@@ -1,0 +1,21 @@
+[Unit]
+Description=HAL Live Hive — worker lane "%i"
+Documentation=https://gist.github.com/Keen25/08d90e38b9a9aad47120ef8e8b38036b
+After=hive-queue-server.service
+Wants=hive-queue-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hive
+EnvironmentFile=-%h/.hive/hive.env
+Environment=HIVE_QUEUE_URL=http://127.0.0.1:5001
+Environment=PYTHONUNBUFFERED=1
+# %i is the lane name (e.g. hal). worker-id defaults to "<lane>#1".
+ExecStart=/usr/bin/python3 %h/hive/worker_loop.py \
+    --worker-id %i#1 --lane %i \
+    --queue ${HIVE_QUEUE_URL} --token ${HIVE_TOKEN}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

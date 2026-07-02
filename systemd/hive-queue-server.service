@@ -1,0 +1,21 @@
+[Unit]
+Description=HAL Live Hive — queue control plane (REST + reaper + merge-loop)
+Documentation=https://gist.github.com/Keen25/08d90e38b9a9aad47120ef8e8b38036b
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hive
+# HIVE_PORT / HIVE_BIND / HIVE_VERIFY_CMD can be overridden via an env file.
+EnvironmentFile=-%h/.hive/hive.env
+Environment=HIVE_PORT=5001
+Environment=HIVE_BIND=0.0.0.0
+Environment=PYTHONUNBUFFERED=1
+ExecStartPre=/usr/bin/python3 %h/hive/halctl.py init
+ExecStart=/usr/bin/python3 %h/hive/queue_server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

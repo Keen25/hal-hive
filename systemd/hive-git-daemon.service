@@ -1,0 +1,27 @@
+[Unit]
+Description=HAL Live Hive — lab.git transport (git:// daemon on the lab net)
+Documentation=https://gist.github.com/Keen25/08d90e38b9a9aad47120ef8e8b38036b
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hive
+EnvironmentFile=-%h/.hive/hive.env
+Environment=HIVE_GIT_LISTEN=192.168.100.1
+Environment=HIVE_GIT_PORT=9418
+# Serve %h/hive/lab.git for remote workers (clone + push). receive-pack is
+# enabled because pull-model workers push their result branch back over git://.
+# The lab net (192.168.100.0/24) is an isolated host-only interface; the daemon
+# is bound to it only, never the routable LAN.
+ExecStartPre=/usr/bin/touch %h/hive/lab.git/git-daemon-export-ok
+ExecStart=/usr/libexec/git-core/git-daemon --reuseaddr \
+    --base-path=%h/hive --export-all \
+    --enable=upload-pack --enable=receive-pack \
+    --listen=${HIVE_GIT_LISTEN} --port=${HIVE_GIT_PORT} \
+    %h/hive/lab.git
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

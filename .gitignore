@@ -1,0 +1,22 @@
+# Live state — the queue is runtime state, not source
+queue.db
+queue.db-wal
+queue.db-shm
+*.db-wal
+*.db-shm
+
+# Bare lab repo — separately managed (git://) and repaired; do not nest
+lab.git/
+
+# Worker scratch clones
+workspace/
+runs/
+
+# Secrets live in ~/.hive/ (outside this tree); never vendor them here
+*.token
+.hive/
+hive.env
+
+# Python
+__pycache__/
+*.pyc

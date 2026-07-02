@@ -1,0 +1,598 @@
+#!/usr/bin/env python3
+"""
+HAL — Live Hive Queue core (Phase 9.1)
+
+The correctness core of the pull-persistent hive:
+  - queue.db schema v2 + connection invariant (WAL, busy_timeout, FK)   [C4/C2]
+  - atomic claim() with dependency-gate + lease                         [C1/C3]
+  - heartbeat + reaper (crashed-worker recovery, dead-letter)           [C3/M1]
+  - merge_loop: rebase -> verify -> ff-merge, park needs_attention      [C5/M2]
+
+All DB access happens on HAL's local filesystem. Windows workers NEVER open the
+file directly (SQLite locking is broken over SMB/NFS) — they reach the queue only
+through queue_server.py. HAL is therefore the single clock source: every timestamp
+is written by datetime('now') on HAL.
+
+Design source: gist hal-phase9.1-hardening.md.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Iterator, Optional
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+HIVE_DIR   = os.path.expanduser('~/hive')
+QUEUE_DB   = os.path.join(HIVE_DIR, 'queue.db')
+LAB_GIT    = os.path.join(HIVE_DIR, 'lab.git')
+DEFAULT_BASE_REF = 'master'          # lab.git default branch
+
+LEASE_MINUTES     = 15               # §3 claim lease window
+HEARTBEAT_RENEW   = '+15 minutes'    # §4 pulse renews the lease
+REAPER_INTERVAL_S = 30               # §4 reaper cadence
+MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
+
+SCHEMA_VERSION = 3
+
+# Verify host used by the merge gate (§7). Overridable via env for tests.
+VERIFY_HOST = os.environ.get('HIVE_VERIFY_HOST', 'ar1')
+
+# Statuses considered "in flight" (hold a lease) for the reaper.
+_INFLIGHT = ('claimed', 'running')
+
+
+# ── Connection invariant (fixes C4) ───────────────────────────────────────────
+
+def connect(db_path: str = QUEUE_DB) -> sqlite3.Connection:
+    """Open queue.db with the mandatory PRAGMAs. Every process MUST use this."""
+    conn = sqlite3.connect(db_path, timeout=5.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.execute('PRAGMA journal_mode = WAL;')      # concurrent readers + 1 writer
+    conn.execute('PRAGMA busy_timeout = 5000;')     # wait 5s for the lock, don't throw
+    conn.execute('PRAGMA foreign_keys = ON;')       # enforce task_deps integrity
+    conn.execute('PRAGMA synchronous = NORMAL;')    # WAL-safe, fast enough for a lab
+    return conn
+
+
+@contextmanager
+def cursor(db_path: str = QUEUE_DB) -> Iterator[sqlite3.Cursor]:
+    conn = connect(db_path)
+    try:
+        cur = conn.cursor()
+        yield cur
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Schema (fixes C2) ──────────────────────────────────────────────────────────
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS tasks (
+    id            TEXT PRIMARY KEY,
+    branch        TEXT NOT NULL UNIQUE,
+    base_ref      TEXT NOT NULL DEFAULT 'master',
+    prompt        TEXT NOT NULL,
+    worker        TEXT,                        -- exact lane pin ('ar1'|'hal'|...), NULL = any
+    requires      TEXT,                        -- capability tags a worker MUST have (space-sep), NULL = none
+    scope         TEXT,                        -- optional build/test scope for verify gate
+    priority      INTEGER NOT NULL DEFAULT 5,  -- 1=urgent .. 10=background
+    status        TEXT NOT NULL DEFAULT 'pending',
+    worker_id     TEXT,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    max_attempts  INTEGER NOT NULL DEFAULT 3,
+    lease_expires DATETIME,
+    heartbeat_at  DATETIME,
+    not_before    DATETIME,                    -- retry backoff gate
+    created_at    DATETIME NOT NULL DEFAULT (datetime('now')),
+    claimed_at    DATETIME,
+    started_at    DATETIME,
+    done_at       DATETIME,
+    commit_hash   TEXT,
+    exit_code     INTEGER,
+    turns         INTEGER,
+    cost_pr       REAL,
+    log_path      TEXT,
+    error         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS task_deps (
+    task_id     TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    depends_on  TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (task_id, depends_on)
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_claimable
+    ON tasks(status, priority, created_at);
+"""
+
+
+def init_db(db_path: str = QUEUE_DB) -> None:
+    """Create/upgrade the schema. Idempotent, with in-place migration."""
+    with cursor(db_path) as cur:
+        cur.executescript(_SCHEMA)
+        # Migration v2 -> v3: add capability-requirement column to existing DBs.
+        cols = {r['name'] for r in cur.execute('PRAGMA table_info(tasks)').fetchall()}
+        if 'requires' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN requires TEXT')
+        cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
+
+
+# ── Capability tags ────────────────────────────────────────────────────────────
+
+def parse_tags(value) -> set[str]:
+    """Normalise a capability/requirement spec into a lowercase tag set.
+
+    Accepts a list/tuple/set or a comma/whitespace-separated string. Tags are
+    opaque strings by convention namespaced like 'os:windows', 'msbuild',
+    'name:ar1'. Matching is case-insensitive.
+    """
+    if not value:
+        return set()
+    items = value if isinstance(value, (list, tuple, set)) else re.split(r'[\s,]+', value)
+    return {t.strip().lower() for t in items if t and str(t).strip()}
+
+
+def canon_tags(value) -> Optional[str]:
+    """Canonical stored form: sorted, space-joined, or None when empty."""
+    tags = parse_tags(value)
+    return ' '.join(sorted(tags)) if tags else None
+
+
+def ensure_lab_repo(lab_git: str = LAB_GIT, base_ref: str = DEFAULT_BASE_REF) -> None:
+    """
+    Guarantee lab.git exists as a bare repo whose base_ref already has at least
+    one commit. An empty base_ref lets early workers branch off an unborn HEAD and
+    create orphan roots that can never rebase — so we seed an empty root commit.
+    Idempotent.
+    """
+    import shutil, tempfile
+    if not os.path.isdir(lab_git):
+        subprocess.run(['git', 'init', '--bare', '-b', base_ref, lab_git], check=True,
+                       capture_output=True, text=True)
+    # base_ref already has commits? nothing to do.
+    have = subprocess.run(['git', '--git-dir', lab_git, 'rev-parse', '--verify',
+                           f'refs/heads/{base_ref}'], capture_output=True, text=True)
+    if have.returncode == 0:
+        return
+    # Seed an empty root commit on base_ref via a throwaway worktree.
+    wt = tempfile.mkdtemp(prefix='hive-seed-')
+    try:
+        env = {**os.environ,
+               'GIT_AUTHOR_NAME': 'HAL', 'GIT_AUTHOR_EMAIL': 'hal@lab',
+               'GIT_COMMITTER_NAME': 'HAL', 'GIT_COMMITTER_EMAIL': 'hal@lab'}
+        subprocess.run(['git', 'clone', lab_git, wt], check=True,
+                       capture_output=True, text=True)
+        subprocess.run(['git', 'checkout', '-b', base_ref], cwd=wt,
+                       capture_output=True, text=True)
+        subprocess.run(['git', 'commit', '--allow-empty', '-m',
+                        'hive: seed root commit'], cwd=wt, env=env, check=True,
+                       capture_output=True, text=True)
+        subprocess.run(['git', 'push', 'origin', base_ref], cwd=wt, check=True,
+                       capture_output=True, text=True)
+        print(f'[lab] seeded empty root commit on {base_ref} in {lab_git}')
+    finally:
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+# ── Task insertion (HAL control plane) ─────────────────────────────────────────
+
+def add_task(
+    task_id: str,
+    prompt: str,
+    branch: Optional[str] = None,
+    base_ref: str = DEFAULT_BASE_REF,
+    worker: Optional[str] = None,
+    requires: Optional[list[str]] = None,
+    scope: Optional[str] = None,
+    priority: int = 5,
+    deps: Optional[list[str]] = None,
+    max_attempts: int = 3,
+    db_path: str = QUEUE_DB,
+) -> None:
+    """Insert a task (+ its dependency edges) into the queue.
+
+    `worker` pins the task to one exact lane. `requires` is a set of capability
+    tags a worker must ALL advertise to be allowed to claim it (e.g.
+    ['os:windows', 'msbuild']). Both are optional and both must pass.
+    """
+    branch = branch or f'feature/{task_id}'
+    with cursor(db_path) as cur:
+        cur.execute(
+            """INSERT INTO tasks
+                 (id, branch, base_ref, prompt, worker, requires, scope,
+                  priority, max_attempts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task_id, branch, base_ref, prompt, worker, canon_tags(requires),
+             scope, priority, max_attempts),
+        )
+        for dep in (deps or []):
+            cur.execute(
+                'INSERT OR IGNORE INTO task_deps (task_id, depends_on) VALUES (?, ?)',
+                (task_id, dep),
+            )
+
+
+# ── The claim (fixes C1 + C3) ──────────────────────────────────────────────────
+
+@dataclass
+class ClaimedTask:
+    id: str
+    branch: str
+    base_ref: str
+    prompt: str
+    scope: Optional[str]
+    attempts: int
+
+
+def claim_next(worker_id: str, worker_lane: Optional[str] = None,
+               worker_caps: Optional[set[str]] = None,
+               db_path: str = QUEUE_DB) -> Optional[ClaimedTask]:
+    """
+    Atomically claim the highest-priority claimable task and return it, or None.
+
+    Claimable = pending, past its not_before backoff gate, every dependency merged,
+    (if worker_lane given) either unpinned or pinned to this lane, AND this worker's
+    capabilities satisfy the task's `requires` set (requires ⊆ caps). Capability
+    matching is done in Python over the priority-ordered candidates so subset logic
+    stays simple; it remains atomic because BEGIN IMMEDIATE holds the write lock for
+    the whole select-then-update.
+    """
+    caps = parse_tags(worker_caps) if worker_caps is not None else set()
+    conn = connect(db_path)
+    try:
+        conn.execute('BEGIN IMMEDIATE;')
+        rows = conn.execute(
+            """
+            SELECT t.id, t.branch, t.base_ref, t.prompt, t.scope, t.attempts,
+                   t.requires
+            FROM tasks t
+            WHERE t.status = 'pending'
+              AND (t.not_before IS NULL OR t.not_before <= datetime('now'))
+              AND (t.worker IS NULL OR t.worker = :lane)
+              AND NOT EXISTS (
+                    SELECT 1 FROM task_deps d
+                    JOIN tasks dep ON dep.id = d.depends_on
+                    WHERE d.task_id = t.id AND dep.status <> 'merged'
+              )
+            ORDER BY (t.priority - MIN(t.attempts, 3)) ASC, t.created_at ASC
+            """,
+            {'lane': worker_lane},
+        ).fetchall()
+
+        # Pick the first candidate whose capability requirements this worker meets.
+        chosen = next((r for r in rows if parse_tags(r['requires']) <= caps), None)
+        if chosen is None:
+            conn.execute('COMMIT;')
+            return None
+
+        conn.execute(
+            """
+            UPDATE tasks
+            SET status        = 'claimed',
+                worker_id     = :wid,
+                attempts      = attempts + 1,
+                claimed_at    = datetime('now'),
+                heartbeat_at  = datetime('now'),
+                lease_expires = datetime('now', :lease)
+            WHERE id = :tid
+            """,
+            {'wid': worker_id, 'tid': chosen['id'], 'lease': f'+{LEASE_MINUTES} minutes'},
+        )
+        conn.execute('COMMIT;')
+        return ClaimedTask(
+            id=chosen['id'], branch=chosen['branch'], base_ref=chosen['base_ref'],
+            prompt=chosen['prompt'], scope=chosen['scope'],
+            attempts=chosen['attempts'] + 1,
+        )
+    except Exception:
+        conn.execute('ROLLBACK;')
+        raise
+    finally:
+        conn.close()
+
+
+def mark_running(task_id: str, worker_id: str, db_path: str = QUEUE_DB) -> None:
+    with cursor(db_path) as cur:
+        cur.execute(
+            """UPDATE tasks SET status='running', started_at=datetime('now')
+               WHERE id=? AND worker_id=?""",
+            (task_id, worker_id),
+        )
+
+
+# ── Heartbeat (fixes C3) ───────────────────────────────────────────────────────
+
+def heartbeat(task_id: str, worker_id: str, db_path: str = QUEUE_DB) -> bool:
+    """Renew the lease. Returns False if the task was reaped/reassigned (stop work)."""
+    with cursor(db_path) as cur:
+        cur.execute(
+            """
+            UPDATE tasks
+            SET heartbeat_at  = datetime('now'),
+                lease_expires = datetime('now', ?)
+            WHERE id = ? AND worker_id = ? AND status IN ('claimed','running')
+            """,
+            (HEARTBEAT_RENEW, task_id, worker_id),
+        )
+        return cur.rowcount > 0
+
+
+# ── Completion + retry/dead-letter (fixes M1) ─────────────────────────────────
+
+def complete_task(
+    task_id: str,
+    worker_id: str,
+    exit_code: int,
+    commit_hash: Optional[str] = None,
+    turns: Optional[int] = None,
+    cost_pr: Optional[float] = None,
+    log_path: Optional[str] = None,
+    error: Optional[str] = None,
+    db_path: str = QUEUE_DB,
+) -> str:
+    """
+    Record the outcome of a run. Success -> 'done' (merge loop takes it from here).
+    Failure -> retry with exponential backoff, or dead-letter at max_attempts.
+    Returns the resulting status.
+    """
+    success = exit_code == 0 and bool(commit_hash)
+    with cursor(db_path) as cur:
+        row = cur.execute(
+            'SELECT attempts, max_attempts FROM tasks WHERE id=?', (task_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f'unknown task {task_id}')
+
+        if success:
+            cur.execute(
+                """UPDATE tasks
+                   SET status='done', done_at=datetime('now'),
+                       exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
+                       lease_expires=NULL, heartbeat_at=NULL
+                   WHERE id=? AND worker_id=?""",
+                (exit_code, commit_hash, turns, cost_pr, log_path, task_id, worker_id),
+            )
+            return 'done'
+
+        if row['attempts'] >= row['max_attempts']:
+            cur.execute(
+                """UPDATE tasks
+                   SET status='dead', done_at=datetime('now'),
+                       exit_code=?, log_path=?, error=?,
+                       lease_expires=NULL, heartbeat_at=NULL
+                   WHERE id=?""",
+                (exit_code, log_path, error, task_id),
+            )
+            return 'dead'
+
+        backoff = 2 ** row['attempts'] * 30      # 60s, 120s, 240s, ...
+        cur.execute(
+            """UPDATE tasks
+               SET status='pending', worker_id=NULL,
+                   not_before=datetime('now', ?),
+                   lease_expires=NULL, heartbeat_at=NULL,
+                   exit_code=?, log_path=?, error=?
+               WHERE id=?""",
+            (f'+{backoff} seconds', exit_code, log_path, error, task_id),
+        )
+        return 'pending'
+
+
+# ── Reaper (fixes C3) ─────────────────────────────────────────────────────────
+
+def reap_once(db_path: str = QUEUE_DB) -> int:
+    """Requeue tasks whose lease expired; dead-letter those out of attempts."""
+    with cursor(db_path) as cur:
+        cur.execute(
+            f"""
+            UPDATE tasks
+            SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'pending' END,
+                worker_id = NULL, lease_expires = NULL, heartbeat_at = NULL,
+                error = COALESCE(error,'') ||
+                        ' [reaped: lease expired @' || datetime('now') || ']'
+            WHERE status IN {_INFLIGHT}
+              AND lease_expires IS NOT NULL
+              AND lease_expires < datetime('now')
+            """
+        )
+        return cur.rowcount
+
+
+def reaper_loop(stop: threading.Event, db_path: str = QUEUE_DB) -> None:
+    while not stop.is_set():
+        try:
+            n = reap_once(db_path)
+            if n:
+                print(f'[reaper] requeued/dead-lettered {n} orphaned task(s)')
+        except Exception as e:  # never let the reaper die
+            print(f'[reaper] error: {e}')
+        stop.wait(REAPER_INTERVAL_S)
+
+
+# ── Merge loop (fixes C5 + M2) ────────────────────────────────────────────────
+
+def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ['git', '--git-dir', LAB_GIT, *args],
+        capture_output=True, text=True, check=check,
+    )
+
+
+def _rebase_bare(branch: str, base_ref: str) -> bool:
+    """
+    Rebase `branch` onto `base_ref` inside a bare repo. Bare repos have no
+    worktree, so we attach a throwaway one, rebase there, then let the branch ref
+    follow. Returns True on clean rebase, False on conflict (worktree cleaned up).
+    """
+    import tempfile, shutil
+    # Rebase creates new commits, so git needs a committer identity even in a
+    # scratch worktree (else it aborts with "Committer identity unknown", which
+    # must NOT be misread as a merge conflict).
+    env = {**os.environ,
+           'GIT_AUTHOR_NAME': 'HAL', 'GIT_AUTHOR_EMAIL': 'hal@lab',
+           'GIT_COMMITTER_NAME': 'HAL', 'GIT_COMMITTER_EMAIL': 'hal@lab'}
+    wt = tempfile.mkdtemp(prefix='hive-rebase-')
+    try:
+        add = _git('worktree', 'add', '-f', '--checkout', wt, branch, check=False)
+        if add.returncode != 0:
+            return False
+        rb = subprocess.run(['git', 'rebase', base_ref], cwd=wt, env=env,
+                            capture_output=True, text=True)
+        if rb.returncode != 0:
+            subprocess.run(['git', 'rebase', '--abort'], cwd=wt, env=env,
+                           capture_output=True, text=True)
+            return False
+        return True
+    finally:
+        _git('worktree', 'remove', '--force', wt, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+        _git('worktree', 'prune', check=False)
+
+
+def _deps_all_merged(cur: sqlite3.Cursor, task_id: str) -> bool:
+    row = cur.execute(
+        """SELECT COUNT(*) AS n FROM task_deps d
+           JOIN tasks dep ON dep.id = d.depends_on
+           WHERE d.task_id = ? AND dep.status <> 'merged'""",
+        (task_id,),
+    ).fetchone()
+    return row['n'] == 0
+
+
+def _park(cur: sqlite3.Cursor, task_id: str, reason: str) -> None:
+    cur.execute(
+        """UPDATE tasks SET status='needs_attention', error=? WHERE id=?""",
+        (reason, task_id),
+    )
+    print(f'  ⚠️  parked {task_id}: {reason}')
+
+
+def verify_branch(branch: str, base_ref: str, scope: Optional[str]) -> tuple[bool, str]:
+    """
+    Build/test gate (§7). Rebase the branch onto the live base, then run the
+    verification build on VERIFY_HOST. Default lab implementation is a no-op pass;
+    override by setting HIVE_VERIFY_CMD to a shell command (run with cwd=lab.git).
+    Returns (ok, summary).
+    """
+    cmd = os.environ.get('HIVE_VERIFY_CMD')
+    if not cmd:
+        return True, 'verify skipped (no HIVE_VERIFY_CMD set)'
+    proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                          cwd=HIVE_DIR)
+    tail = (proc.stdout + proc.stderr).strip().splitlines()[-5:]
+    return proc.returncode == 0, ' | '.join(tail)
+
+
+def _merge_one(cur: sqlite3.Cursor, task: sqlite3.Row) -> None:
+    branch, base_ref = task['branch'], task['base_ref'] or DEFAULT_BASE_REF
+    cur.execute("UPDATE tasks SET status='verifying' WHERE id=?", (task['id'],))
+
+    # base_ref is guaranteed to exist (ensure_lab_repo seeds a root commit), so we
+    # always rebase then fast-forward — no orphan-seed special case.
+    if _git('rev-parse', '--verify', f'refs/heads/{base_ref}',
+            check=False).returncode != 0:
+        _park(cur, task['id'], f'base_ref {base_ref} missing (run ensure_lab_repo)')
+        return
+
+    # M2: rebase branch onto the LIVE base so we never merge stale. lab.git is
+    # bare (no worktree), so rebase runs in a scratch worktree; on success the
+    # rebased tip fast-forwards base_ref via `branch -f` (ff by construction).
+    if not _rebase_bare(branch, base_ref):
+        _park(cur, task['id'], f'rebase conflict onto {base_ref}')
+        return
+
+    # C5: build/test gate BEFORE merge — no unverified code lands.
+    ok, summary = verify_branch(branch, base_ref, task['scope'])
+    if not ok:
+        _park(cur, task['id'], f'verify failed: {summary}')
+        return
+
+    # Advance base_ref to the rebased branch tip (fast-forward in a bare repo).
+    res = _git('branch', '-f', base_ref, branch, check=False)
+    if res.returncode != 0:
+        _park(cur, task['id'], f'merge into {base_ref} failed: {res.stderr.strip()}')
+        return
+    tip = _git('rev-parse', branch, check=False).stdout.strip() or None
+    cur.execute(
+        "UPDATE tasks SET status='merged', commit_hash=? WHERE id=?",
+        (tip, task['id']),
+    )
+    print(f'  ✅ merged {branch} → {base_ref} ({task["id"]})')
+
+
+def merge_once(db_path: str = QUEUE_DB) -> int:
+    """Process all mergeable 'done' tasks, oldest-first, serialized. Returns count."""
+    merged = 0
+    with cursor(db_path) as cur:
+        rows = cur.execute(
+            """SELECT * FROM tasks WHERE status='done'
+               ORDER BY done_at ASC"""
+        ).fetchall()
+        for task in rows:
+            if not _deps_all_merged(cur, task['id']):
+                continue
+            _merge_one(cur, task)
+            merged += 1
+    return merged
+
+
+def merge_loop(stop: threading.Event, db_path: str = QUEUE_DB) -> None:
+    while not stop.is_set():
+        try:
+            merge_once(db_path)
+        except Exception as e:  # never let the merge loop die
+            print(f'[merge] error: {e}')
+        stop.wait(MERGE_INTERVAL_S)
+
+
+# ── Status / control helpers ──────────────────────────────────────────────────
+
+def status_snapshot(db_path: str = QUEUE_DB) -> dict:
+    with cursor(db_path) as cur:
+        counts = {
+            r['status']: r['n']
+            for r in cur.execute(
+                'SELECT status, COUNT(*) AS n FROM tasks GROUP BY status'
+            ).fetchall()
+        }
+        rows = [dict(r) for r in cur.execute(
+            """SELECT id, status, worker_id, worker, requires, priority, branch,
+                      commit_hash, error
+               FROM tasks ORDER BY
+                 CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
+                             WHEN 'pending' THEN 2 ELSE 3 END,
+                 priority ASC, created_at ASC"""
+        ).fetchall()]
+    return {'counts': counts, 'tasks': rows}
+
+
+def cancel_task(task_id: str, db_path: str = QUEUE_DB) -> bool:
+    """Cancel a task in any pre-merge state."""
+    with cursor(db_path) as cur:
+        cur.execute(
+            """UPDATE tasks SET status='cancelled',
+                   lease_expires=NULL, heartbeat_at=NULL
+               WHERE id=? AND status NOT IN ('merged','cancelled','dead')""",
+            (task_id,),
+        )
+        return cur.rowcount > 0
+
+
+def reprioritize(task_id: str, priority: int, db_path: str = QUEUE_DB) -> bool:
+    with cursor(db_path) as cur:
+        cur.execute('UPDATE tasks SET priority=? WHERE id=?', (priority, task_id))
+        return cur.rowcount > 0
+
+
+if __name__ == '__main__':
+    init_db()
+    print(f'queue.db initialised at {QUEUE_DB} (schema v{SCHEMA_VERSION})')
