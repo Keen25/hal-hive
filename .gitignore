@@ -17,6 +17,14 @@ runs/
 .hive/
 hive.env
 
+# TLS material — the lab CA/server cert+key live in ~/.hive-ca/ (outside this
+# tree). Guard against ever committing key/cert material if a run drops it here.
+*.key
+*.crt
+*.pem
+*.csr
+*.srl
+
 # Python
 __pycache__/
 *.pyc

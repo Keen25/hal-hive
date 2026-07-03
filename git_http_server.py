@@ -340,6 +340,20 @@ def _resolve_bind_addrs(override, default_lab_ip="192.168.100.1"):
     return addrs
 
 
+def _tls_context():
+    """ssl.SSLContext when HIVE_TLS_CERT and HIVE_TLS_KEY are both set, else None
+    (plain HTTP). Encrypts git packs + the token header (issue #8 / S5). Mint the
+    cert/key with gen-lab-ca.sh; the same pair is shared with queue_server."""
+    cert = os.environ.get("HIVE_TLS_CERT")
+    key = os.environ.get("HIVE_TLS_KEY")
+    if not (cert and key):
+        return None
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=cert, keyfile=key)
+    return ctx
+
+
 def main():
     if not AUTH_TOKEN:
         sys.stderr.write(
@@ -348,6 +362,12 @@ def main():
         )
         sys.exit(1)
     addrs = _resolve_bind_addrs(BIND)
+    ctx = _tls_context()
+    scheme = "https" if ctx else "http"
+    if not ctx:
+        sys.stderr.write(
+            "TLS OFF — set HIVE_TLS_CERT/HIVE_TLS_KEY to encrypt (issue #8)\n"
+        )
     servers = []
     for addr in addrs:
         try:
@@ -355,11 +375,13 @@ def main():
         except OSError as exc:
             sys.stderr.write("skip bind %s:%d (%s)\n" % (addr, PORT, exc))
             continue
+        if ctx:
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         servers.append(httpd)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
         sys.stderr.write(
-            "hal-git-http serving %s on http://%s:%d (backend=%s, token-auth ON)\n"
-            % (PROJECT_ROOT, addr, PORT, GIT_HTTP_BACKEND)
+            "hal-git-http serving %s on %s://%s:%d (backend=%s, token-auth ON)\n"
+            % (PROJECT_ROOT, scheme, addr, PORT, GIT_HTTP_BACKEND)
         )
     if not servers:
         sys.stderr.write("FATAL: could not bind any of %r:%d\n" % (addrs, PORT))
