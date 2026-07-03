@@ -162,7 +162,19 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         return subprocess.run(['git', *auth, *a], cwd=cwd, capture_output=True, text=True)
 
     try:
-        cl = subprocess.run(['git', *auth, 'clone', lab_git, run_dir],
+        # Sc4 (#13): blobless partial clone — fetch commits+trees now, blobs on
+        # demand. `git checkout base_ref` below materializes the working tree
+        # (fetching just those blobs over the same authed transport), so copilot
+        # sees a full tree while clone cost stops scaling with repo size × tasks.
+        # Needs uploadpack.allowFilter on the server (git_http_server sets it);
+        # against a server without it git prints a warning and falls back to a
+        # full clone, so this is safe either way. HIVE_CLONE_FILTER='' disables.
+        clone_filter = os.environ.get('HIVE_CLONE_FILTER', 'blob:none').strip()
+        clone_args = ['clone']
+        if clone_filter:
+            clone_args.append(f'--filter={clone_filter}')
+        clone_args += [lab_git, run_dir]
+        cl = subprocess.run(['git', *auth, *clone_args],
                             capture_output=True, text=True)
         if cl.returncode != 0:
             return {'exit_code': 1, 'error': f'clone failed: {cl.stderr.strip()}'}
