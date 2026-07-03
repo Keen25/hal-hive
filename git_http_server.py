@@ -7,10 +7,21 @@ because git:// push deadlocks the Git-for-Windows client (sideband/pipe-buffer
 half-duplex deadlock in receive-pack); smart-HTTP is fully request/response
 framed and does not hit that bug. Clone/fetch/push all go through here.
 
-No auth (host-only LABNet). Streams request/response bodies so large packs are
-not buffered in memory. Pure stdlib (Python 3.13+ removed the ``cgi`` module,
-so we build the CGI environment by hand).
+Token auth (shared with the queue control plane): every request must present
+``Authorization: Bearer <token>`` (or HTTP Basic where the password equals the
+token). Workers inject the header with ``git -c http.extraheader=...``. The token
+is resolved from ``HIVE_GIT_TOKEN`` → ``HIVE_TOKEN`` → ``~/.hive/worker.token`` —
+the same secret the REST server uses — so the LAN is no longer an implicit trust
+boundary. (``GIT_HTTP_EXPORT_ALL`` stays on so git-http-backend serves the bare
+repo; the HTTP auth layer above is the real gate now.) If NO token can be
+resolved the server refuses to start rather than silently running open.
+
+Streams request/response bodies so large packs are not buffered in memory. Pure
+stdlib (Python 3.13+ removed the ``cgi`` module, so we build the CGI environment
+by hand).
 """
+import base64
+import hmac
 import os
 import subprocess
 import sys
@@ -26,15 +37,69 @@ PORT = int(os.environ.get("GIT_HTTP_PORT", "8418"))
 # Chunk size for streaming bodies between socket and the CGI process.
 CHUNK = 65536
 
+TOKEN_FILE = os.path.expanduser("~/.hive/worker.token")
+
+
+def _resolve_token() -> str:
+    """Shared hive token — same precedence as queue_server so both agree."""
+    for key in ("HIVE_GIT_TOKEN", "HIVE_TOKEN"):
+        val = os.environ.get(key)
+        if val and val.strip():
+            return val.strip()
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE) as f:
+            return f.read().strip()
+    return ""
+
+
+AUTH_TOKEN = _resolve_token()
+
 
 class GitHTTPHandler(BaseHTTPRequestHandler):
     server_version = "hal-git-http/1.0"
     protocol_version = "HTTP/1.1"
 
+    def _authorized(self) -> bool:
+        """True iff the request carries the shared token (Bearer or Basic)."""
+        hdr = self.headers.get("Authorization", "")
+        if hdr.startswith("Bearer "):
+            return hmac.compare_digest(hdr[7:].strip(), AUTH_TOKEN)
+        if hdr.startswith("Basic "):
+            try:
+                raw = base64.b64decode(hdr[6:].strip()).decode("utf-8", "replace")
+            except Exception:
+                return False
+            user, _, pw = raw.partition(":")
+            # Accept the token as either the username or the password so both
+            # `https://<token>@host/` and `https://x:<token>@host/` URL forms work.
+            return (hmac.compare_digest(pw, AUTH_TOKEN)
+                    or hmac.compare_digest(user, AUTH_TOKEN))
+        return False
+
+    def _require_auth(self) -> bool:
+        if self._authorized():
+            return True
+        body = b"401 unauthorized: hive git transport requires the shared token\n"
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="hal-hive-git"')
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+        return False
+
     def do_GET(self):
+        if not self._require_auth():
+            return
         self._run_cgi("GET")
 
     def do_POST(self):
+        if not self._require_auth():
+            return
         self._run_cgi("POST")
 
     def _build_env(self, method):
@@ -238,9 +303,15 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
 
 
 def main():
+    if not AUTH_TOKEN:
+        sys.stderr.write(
+            "FATAL: no hive token resolvable (HIVE_GIT_TOKEN / HIVE_TOKEN / "
+            "~/.hive/worker.token). Refusing to serve lab.git without auth.\n"
+        )
+        sys.exit(1)
     httpd = ThreadingHTTPServer((BIND, PORT), GitHTTPHandler)
     sys.stderr.write(
-        "hal-git-http serving %s on http://%s:%d (backend=%s)\n"
+        "hal-git-http serving %s on http://%s:%d (backend=%s, token-auth ON)\n"
         % (PROJECT_ROOT, BIND, PORT, GIT_HTTP_BACKEND)
     )
     httpd.serve_forever()
