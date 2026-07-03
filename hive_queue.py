@@ -39,6 +39,7 @@ LEASE_MINUTES     = 15               # §3 claim lease window
 HEARTBEAT_RENEW   = '+15 minutes'    # §4 pulse renews the lease
 REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
+VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 
 SCHEMA_VERSION = 5
 WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
@@ -511,24 +512,38 @@ def _deps_all_merged(cur: sqlite3.Cursor, task_id: str) -> bool:
 
 def _park(cur: sqlite3.Cursor, task_id: str, reason: str) -> None:
     cur.execute(
-        """UPDATE tasks SET status='needs_attention', error=? WHERE id=?""",
+        """UPDATE tasks SET status='needs_attention', error=?,
+                            lease_expires=NULL WHERE id=?""",
         (reason, task_id),
     )
     print(f'  ⚠️  parked {task_id}: {reason}')
 
 
 def _set_status(db_path: str, task_id: str, status: str,
-                commit_hash: Optional[str] = None) -> None:
+                commit_hash: Optional[str] = None,
+                lease: Optional[str] = None,
+                clear_lease: bool = False) -> None:
     """Short-lived write for a single merge-loop state transition. Keeping each
     flip in its own tiny cursor block means the (slow) git rebase + verify
     subprocesses in _merge_one run with NO DB cursor open, so they can never
-    stall other writers regardless of the connection's isolation level."""
+    stall other writers regardless of the connection's isolation level.
+
+    `lease` (a sqlite datetime modifier, e.g. '+30 minutes') stamps
+    lease_expires so a crash mid-transition is recoverable; `clear_lease` wipes
+    it on reaching a terminal state."""
+    sets = ['status=?']
+    params: list = [status]
+    if commit_hash is not None:
+        sets.append('commit_hash=?')
+        params.append(commit_hash)
+    if lease is not None:
+        sets.append("lease_expires=datetime('now', ?)")
+        params.append(lease)
+    elif clear_lease:
+        sets.append('lease_expires=NULL')
+    params.append(task_id)
     with cursor(db_path) as cur:
-        if commit_hash is not None:
-            cur.execute("UPDATE tasks SET status=?, commit_hash=? WHERE id=?",
-                        (status, commit_hash, task_id))
-        else:
-            cur.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+        cur.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", params)
 
 
 def _park_task(db_path: str, task_id: str, reason: str) -> None:
@@ -580,7 +595,11 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
     """
     branch, base_ref = task['branch'], task['base_ref'] or DEFAULT_BASE_REF
     task_id = task['id']
-    _set_status(db_path, task_id, 'verifying')
+    # Stamp a lease on 'verifying' so a merge-loop crash mid-transition is
+    # recoverable: merge_once sweeps expired 'verifying' rows back to 'done'
+    # (see _sweep_stale_verifying). Without this the row would have a NULL lease,
+    # the reaper (in-flight only) would skip it, and it would hang forever.
+    _set_status(db_path, task_id, 'verifying', lease=VERIFY_LEASE)
 
     # base_ref is guaranteed to exist (ensure_lab_repo seeds a root commit), so we
     # always rebase then fast-forward — no orphan-seed special case.
@@ -612,10 +631,31 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
             _park_task(db_path, task_id, f'merge into {base_ref} failed: {res.stderr.strip()}')
             return
         tip = _git('rev-parse', branch, check=False).stdout.strip() or None
-        _set_status(db_path, task_id, 'merged', commit_hash=tip)
+        _set_status(db_path, task_id, 'merged', commit_hash=tip, clear_lease=True)
         print(f'  ✅ merged {branch} → {base_ref} ({task_id})')
     finally:
         _remove_worktree(wt)
+
+
+def _sweep_stale_verifying(db_path: str) -> int:
+    """Recover tasks orphaned in 'verifying' by a merge-loop crash/restart.
+
+    A 'verifying' row carries a lease (VERIFY_LEASE). If the single merge thread
+    dies before reaching a terminal state, the row is stuck: the reaper only
+    reclaims in-flight (claimed/running) leases, and the merge selector only
+    picks status='done'. Once the lease expires we reset it to 'done' so the
+    next merge pass re-processes it (rebase+verify are idempotent)."""
+    with cursor(db_path) as cur:
+        cur.execute(
+            """UPDATE tasks SET status='done', lease_expires=NULL
+               WHERE status='verifying'
+                 AND lease_expires IS NOT NULL
+                 AND lease_expires < datetime('now')"""
+        )
+        n = cur.rowcount
+    if n:
+        print(f'[merge] recovered {n} stale verifying task(s) -> done')
+    return n
 
 
 def merge_once(db_path: str = QUEUE_DB) -> int:
@@ -625,6 +665,7 @@ def merge_once(db_path: str = QUEUE_DB) -> int:
     doing any (slow) git/verify work in _merge_one — so the rebase/verify
     subprocesses never run with a DB cursor held open.
     """
+    _sweep_stale_verifying(db_path)  # recover crash-orphaned 'verifying' first
     with cursor(db_path) as cur:
         rows = cur.execute(
             """SELECT * FROM tasks WHERE status='done'
