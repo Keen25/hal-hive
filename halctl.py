@@ -106,6 +106,15 @@ def cmd_cancel(a):
     print('cancelled' if q.cancel_task(a.task_id) else 'not cancellable', a.task_id)
 
 
+def cmd_requeue(a):
+    ok = q.requeue_task(a.task_id, reset_attempts=not a.keep_attempts)
+    if ok:
+        note = '' if a.keep_attempts else ' (attempts reset)'
+        print(f'requeued -> pending{note}', a.task_id)
+    else:
+        print('not requeueable (must be needs_attention|dead|cancelled)', a.task_id)
+
+
 def cmd_prio(a):
     print('ok' if q.reprioritize(a.task_id, a.priority) else 'no such task',
           a.task_id, '->', a.priority)
@@ -152,6 +161,13 @@ def main():
     pc = sub.add_parser('cancel', help='cancel a task')
     pc.add_argument('task_id')
     pc.set_defaults(fn=cmd_cancel)
+
+    prq = sub.add_parser('requeue',
+                         help='re-enqueue a needs_attention|dead|cancelled task')
+    prq.add_argument('task_id')
+    prq.add_argument('--keep-attempts', action='store_true',
+                     help='do NOT reset the attempt counter (default: reset to 0)')
+    prq.set_defaults(fn=cmd_requeue)
 
     pp = sub.add_parser('prio', help='reprioritize a pending task')
     pp.add_argument('task_id')

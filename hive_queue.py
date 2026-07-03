@@ -809,6 +809,28 @@ def reprioritize(task_id: str, priority: int, db_path: str = QUEUE_DB) -> bool:
         return cur.rowcount > 0
 
 
+def requeue_task(task_id: str, reset_attempts: bool = True,
+                 db_path: str = QUEUE_DB) -> bool:
+    """Re-enqueue a parked task (needs_attention | dead | cancelled) back to
+    'pending' so a worker can pick it up again. Clears the error, worker binding,
+    lease/heartbeat and the not_before backoff gate; by default also resets the
+    attempt counter so a fresh run gets its full max_attempts budget (U1).
+
+    Returns False if the task doesn't exist or isn't in a re-queueable state
+    (e.g. already pending/running/merged)."""
+    attempts_sql = ', attempts=0' if reset_attempts else ''
+    with cursor(db_path) as cur:
+        cur.execute(
+            f"""UPDATE tasks
+                SET status='pending', error=NULL, worker_id=NULL,
+                    lease_expires=NULL, heartbeat_at=NULL, not_before=NULL
+                    {attempts_sql}
+                WHERE id=? AND status IN ('needs_attention','dead','cancelled')""",
+            (task_id,),
+        )
+        return cur.rowcount > 0
+
+
 if __name__ == '__main__':
     init_db()
     print(f'queue.db initialised at {QUEUE_DB} (schema v{SCHEMA_VERSION})')

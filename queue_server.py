@@ -300,6 +300,17 @@ def cancel():
     return jsonify(cancelled=q.cancel_task(b['task_id'])), 200
 
 
+@app.post('/requeue')
+def requeue():
+    """Re-enqueue a parked task (needs_attention|dead|cancelled) -> pending. (U1)"""
+    b = request.get_json(force=True, silent=True) or {}
+    task_id = b.get('task_id')
+    if not task_id:
+        return jsonify(error='task_id required'), 400
+    ok = q.requeue_task(task_id, reset_attempts=bool(b.get('reset_attempts', True)))
+    return jsonify(requeued=ok), 200
+
+
 @app.get('/status')
 def status():
     return jsonify(q.status_snapshot()), 200
