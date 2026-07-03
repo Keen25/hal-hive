@@ -295,7 +295,13 @@ def claim_next(worker_id: str, worker_lane: Optional[str] = None,
                     JOIN tasks dep ON dep.id = d.depends_on
                     WHERE d.task_id = t.id AND dep.status <> 'merged'
               )
-            ORDER BY (t.priority - MIN(t.attempts, 3)) ASC, t.created_at ASC
+            -- Sc5: order by DECLARED priority then FIFO. The old
+            -- (priority - MIN(attempts,3)) term let a repeatedly-failing task's
+            -- effective key drop below genuinely higher-priority fresh work, so
+            -- a poison task climbed ahead and starved healthy work. Retries are
+            -- already spaced by the not_before backoff gate above; within a
+            -- priority, oldest-created wins (a retried task keeps its slot).
+            ORDER BY t.priority ASC, t.created_at ASC
             """,
             {'lane': worker_lane},
         ).fetchall()
