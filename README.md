@@ -6,6 +6,10 @@ is a live control plane; nothing blocks while the fleet runs.
 
 Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 
+> **Scaling?** ~10 workers is feasible today with no redesign; the ceiling is
+> the serialized merge+verify loop, not worker count. See
+> [Scaling & known limits](#scaling--known-limits-honest-take).
+
 ## Layout
 
 | File | Role |
