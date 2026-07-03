@@ -31,9 +31,12 @@ import random
 import threading
 import time
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 import hive_queue as q
+
+DASHBOARD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              'dashboard.html')
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -74,7 +77,7 @@ def _authorized() -> bool:
 
 @app.before_request
 def _guard():
-    if request.method == 'GET' and request.path == '/health':
+    if request.method == 'GET' and request.path in ('/health', '/', '/dashboard'):
         return None
     if not _authorized():
         return jsonify(error='unauthorized'), 401
@@ -83,6 +86,26 @@ def _guard():
 @app.get('/health')
 def health():
     return jsonify(ok=True)
+
+
+@app.get('/')
+@app.get('/dashboard')
+def dashboard():
+    """Serve the single-page control-plane dashboard.
+
+    The page is unauthenticated (host-only LAN trust model, same as the
+    git-http transport), but the API it polls (/status, /cancel) still requires
+    the bearer token — so the server injects the token into the page. Nothing
+    beyond this LAN can reach the port, and the workers already hold the token.
+    """
+    try:
+        with open(DASHBOARD_FILE, encoding='utf-8') as f:
+            html = f.read()
+    except OSError as exc:
+        return Response(f'dashboard unavailable: {exc}', status=500,
+                        mimetype='text/plain')
+    html = html.replace('%TOKEN%', TOKEN)
+    return Response(html, mimetype='text/html')
 
 
 @app.post('/claim')

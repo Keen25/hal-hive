@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HAL Hive — Control Plane</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#c9d1d9;
+    --muted:#8b949e; --accent:#58a6ff; --ok:#3fb950; --warn:#d29922;
+    --bad:#f85149; --run:#58a6ff; --pend:#8b949e; --merge:#3fb950;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,monospace; }
+  header { display:flex; align-items:center; gap:14px; padding:14px 22px;
+           border-bottom:1px solid var(--border); background:var(--panel); }
+  header h1 { font-size:18px; margin:0; letter-spacing:.5px; }
+  header .dot { width:10px; height:10px; border-radius:50%; background:var(--muted); }
+  header .dot.live { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+  header .spacer { flex:1; }
+  header .meta { color:var(--muted); font-size:12px; }
+  .wrap { padding:22px; max-width:1200px; margin:0 auto; }
+  .cards { display:flex; flex-wrap:wrap; gap:12px; margin-bottom:22px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+          padding:14px 18px; min-width:110px; flex:1; }
+  .card .n { font-size:28px; font-weight:600; }
+  .card .l { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.5px; }
+  .card.running .n{color:var(--run);} .card.merged .n{color:var(--merge);}
+  .card.pending .n{color:var(--pend);} .card.needs_attention .n{color:var(--warn);}
+  .card.dead .n,.card.cancelled .n{color:var(--bad);}
+  .grid { display:grid; grid-template-columns:2fr 1fr; gap:22px; }
+  @media(max-width:820px){ .grid{grid-template-columns:1fr;} }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted);
+       margin:0 0 10px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px;
+           overflow:hidden; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--border);
+          white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:220px; }
+  th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; }
+  tr:last-child td { border-bottom:none; }
+  tr:hover td { background:rgba(88,166,255,.06); }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;
+           font-weight:600; }
+  .b-running{background:rgba(88,166,255,.15);color:var(--run);}
+  .b-claimed{background:rgba(88,166,255,.10);color:var(--accent);}
+  .b-pending{background:rgba(139,148,158,.15);color:var(--pend);}
+  .b-done,.b-verifying{background:rgba(210,153,34,.15);color:var(--warn);}
+  .b-merged{background:rgba(63,185,80,.15);color:var(--merge);}
+  .b-needs_attention{background:rgba(210,153,34,.20);color:var(--warn);}
+  .b-dead,.b-cancelled{background:rgba(248,81,73,.15);color:var(--bad);}
+  .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .muted { color:var(--muted); }
+  .worker { display:flex; align-items:center; gap:8px; padding:9px 14px;
+            border-bottom:1px solid var(--border); }
+  .worker:last-child{border-bottom:none;}
+  .worker .wdot{width:8px;height:8px;border-radius:50%;background:var(--ok);}
+  .worker .wdot.idle{background:var(--muted);}
+  .btn { background:transparent; border:1px solid var(--border); color:var(--muted);
+         border-radius:5px; padding:2px 8px; font-size:11px; cursor:pointer; }
+  .btn:hover{ border-color:var(--bad); color:var(--bad); }
+  .empty { padding:22px; text-align:center; color:var(--muted); }
+  .err { color:var(--bad); font-size:11px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="livedot"></span>
+  <h1>HAL&nbsp;HIVE</h1>
+  <span class="meta" id="clock"></span>
+  <span class="spacer"></span>
+  <span class="meta">queue :5001 · git-http :8418</span>
+  <span class="meta" id="lastupd">—</span>
+</header>
+<div class="wrap">
+  <div class="cards" id="cards"></div>
+  <div class="grid">
+    <div>
+      <h2>Tasks</h2>
+      <div class="panel"><table id="tasktbl">
+        <thead><tr><th>ID</th><th>Status</th><th>Worker</th><th>Prio</th>
+          <th>Requires</th><th>Branch</th><th></th></tr></thead>
+        <tbody id="taskbody"><tr><td class="empty" colspan="7">loading…</td></tr></tbody>
+      </table></div>
+    </div>
+    <div>
+      <h2>Workers</h2>
+      <div class="panel" id="workers"><div class="empty">—</div></div>
+      <h2 style="margin-top:22px">Transports</h2>
+      <div class="panel" id="transports"><div class="empty">—</div></div>
+    </div>
+  </div>
+</div>
+<script>
+const TOKEN = "%TOKEN%";
+const H = { 'Authorization': 'Bearer ' + TOKEN };
+const ORDER = ['running','claimed','pending','done','verifying','needs_attention','merged','cancelled','dead'];
+
+function el(t, cls, txt){ const e=document.createElement(t); if(cls)e.className=cls;
+  if(txt!=null)e.textContent=txt; return e; }
+
+async function poll(){
+  const dot = document.getElementById('livedot');
+  try {
+    const r = await fetch('/status', {headers:H});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const d = await r.json();
+    dot.classList.add('live');
+    document.getElementById('lastupd').textContent =
+      'updated ' + new Date().toLocaleTimeString();
+    render(d);
+  } catch(e){
+    dot.classList.remove('live');
+    document.getElementById('lastupd').textContent = 'error: ' + e.message;
+  }
+}
+
+function render(d){
+  const counts = d.counts||{}, tasks = d.tasks||[];
+  // cards
+  const cards = document.getElementById('cards'); cards.innerHTML='';
+  const total = tasks.length;
+  const tc = el('div','card'); tc.appendChild(el('div','n',total));
+  tc.appendChild(el('div','l','total')); cards.appendChild(tc);
+  ORDER.forEach(s=>{ if(counts[s]){ const c=el('div','card '+s);
+    c.appendChild(el('div','n',counts[s])); c.appendChild(el('div','l',s.replace('_',' ')));
+    cards.appendChild(c);} });
+  // tasks
+  const tb = document.getElementById('taskbody'); tb.innerHTML='';
+  if(!tasks.length){ tb.appendChild(row7('no tasks')); }
+  tasks.forEach(t=>{
+    const tr=document.createElement('tr');
+    tr.appendChild(cell(t.id,'mono'));
+    const sc=document.createElement('td');
+    sc.appendChild(el('span','badge b-'+t.status,t.status.replace('_',' ')));
+    if(t.error){ const e=el('div','err',t.error); sc.appendChild(e);} tr.appendChild(sc);
+    tr.appendChild(cell(t.worker_id || t.worker || '—', 'muted'));
+    tr.appendChild(cell(t.priority));
+    tr.appendChild(cell((t.requires&&t.requires.length)?
+      (Array.isArray(t.requires)?t.requires.join(' '):t.requires):'—','muted'));
+    tr.appendChild(cell(t.branch||'—','mono muted'));
+    const ac=document.createElement('td');
+    if(!['merged','cancelled','dead'].includes(t.status)){
+      const b=el('button','btn','cancel'); b.onclick=()=>cancel(t.id); ac.appendChild(b);}
+    tr.appendChild(ac);
+    tb.appendChild(tr);
+  });
+  // workers (derived from active task ownership)
+  const wmap={};
+  tasks.forEach(t=>{ if(t.worker_id){ wmap[t.worker_id]=wmap[t.worker_id]||[];
+    if(['running','claimed'].includes(t.status)) wmap[t.worker_id].push(t.id);} });
+  // include pinned lanes that have no active task
+  tasks.forEach(t=>{ if(t.worker && !wmap[t.worker]) wmap[t.worker]=wmap[t.worker]||[]; });
+  const wp=document.getElementById('workers'); wp.innerHTML='';
+  const wkeys=Object.keys(wmap);
+  if(!wkeys.length){ wp.appendChild(el('div','empty','no worker activity')); }
+  wkeys.sort().forEach(w=>{
+    const busy=wmap[w].length>0;
+    const row=el('div','worker');
+    row.appendChild(el('span','wdot'+(busy?'':' idle')));
+    row.appendChild(el('span','mono',w));
+    row.appendChild(el('span','muted', busy?('· '+wmap[w][0]):'· idle'));
+    wp.appendChild(row);
+  });
+  // transports
+  const tp=document.getElementById('transports'); tp.innerHTML='';
+  [['queue REST',':5001','live'],['git smart-HTTP',':8418','lab.git clone+push']]
+    .forEach(([n,p,s])=>{ const row=el('div','worker');
+      row.appendChild(el('span','wdot')); row.appendChild(el('span','mono',n));
+      row.appendChild(el('span','muted','· '+p+' '+s)); tp.appendChild(row); });
+}
+function cell(txt,cls){ return el('td',cls,txt==null?'':String(txt)); }
+function row7(msg){ const tr=document.createElement('tr');
+  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=7; return tr; }
+async function cancel(id){
+  if(!confirm('Cancel '+id+'?')) return;
+  await fetch('/cancel',{method:'POST',headers:{...H,'Content-Type':'application/json'},
+    body:JSON.stringify({task_id:id})});
+  poll();
+}
+setInterval(()=>document.getElementById('clock').textContent=new Date().toLocaleTimeString(),1000);
+poll(); setInterval(poll, 2000);
+</script>
+</body>
+</html>
