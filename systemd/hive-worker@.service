@@ -10,6 +10,9 @@ WorkingDirectory=%h/hive
 EnvironmentFile=-%h/.hive/hive.env
 Environment=HIVE_QUEUE_URL=http://127.0.0.1:5001
 Environment=PYTHONUNBUFFERED=1
+# systemd runs with a minimal PATH that excludes ~/.local/bin, so point at the
+# copilot CLI by absolute path (a bare `copilot` fails with Errno 2).
+Environment=HIVE_COPILOT_CMD=%h/.local/bin/copilot
 # %i is the lane name (e.g. hal). worker-id defaults to "<lane>#1".
 ExecStart=/usr/bin/python3 %h/hive/worker_loop.py \
     --worker-id %i#1 --lane %i \

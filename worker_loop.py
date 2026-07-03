@@ -38,16 +38,22 @@ POLL_BACKOFF_S       = 3         # sleep when /claim returns empty (204)
 COPILOT_TIMEOUT_S    = 840
 
 
-def _copilot_argv(prompt: str) -> list[str]:
+def _copilot_argv(prompt_ref: str) -> list[str]:
     """Build the copilot invocation. The executable is configurable via
     HIVE_COPILOT_CMD because the CLI is not always named `copilot` on PATH —
     on Windows npm installs a `copilot.cmd` shim that CreateProcess cannot
     launch via a bare `copilot` (PATHEXT is not applied to argv[0]). Point
     HIVE_COPILOT_CMD at the full shim path there, e.g.
-    C:\\npm-global\\copilot.cmd."""
+    C:\\npm-global\\copilot.cmd.
+
+    ``prompt_ref`` is a copilot ``-p`` argument. Callers pass ``@<file>`` so the
+    prompt is read from a file rather than argv: a large prompt (e.g. a PR diff
+    embedded for review) overflows the Windows CreateProcess command-line limit
+    (~32 KB) and fails with WinError 206. A file reference is a few bytes and
+    works identically on every platform."""
     exe = os.environ.get('HIVE_COPILOT_CMD', 'copilot')
-    return [exe, '-p', prompt, '--no-ask-user',
-            '--allow-all-tools', '--autopilot', '--output-format', 'json']
+    return [exe, '-p', prompt_ref, '--no-ask-user',
+            '--allow-all', '--autopilot', '--output-format', 'json']
 
 
 # ── Queue client (REST) ───────────────────────────────────────────────────────
@@ -120,6 +126,12 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
     # run_dir pollutes every commit and causes cross-task rebase conflicts).
     log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl')
     os.close(log_fd)
+    # Prompt also lives outside the clone and is fed to copilot via `-p @file`
+    # (see _copilot_argv): a large embedded prompt overflows the Windows argv
+    # limit (WinError 206). Writing it inside run_dir would also get committed.
+    prompt_fd, prompt_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.prompt')
+    with os.fdopen(prompt_fd, 'w', encoding='utf-8') as pf:
+        pf.write(task['prompt'])
 
     def g(*a, cwd=run_dir):
         return subprocess.run(['git', *a], cwd=cwd, capture_output=True, text=True)
@@ -139,7 +151,7 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
 
         with open(log_path, 'w') as log:
             proc = subprocess.run(
-                _copilot_argv(task['prompt']),
+                _copilot_argv(f'@{prompt_path}'),
                 cwd=run_dir, stdout=log, stderr=subprocess.STDOUT,
                 timeout=COPILOT_TIMEOUT_S, text=True,
             )
@@ -162,6 +174,11 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         return {'exit_code': 124, 'error': 'copilot timed out', 'log_path': log_path}
     except Exception as e:
         return {'exit_code': 1, 'error': str(e), 'log_path': log_path}
+    finally:
+        try:
+            os.remove(prompt_path)
+        except OSError:
+            pass
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
