@@ -14,6 +14,7 @@ tag language. Keep every tag defined here and nowhere else.
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import shutil
@@ -120,6 +121,43 @@ COMPLEXITY_MODELS: dict[int, str] = {
     3: 'claude-opus-4.8',     # complex / architectural
 }
 COMPLEXITY_LABELS: dict[int, str] = {1: 'simple', 2: 'standard', 3: 'complex'}
+
+
+def _load_model_overrides() -> None:
+    """F2 (#21): let operators remap complexity->model without editing code, so
+    the hardcoded ids don't rot as models are renamed/retired. Precedence (low to
+    high): built-in defaults, then ~/.hive/models.json (or $HIVE_MODELS_FILE),
+    then the $HIVE_MODELS env var (JSON). Each source is a partial {level: id}
+    map merged over the current mapping. Keys are 1..3 (int or str); bad/absent
+    sources are ignored so a typo never takes the fleet down."""
+    import json
+    sources = []
+    path = os.environ.get('HIVE_MODELS_FILE',
+                          os.path.expanduser('~/.hive/models.json'))
+    try:
+        with open(path) as fh:
+            sources.append(fh.read())
+    except OSError:
+        pass
+    if os.environ.get('HIVE_MODELS'):
+        sources.append(os.environ['HIVE_MODELS'])
+    for raw in sources:
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for k, v in data.items():
+            try:
+                level = int(k)
+            except (ValueError, TypeError):
+                continue
+            if level in (1, 2, 3) and isinstance(v, str) and v.strip():
+                COMPLEXITY_MODELS[level] = v.strip()
+
+
+_load_model_overrides()
 
 
 def model_for_complexity(complexity: int) -> str:
