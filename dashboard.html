@@ -39,6 +39,11 @@
   th,td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--border);
           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:220px; }
   th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; }
+  th.sortable { cursor:pointer; user-select:none; }
+  th.sortable:hover { color:var(--fg); }
+  th.sortable .arw { opacity:.4; font-size:9px; margin-left:3px; }
+  th.sortable.active { color:var(--fg); }
+  th.sortable.active .arw { opacity:1; }
   tr:last-child td { border-bottom:none; }
   tr:hover td { background:rgba(88,166,255,.06); }
   .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;
@@ -100,9 +105,16 @@
     <div>
       <h2>Tasks</h2>
       <div class="panel"><table id="tasktbl">
-        <thead><tr><th>ID</th><th>Task</th><th>Status</th><th>Worker</th><th>Model</th><th>Prio</th>
-          <th>Requires</th><th>Branch</th><th></th></tr></thead>
-        <tbody id="taskbody"><tr><td class="empty" colspan="9">loading…</td></tr></tbody>
+        <thead><tr>
+          <th class="sortable" data-sort="id">ID<span class="arw"></span></th>
+          <th>Task</th>
+          <th class="sortable" data-sort="status">Status<span class="arw"></span></th>
+          <th>Worker</th><th>Model</th>
+          <th class="sortable" data-sort="priority">Prio<span class="arw"></span></th>
+          <th>Requires</th><th>Branch</th>
+          <th class="sortable" data-sort="time">Time<span class="arw"></span></th>
+          <th></th></tr></thead>
+        <tbody id="taskbody"><tr><td class="empty" colspan="10">loading…</td></tr></tbody>
       </table></div>
     </div>
     <div>
@@ -139,6 +151,52 @@ const H = { 'Authorization': 'Bearer ' + RO_TOKEN };
 function ctlToken(){ return sessionStorage.getItem('hive_ctl') || ''; }
 function ctlHeaders(){ return {'Authorization':'Bearer '+ctlToken(),'Content-Type':'application/json'}; }
 const ORDER = ['running','claimed','pending','done','verifying','needs_attention','merged','cancelled','dead'];
+const STATUS_RANK = Object.fromEntries(ORDER.map((s,i)=>[s,i]));
+// Sort state for the task table. key=null -> server's natural order.
+const SORT = { key:null, dir:1 };   // dir: 1 asc, -1 desc
+
+// SQLite datetime('now') is a UTC string "YYYY-MM-DD HH:MM:SS" with no zone —
+// parse it explicitly as UTC (a bare `new Date(str)` treats it as local time).
+function parseTs(s){ if(!s) return null; const d=new Date(s.replace(' ','T')+'Z');
+  return isNaN(d) ? null : d.getTime(); }
+// A task's representative time: when it finished if terminal, else when created.
+function taskTs(t){ return parseTs(t.done_at) || parseTs(t.created_at) || 0; }
+
+function sortVal(t, key){
+  if(key==='id')       return (t.id||'').toLowerCase();
+  if(key==='status')   return STATUS_RANK[t.status] ?? 99;
+  if(key==='priority') return t.priority==null ? 999 : t.priority;
+  if(key==='time')     return taskTs(t);
+  return 0;
+}
+function sortTasks(tasks){
+  if(!SORT.key) return tasks;                 // keep server order
+  return tasks.slice().sort((a,b)=>{
+    const va=sortVal(a,SORT.key), vb=sortVal(b,SORT.key);
+    if(va<vb) return -1*SORT.dir; if(va>vb) return 1*SORT.dir;
+    // stable tiebreak so equal rows don't jitter between polls
+    return (a.id||'').localeCompare(b.id||'');
+  });
+}
+function updateSortHeaders(){
+  document.querySelectorAll('#tasktbl th.sortable').forEach(th=>{
+    const active = th.dataset.sort===SORT.key;
+    th.classList.toggle('active', active);
+    th.querySelector('.arw').textContent = active ? (SORT.dir>0?'▲':'▼') : '';
+  });
+}
+function initSortHeaders(){
+  document.querySelectorAll('#tasktbl th.sortable').forEach(th=>{
+    th.addEventListener('click', ()=>{
+      const k = th.dataset.sort;
+      if(SORT.key===k) SORT.dir *= -1;         // same column -> toggle direction
+      else { SORT.key=k; SORT.dir = (k==='time') ? -1 : 1; }  // time defaults newest-first
+      updateSortHeaders();
+      if(LAST_DATA) render(LAST_DATA);         // re-render immediately, no wait for poll
+    });
+  });
+}
+let LAST_DATA = null;
 
 function el(t, cls, txt){ const e=document.createElement(t); if(cls)e.className=cls;
   if(txt!=null)e.textContent=txt; return e; }
@@ -160,6 +218,7 @@ async function poll(){
 }
 
 function render(d){
+  LAST_DATA = d;
   const counts = d.counts||{}, tasks = d.tasks||[];
   // cards
   const cards = document.getElementById('cards'); cards.innerHTML='';
@@ -172,7 +231,7 @@ function render(d){
   // tasks
   const tb = document.getElementById('taskbody'); tb.innerHTML='';
   if(!tasks.length){ tb.appendChild(row7('no tasks')); }
-  tasks.forEach(t=>{
+  sortTasks(tasks).forEach(t=>{
     const tr=document.createElement('tr');
     tr.appendChild(cell(t.id,'mono'));
     tr.appendChild(cell(t.title||'—','title'));
@@ -185,6 +244,7 @@ function render(d){
     tr.appendChild(cell((t.requires&&t.requires.length)?
       (Array.isArray(t.requires)?t.requires.join(' '):t.requires):'—','muted'));
     tr.appendChild(cell(t.branch||'—','mono muted'));
+    tr.appendChild(timeCell(t));
     const ac=document.createElement('td');
     if(!['merged','cancelled','dead'].includes(t.status)){
       const b=el('button','btn','cancel'); b.onclick=()=>cancel(t.id); ac.appendChild(b);}
@@ -241,9 +301,20 @@ function modelLabel(t){
   return s || '—';
 }
 function fmtAge(s){ if(s==null) return '?'; if(s<60) return s+'s ago';
-  if(s<3600) return Math.floor(s/60)+'m ago'; return Math.floor(s/3600)+'h ago'; }
+  if(s<3600) return Math.floor(s/60)+'m ago'; if(s<86400) return Math.floor(s/3600)+'h ago';
+  return Math.floor(s/86400)+'d ago'; }
+function timeCell(t){
+  const ms = taskTs(t);
+  if(!ms) return cell('—','muted');
+  const age = Math.max(0, Math.floor((Date.now()-ms)/1000));
+  const td = el('td','muted', fmtAge(age));
+  const terminal = ['merged','cancelled','dead','done','needs_attention'].includes(t.status);
+  td.title = (terminal && t.done_at ? 'finished ' : 'created ')
+    + new Date(ms).toLocaleString() + (t.created_at?('  ·  created '+new Date(parseTs(t.created_at)).toLocaleString()):'');
+  return td;
+}
 function row7(msg){ const tr=document.createElement('tr');
-  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=9; return tr; }
+  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=10; return tr; }
 async function cancel(id){
   if(!ctlToken()){
     const t = prompt('Cancel is a control action. Paste the control token (HIVE_TOKEN):');
@@ -261,6 +332,7 @@ async function cancel(id){
   poll();
 }
 setInterval(()=>document.getElementById('clock').textContent=new Date().toLocaleTimeString(),1000);
+initSortHeaders(); updateSortHeaders();
 poll(); setInterval(poll, 2000);
 
 // ── Add-a-worker one-liner builder ──────────────────────────────────────────
