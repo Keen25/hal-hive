@@ -269,10 +269,32 @@ document.querySelectorAll('.osb').forEach(b=>b.addEventListener('click',()=>{
   b.classList.add('sel'); W_OS = b.dataset.os; buildCmd();
 }));
 ['w_lane','w_caps','w_id'].forEach(id=>document.getElementById(id).addEventListener('input',buildCmd));
+function copyText(t){
+  // navigator.clipboard exists ONLY in secure contexts (https / localhost).
+  // The dashboard is served over plain http on the LAN, so fall back to the
+  // legacy execCommand('copy') via a hidden textarea when it's unavailable.
+  if(navigator.clipboard && window.isSecureContext){
+    return navigator.clipboard.writeText(t).then(()=>true).catch(()=>false);
+  }
+  try{
+    const ta=document.createElement('textarea');
+    ta.value=t;
+    ta.style.position='fixed'; ta.style.top='-9999px'; ta.style.opacity='0';
+    ta.setAttribute('readonly','');
+    document.body.appendChild(ta);
+    ta.select(); ta.setSelectionRange(0, t.length);
+    const ok=document.execCommand('copy');
+    document.body.removeChild(ta);
+    return Promise.resolve(ok);
+  }catch(e){ return Promise.resolve(false); }
+}
 document.getElementById('w_copy').addEventListener('click',()=>{
   const t=document.getElementById('w_cmd').textContent;
-  navigator.clipboard?.writeText(t); const b=document.getElementById('w_copy');
-  b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200);
+  const b=document.getElementById('w_copy');
+  copyText(t).then(ok=>{
+    b.textContent = ok ? 'Copied' : 'Copy failed — select manually';
+    setTimeout(()=>b.textContent='Copy', ok ? 1200 : 2500);
+  });
 });
 </script>
 </body>
