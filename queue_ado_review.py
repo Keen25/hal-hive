@@ -162,6 +162,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pr_id", type=int)
     ap.add_argument("--priority", type=int, default=3)
+    ap.add_argument("--complexity", default="3", choices=["1", "2", "3", "auto"],
+                    help="model tier (default 3=opus: PR review is high-reasoning)")
     ap.add_argument("--worker", default=None, help="pin to a lane (optional)")
     args = ap.parse_args()
 
@@ -169,7 +171,8 @@ def main():
     prompt = build_review_prompt(args.pr_id, token)
 
     cmd = ["python3", "halctl.py", "add", prompt,
-           "--priority", str(args.priority)]
+           "--priority", str(args.priority),
+           "--complexity", args.complexity]
     if args.worker:
         cmd += ["--worker", args.worker]
     print(f"[queue-ado-review] prompt assembled ({len(prompt)} chars) — adding task")

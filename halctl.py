@@ -32,11 +32,22 @@ _ICON = {
 
 
 def cmd_add(a):
+    import hive_caps
     tid = a.id or f'task-{uuid.uuid4().hex[:8]}'
+    if a.complexity == 'auto':
+        cl = hive_caps.classify_complexity(a.prompt)
+        complexity, model = cl['complexity'], cl['model']
+        auto_note = f" (auto: {cl['label']} — {'; '.join(cl['reasons'])})"
+    else:
+        complexity = int(a.complexity)
+        model = hive_caps.model_for_complexity(complexity)
+        auto_note = ''
     q.add_task(tid, a.prompt, branch=a.branch, base_ref=a.base_ref,
                worker=a.worker, requires=a.require, scope=a.scope,
-               priority=a.priority, deps=a.dep, max_attempts=a.max_attempts)
+               priority=a.priority, complexity=complexity, model=model,
+               deps=a.dep, max_attempts=a.max_attempts)
     bits = [f'+ {tid}', f'prio={a.priority}',
+            f'cx={complexity}/{model}{auto_note}',
             f'branch={a.branch or f"feature/{tid}"}']
     if a.worker:
         bits.append(f'pin={a.worker}')
@@ -51,12 +62,18 @@ def cmd_classify(a):
     import json
     import hive_caps
     r = hive_caps.classify_prompt(a.prompt)
+    cx = hive_caps.classify_complexity(a.prompt)
     if a.json:
-        print(json.dumps(r))
+        print(json.dumps({**r, 'complexity': cx['complexity'],
+                          'model': cx['model'], 'complexity_label': cx['label'],
+                          'complexity_reasons': cx['reasons']}))
         return
     print(f"confidence: {r['confidence']}")
     print(f"requires:   {' '.join(r['requires']) or '(none — runs anywhere)'}")
     for why in r['reasons']:
+        print(f"  · {why}")
+    print(f"complexity: {cx['complexity']} ({cx['label']}) -> {cx['model']}")
+    for why in cx['reasons']:
         print(f"  · {why}")
 
 
@@ -115,6 +132,10 @@ def main():
                          'e.g. --require os:windows --require msbuild')
     pa.add_argument('--scope', help='build/test scope for the verify gate')
     pa.add_argument('--priority', type=int, default=5)
+    pa.add_argument('--complexity', required=True,
+                    choices=['1', '2', '3', 'auto'],
+                    help='required. model tier: 1=haiku(simple) 2=sonnet(standard) '
+                         '3=opus(complex), or "auto" to classify from the prompt')
     pa.add_argument('--dep', action='append', help='dependency task id (repeatable)')
     pa.add_argument('--max-attempts', type=int, default=3)
     pa.set_defaults(fn=cmd_add)

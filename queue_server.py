@@ -132,6 +132,7 @@ def claim():
             return jsonify(
                 id=task.id, branch=task.branch, base_ref=task.base_ref,
                 prompt=task.prompt, scope=task.scope, attempts=task.attempts,
+                model=task.model,
             ), 200
         if time.time() >= deadline:
             return '', 204
@@ -167,6 +168,8 @@ def add():
         base_ref=b.get('base_ref', q.DEFAULT_BASE_REF), worker=b.get('worker'),
         requires=b.get('requires'), scope=b.get('scope'),
         priority=int(b.get('priority', 5)),
+        complexity=(int(b['complexity']) if b.get('complexity') is not None else None),
+        model=b.get('model'),
         deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
     )
     return jsonify(id=b['id']), 201

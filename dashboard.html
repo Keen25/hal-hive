@@ -82,9 +82,9 @@
     <div>
       <h2>Tasks</h2>
       <div class="panel"><table id="tasktbl">
-        <thead><tr><th>ID</th><th>Task</th><th>Status</th><th>Worker</th><th>Prio</th>
+        <thead><tr><th>ID</th><th>Task</th><th>Status</th><th>Worker</th><th>Model</th><th>Prio</th>
           <th>Requires</th><th>Branch</th><th></th></tr></thead>
-        <tbody id="taskbody"><tr><td class="empty" colspan="8">loading…</td></tr></tbody>
+        <tbody id="taskbody"><tr><td class="empty" colspan="9">loading…</td></tr></tbody>
       </table></div>
     </div>
     <div>
@@ -140,6 +140,7 @@ function render(d){
     sc.appendChild(el('span','badge b-'+t.status,t.status.replace('_',' ')));
     if(t.error){ const e=el('div','err',t.error); sc.appendChild(e);} tr.appendChild(sc);
     tr.appendChild(cell(t.worker_id || t.worker || '—', 'muted'));
+    tr.appendChild(cell(modelLabel(t), 'muted'));
     tr.appendChild(cell(t.priority));
     tr.appendChild(cell((t.requires&&t.requires.length)?
       (Array.isArray(t.requires)?t.requires.join(' '):t.requires):'—','muted'));
@@ -193,10 +194,16 @@ function render(d){
       row.appendChild(el('span','muted','· '+p+' '+s)); tp.appendChild(row); });
 }
 function cell(txt,cls){ return el('td',cls,txt==null?'':String(txt)); }
+function modelLabel(t){
+  const short = m => m ? m.replace(/^claude-/,'').replace(/-[0-9.]+$/,'') : '';
+  const s = short(t.model);
+  if(t.complexity) return 'c'+t.complexity+(s?' · '+s:'');
+  return s || '—';
+}
 function fmtAge(s){ if(s==null) return '?'; if(s<60) return s+'s ago';
   if(s<3600) return Math.floor(s/60)+'m ago'; return Math.floor(s/3600)+'h ago'; }
 function row7(msg){ const tr=document.createElement('tr');
-  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=8; return tr; }
+  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=9; return tr; }
 async function cancel(id){
   if(!confirm('Cancel '+id+'?')) return;
   await fetch('/cancel',{method:'POST',headers:{...H,'Content-Type':'application/json'},

@@ -104,6 +104,79 @@ _VAGUE = re.compile(r'\b(fix|investigate|look\s+into|the\s+flaky|something|'
                     r'the\s+thing|debug|why)\b', re.I)
 
 
+# ---------------------------------------------------------------------------
+# Complexity → model tiers.
+#
+# Complexity is chosen at task-creation time (required on `halctl add`) and maps
+# to the model the worker runs copilot with: a cheap model for mechanical edits,
+# a frontier model for architectural work. This is the single source of truth
+# for the mapping — the add path stamps `model` onto the task from here, the
+# worker just uses task['model'].
+# ---------------------------------------------------------------------------
+
+COMPLEXITY_MODELS: dict[int, str] = {
+    1: 'claude-haiku-4.5',    # simple / mechanical
+    2: 'claude-sonnet-4.6',   # standard coding
+    3: 'claude-opus-4.8',     # complex / architectural
+}
+COMPLEXITY_LABELS: dict[int, str] = {1: 'simple', 2: 'standard', 3: 'complex'}
+
+
+def model_for_complexity(complexity: int) -> str:
+    """Map a 1..3 complexity to its model id (defaults to the middle tier)."""
+    return COMPLEXITY_MODELS.get(int(complexity), COMPLEXITY_MODELS[2])
+
+
+# Architectural / high-reasoning signals -> tier 3 (opus).
+_COMPLEX_RX = re.compile(
+    r'\b(re-?architect|architecture|redesign|\bdesign\b|refactor|migrat\w+|'
+    r'debug|investigat\w+|root\s*cause|diagnos\w+|race\s*condition|deadlock|'
+    r'concurren\w+|thread[- ]?saf\w+|security|vulnerab\w+|\bcve\b|'
+    r'optimi[sz]e|performance|end[- ]?to[- ]?end|\breview\b|'
+    r'active\s*roles|oi\.ldap|across\s+\w+\s+(files|modules|services))\b', re.I)
+
+# Mechanical / trivial signals -> tier 1 (haiku).
+_SIMPLE_RX = re.compile(
+    r'\b(create\s+a\s+file|add\s+a\s+(line|comment)|rename|fix\s+(a\s+)?typo|'
+    r'bump\s+(the\s+)?version|update\s+the\s+version|reformat|whitespace|'
+    r'delete\s+the|remove\s+the|one\s+line|readme|changelog|'
+    r'\.gitignore|add\s+a\s+badge)\b', re.I)
+
+_COMPLEX_LEN = 3000     # a very large prompt (e.g. an embedded PR diff) is complex
+_SIMPLE_MAXLEN = 400    # a "simple" signal only counts on a short, focused prompt
+
+
+def classify_complexity(prompt: str) -> dict:
+    """Heuristically infer a task's complexity tier (1..3) and its model.
+
+    Returns {complexity, model, label, reasons}. Precedence: any architectural
+    signal (or a very large prompt) -> 3; else a mechanical signal on a short
+    prompt -> 1; otherwise the standard middle tier -> 2. This backs the
+    explicit `--complexity auto` opt-in; it is never applied silently (a bare
+    `halctl add` requires the caller to pass a complexity).
+    """
+    text = prompt or ''
+    reasons: list[str] = []
+    complex_hit = bool(_COMPLEX_RX.search(text))
+    if complex_hit:
+        reasons.append('architectural/high-reasoning keyword')
+    if len(text) > _COMPLEX_LEN:
+        complex_hit = True
+        reasons.append(f'large prompt ({len(text)} chars) — likely embedded spec/diff')
+
+    if complex_hit:
+        c = 3
+    elif _SIMPLE_RX.search(text) and len(text) < _SIMPLE_MAXLEN:
+        c = 1
+        reasons.append('short, mechanical edit')
+    else:
+        c = 2
+        if not reasons:
+            reasons.append('no strong signal — default standard tier')
+    return {'complexity': c, 'model': model_for_complexity(c),
+            'label': COMPLEXITY_LABELS[c], 'reasons': reasons}
+
+
 def classify_prompt(prompt: str) -> dict:
     """Infer required capability tags from a task prompt.
 

@@ -40,7 +40,7 @@ HEARTBEAT_RENEW   = '+15 minutes'    # §4 pulse renews the lease
 REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
 
 # Verify host used by the merge gate (§7). Overridable via env for tests.
@@ -86,6 +86,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     requires      TEXT,                        -- capability tags a worker MUST have (space-sep), NULL = none
     scope         TEXT,                        -- optional build/test scope for verify gate
     priority      INTEGER NOT NULL DEFAULT 5,  -- 1=urgent .. 10=background
+    complexity    INTEGER,                     -- 1=simple 2=standard 3=complex -> model tier
+    model         TEXT,                        -- copilot model derived from complexity
     status        TEXT NOT NULL DEFAULT 'pending',
     worker_id     TEXT,
     attempts      INTEGER NOT NULL DEFAULT 0,
@@ -135,6 +137,11 @@ def init_db(db_path: str = QUEUE_DB) -> None:
         cols = {r['name'] for r in cur.execute('PRAGMA table_info(tasks)').fetchall()}
         if 'requires' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN requires TEXT')
+        # Migration v4 -> v5: per-task complexity tier + derived model.
+        if 'complexity' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN complexity INTEGER')
+        if 'model' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN model TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -206,6 +213,8 @@ def add_task(
     requires: Optional[list[str]] = None,
     scope: Optional[str] = None,
     priority: int = 5,
+    complexity: Optional[int] = None,
+    model: Optional[str] = None,
     deps: Optional[list[str]] = None,
     max_attempts: int = 3,
     db_path: str = QUEUE_DB,
@@ -215,16 +224,23 @@ def add_task(
     `worker` pins the task to one exact lane. `requires` is a set of capability
     tags a worker must ALL advertise to be allowed to claim it (e.g.
     ['os:windows', 'msbuild']). Both are optional and both must pass.
+
+    `complexity` (1..3) selects the model the worker runs copilot with; `model`
+    is normally derived from it by the caller. If `model` is not given but
+    `complexity` is, the model is filled in here from the shared mapping.
     """
+    if model is None and complexity is not None:
+        from hive_caps import model_for_complexity
+        model = model_for_complexity(complexity)
     branch = branch or f'feature/{task_id}'
     with cursor(db_path) as cur:
         cur.execute(
             """INSERT INTO tasks
                  (id, branch, base_ref, prompt, worker, requires, scope,
-                  priority, max_attempts)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  priority, complexity, model, max_attempts)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, branch, base_ref, prompt, worker, canon_tags(requires),
-             scope, priority, max_attempts),
+             scope, priority, complexity, model, max_attempts),
         )
         for dep in (deps or []):
             cur.execute(
@@ -243,6 +259,7 @@ class ClaimedTask:
     prompt: str
     scope: Optional[str]
     attempts: int
+    model: Optional[str] = None
 
 
 def claim_next(worker_id: str, worker_lane: Optional[str] = None,
@@ -265,7 +282,7 @@ def claim_next(worker_id: str, worker_lane: Optional[str] = None,
         rows = conn.execute(
             """
             SELECT t.id, t.branch, t.base_ref, t.prompt, t.scope, t.attempts,
-                   t.requires
+                   t.requires, t.model
             FROM tasks t
             WHERE t.status = 'pending'
               AND (t.not_before IS NULL OR t.not_before <= datetime('now'))
@@ -303,7 +320,7 @@ def claim_next(worker_id: str, worker_lane: Optional[str] = None,
         return ClaimedTask(
             id=chosen['id'], branch=chosen['branch'], base_ref=chosen['base_ref'],
             prompt=chosen['prompt'], scope=chosen['scope'],
-            attempts=chosen['attempts'] + 1,
+            attempts=chosen['attempts'] + 1, model=chosen['model'],
         )
     except Exception:
         conn.execute('ROLLBACK;')
@@ -653,8 +670,8 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
             ).fetchall()
         }
         rows = [dict(r) for r in cur.execute(
-            """SELECT id, status, worker_id, worker, requires, priority, branch,
-                      commit_hash, error, prompt
+            """SELECT id, status, worker_id, worker, requires, priority,
+                      complexity, model, branch, commit_hash, error, prompt
                FROM tasks ORDER BY
                  CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
                              WHEN 'pending' THEN 2 ELSE 3 END,

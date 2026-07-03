@@ -38,7 +38,7 @@ POLL_BACKOFF_S       = 3         # sleep when /claim returns empty (204)
 COPILOT_TIMEOUT_S    = 840
 
 
-def _copilot_argv(prompt_ref: str) -> list[str]:
+def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
     """Build the copilot invocation. The executable is configurable via
     HIVE_COPILOT_CMD because the CLI is not always named `copilot` on PATH —
     on Windows npm installs a `copilot.cmd` shim that CreateProcess cannot
@@ -50,10 +50,17 @@ def _copilot_argv(prompt_ref: str) -> list[str]:
     prompt is read from a file rather than argv: a large prompt (e.g. a PR diff
     embedded for review) overflows the Windows CreateProcess command-line limit
     (~32 KB) and fails with WinError 206. A file reference is a few bytes and
-    works identically on every platform."""
+    works identically on every platform.
+
+    ``model`` (from the task's complexity tier) is passed through as ``--model``
+    so cheap work runs on a cheap model and complex work on a frontier one. When
+    absent, copilot uses its configured default."""
     exe = os.environ.get('HIVE_COPILOT_CMD', 'copilot')
-    return [exe, '-p', prompt_ref, '--no-ask-user',
+    argv = [exe, '-p', prompt_ref, '--no-ask-user',
             '--allow-all', '--autopilot', '--output-format', 'json']
+    if model:
+        argv += ['--model', model]
+    return argv
 
 
 # ── Queue client (REST) ───────────────────────────────────────────────────────
@@ -151,7 +158,7 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
 
         with open(log_path, 'w') as log:
             proc = subprocess.run(
-                _copilot_argv(f'@{prompt_path}'),
+                _copilot_argv(f'@{prompt_path}', model=task.get('model')),
                 cwd=run_dir, stdout=log, stderr=subprocess.STDOUT,
                 timeout=COPILOT_TIMEOUT_S, text=True,
             )
