@@ -33,12 +33,13 @@
   .card.running .n{color:var(--run);} .card.merged .n{color:var(--merge);}
   .card.pending .n{color:var(--pend);} .card.needs_attention .n{color:var(--warn);}
   .card.dead .n,.card.cancelled .n{color:var(--bad);}
-  .grid { display:grid; grid-template-columns:2fr 1fr; gap:22px; }
+  .grid { display:grid; grid-template-columns:minmax(0,2fr) minmax(300px,1fr); gap:22px; align-items:start; }
+  .grid > div { min-width:0; }
   @media(max-width:820px){ .grid{grid-template-columns:1fr;} }
   h2 { font-size:13px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted);
        margin:0 0 10px; }
   .panel { background:var(--panel); border:1px solid var(--border); border-radius:8px;
-           overflow:hidden; }
+           overflow:auto; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
   th,td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--border);
           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:220px; }
@@ -84,14 +85,25 @@
          padding:6px 10px; font-size:12px; cursor:pointer; }
   .osb:first-child{ border-radius:5px 0 0 5px; } .osb:last-child{ border-radius:0 5px 5px 0; border-left:0; }
   .osb.sel { background:var(--accent); color:#0d1117; border-color:var(--accent); }
-  .cmdrow { display:flex; gap:8px; align-items:stretch; margin-top:12px; }
-  .cmdrow code { flex:1; background:var(--bg); border:1px solid var(--border); border-radius:5px;
+  .cmdrow { display:flex; flex-wrap:wrap; gap:8px; align-items:stretch; margin-top:12px; }
+  .cmdrow code { flex:1 1 100%; min-width:0; background:var(--bg); border:1px solid var(--border); border-radius:5px;
                  padding:8px 10px; font:12px ui-monospace,monospace; color:var(--accent);
                  white-space:pre-wrap; word-break:break-all; }
-  #w_copy { background:transparent; border:1px solid var(--border); color:var(--muted);
-            border-radius:5px; padding:2px 12px; font-size:12px; cursor:pointer; }
-  #w_copy:hover{ border-color:var(--accent); color:var(--accent); }
+  #w_settok, #w_copy { flex:0 0 auto; white-space:nowrap; background:transparent; border:1px solid var(--border); color:var(--muted);
+            border-radius:5px; padding:4px 12px; font-size:12px; cursor:pointer; }
+  #w_settok:hover, #w_copy:hover{ border-color:var(--accent); color:var(--accent); }
   .hint { color:var(--muted); font-size:11px; margin-top:8px; }
+  .bigbtn { width:100%; background:var(--accent); color:#0d1117; border:0; border-radius:6px;
+            padding:10px; font-size:13px; font-weight:600; cursor:pointer; }
+  .bigbtn:hover { filter:brightness(1.08); }
+  dialog.modal { width:min(560px,92vw); border:1px solid var(--border); border-radius:10px;
+                 background:var(--panel); color:var(--fg); padding:20px; }
+  dialog.modal::backdrop { background:rgba(0,0,0,.55); }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; margin:0 0 14px; }
+  .modal-head h2 { margin:0; }
+  .modal-head .x { background:transparent; border:0; color:var(--muted); font-size:18px;
+                   line-height:1; cursor:pointer; padding:2px 6px; }
+  .modal-head .x:hover { color:var(--fg); }
 </style>
 </head>
 <body>
@@ -129,25 +141,33 @@
       <div class="panel" id="transports"><div class="empty">—</div></div>
       <h2 style="margin-top:22px">Add a worker</h2>
       <div class="panel" style="padding:14px">
-        <div class="addw">
-          <label>Lane <input id="w_lane" placeholder="sql1" autocomplete="off"></label>
-          <label>Caps <input id="w_caps" placeholder="app:sql" autocomplete="off"></label>
-          <label>Worker id <input id="w_id" placeholder="(lane#1)" autocomplete="off"></label>
-          <div class="os">
-            <button type="button" class="osb sel" data-os="ps1">Windows</button>
-            <button type="button" class="osb" data-os="sh">Linux / macOS</button>
-          </div>
-        </div>
-        <div class="cmdrow">
-          <code id="w_cmd">Run on a fresh box to join the hive.</code>
-          <button type="button" id="w_settok" title="Set the control token used to authorize the join">Set token</button>
-          <button type="button" id="w_copy" title="Copy">Copy</button>
-        </div>
-        <div class="hint">Joining a worker is a control action: click <b>Set token</b> and paste the control token (HIVE_TOKEN) — it stays in this browser tab only and is baked into the one-liner as an auth header. The script then installs Python, the worker, copilot auth &amp; a boot-persistent service. Re-running re-provisions the same lane.</div>
+        <button type="button" id="addw_open" class="bigbtn">+ Add a worker</button>
       </div>
     </div>
   </div>
 </div>
+
+<dialog id="addw_dlg" class="modal">
+  <form method="dialog" class="modal-head">
+    <h2>Add a worker</h2>
+    <button class="x" value="close" aria-label="Close" title="Close">&#10005;</button>
+  </form>
+  <div class="addw">
+    <label>Lane <input id="w_lane" placeholder="sql1" autocomplete="off"></label>
+    <label>Caps <input id="w_caps" placeholder="app:sql" autocomplete="off"></label>
+    <label>Worker id <input id="w_id" placeholder="(lane#1)" autocomplete="off"></label>
+    <div class="os">
+      <button type="button" class="osb sel" data-os="ps1">Windows</button>
+      <button type="button" class="osb" data-os="sh">Linux / macOS</button>
+    </div>
+  </div>
+  <div class="cmdrow">
+    <code id="w_cmd">Run on a fresh box to join the hive.</code>
+    <button type="button" id="w_settok" title="Set the control token used to authorize the join">Set token</button>
+    <button type="button" id="w_copy" title="Copy">Copy</button>
+  </div>
+  <div class="hint">Joining a worker is a control action: click <b>Set token</b> and paste the control token (HIVE_TOKEN) — it stays in this browser tab only and is baked into the one-liner as an auth header. The script then installs Python, the worker, copilot auth &amp; a boot-persistent service. Re-running re-provisions the same lane.</div>
+</dialog>
 <script>
 const RO_TOKEN = "%RO_TOKEN%";
 // Read-only token embedded server-side: only good for GET /status.
@@ -376,6 +396,11 @@ document.querySelectorAll('.osb').forEach(b=>b.addEventListener('click',()=>{
   b.classList.add('sel'); W_OS = b.dataset.os; buildCmd();
 }));
 ['w_lane','w_caps','w_id'].forEach(id=>document.getElementById(id).addEventListener('input',buildCmd));
+// Add-worker modal: open refreshes the command, click-on-backdrop closes it
+// (the header ✕ uses form method="dialog" and Esc closes natively).
+const _addwDlg = document.getElementById('addw_dlg');
+document.getElementById('addw_open').addEventListener('click',()=>{ buildCmd(); _addwDlg.showModal(); });
+_addwDlg.addEventListener('click', e=>{ if(e.target===_addwDlg) _addwDlg.close(); });
 function copyText(t){
   // navigator.clipboard exists ONLY in secure contexts (https / localhost).
   // The dashboard is served over plain http on the LAN, so fall back to the
