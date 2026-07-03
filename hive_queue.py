@@ -30,9 +30,9 @@ from typing import Iterator, Optional
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-HIVE_DIR   = os.path.expanduser('~/hive')
-QUEUE_DB   = os.path.join(HIVE_DIR, 'queue.db')
-LAB_GIT    = os.path.join(HIVE_DIR, 'lab.git')
+HIVE_DIR   = os.path.expanduser(os.environ.get('HIVE_DIR', '~/hive'))
+QUEUE_DB   = os.environ.get('HIVE_QUEUE_DB', os.path.join(HIVE_DIR, 'queue.db'))
+LAB_GIT    = os.environ.get('HIVE_LAB_DIR', os.path.join(HIVE_DIR, 'lab.git'))
 DEFAULT_BASE_REF = 'master'          # lab.git default branch
 
 LEASE_MINUTES     = 15               # §3 claim lease window
@@ -177,6 +177,11 @@ def ensure_lab_repo(lab_git: str = LAB_GIT, base_ref: str = DEFAULT_BASE_REF) ->
     if not os.path.isdir(lab_git):
         subprocess.run(['git', 'init', '--bare', '-b', base_ref, lab_git], check=True,
                        capture_output=True, text=True)
+    # Smart-HTTP push via git-http-backend is refused with HTTP 403 unless the
+    # bare repo explicitly enables receive-pack over HTTP. Set it idempotently so
+    # a from-scratch host accepts worker pushes (prod lab.git had it set by hand).
+    subprocess.run(['git', '--git-dir', lab_git, 'config', 'http.receivepack', 'true'],
+                   check=True, capture_output=True, text=True)
     # base_ref already has commits? nothing to do.
     have = subprocess.run(['git', '--git-dir', lab_git, 'rev-parse', '--verify',
                            f'refs/heads/{base_ref}'], capture_output=True, text=True)
