@@ -65,6 +65,24 @@
   .btn:hover{ border-color:var(--bad); color:var(--bad); }
   .empty { padding:22px; text-align:center; color:var(--muted); }
   .err { color:var(--bad); font-size:11px; }
+  .addw { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
+  .addw label { display:flex; flex-direction:column; gap:3px; font-size:11px;
+                text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }
+  .addw input { background:var(--bg); border:1px solid var(--border); color:var(--fg);
+                border-radius:5px; padding:5px 8px; font:13px ui-monospace,monospace; width:120px; }
+  .os { display:flex; gap:0; margin-left:auto; }
+  .osb { background:var(--bg); border:1px solid var(--border); color:var(--muted);
+         padding:6px 10px; font-size:12px; cursor:pointer; }
+  .osb:first-child{ border-radius:5px 0 0 5px; } .osb:last-child{ border-radius:0 5px 5px 0; border-left:0; }
+  .osb.sel { background:var(--accent); color:#0d1117; border-color:var(--accent); }
+  .cmdrow { display:flex; gap:8px; align-items:stretch; margin-top:12px; }
+  .cmdrow code { flex:1; background:var(--bg); border:1px solid var(--border); border-radius:5px;
+                 padding:8px 10px; font:12px ui-monospace,monospace; color:var(--accent);
+                 white-space:pre-wrap; word-break:break-all; }
+  #w_copy { background:transparent; border:1px solid var(--border); color:var(--muted);
+            border-radius:5px; padding:2px 12px; font-size:12px; cursor:pointer; }
+  #w_copy:hover{ border-color:var(--accent); color:var(--accent); }
+  .hint { color:var(--muted); font-size:11px; margin-top:8px; }
 </style>
 </head>
 <body>
@@ -92,6 +110,23 @@
       <div class="panel" id="workers"><div class="empty">—</div></div>
       <h2 style="margin-top:22px">Transports</h2>
       <div class="panel" id="transports"><div class="empty">—</div></div>
+      <h2 style="margin-top:22px">Add a worker</h2>
+      <div class="panel" style="padding:14px">
+        <div class="addw">
+          <label>Lane <input id="w_lane" placeholder="sql1" autocomplete="off"></label>
+          <label>Caps <input id="w_caps" placeholder="app:sql" autocomplete="off"></label>
+          <label>Worker id <input id="w_id" placeholder="(lane#1)" autocomplete="off"></label>
+          <div class="os">
+            <button type="button" class="osb sel" data-os="ps1">Windows</button>
+            <button type="button" class="osb" data-os="sh">Linux / macOS</button>
+          </div>
+        </div>
+        <div class="cmdrow">
+          <code id="w_cmd">Run on a fresh box to join the hive.</code>
+          <button type="button" id="w_copy" title="Copy">Copy</button>
+        </div>
+        <div class="hint">One-liner is self-contained: it installs Python, the worker, copilot auth &amp; a boot-persistent service. Re-running re-provisions the same lane.</div>
+      </div>
     </div>
   </div>
 </div>
@@ -212,6 +247,33 @@ async function cancel(id){
 }
 setInterval(()=>document.getElementById('clock').textContent=new Date().toLocaleTimeString(),1000);
 poll(); setInterval(poll, 2000);
+
+// ── Add-a-worker one-liner builder ──────────────────────────────────────────
+let W_OS = 'ps1';
+function buildCmd(){
+  const lane = (document.getElementById('w_lane').value || '').trim();
+  const caps = (document.getElementById('w_caps').value || '').trim();
+  const id   = (document.getElementById('w_id').value || '').trim();
+  const out  = document.getElementById('w_cmd');
+  if(!lane){ out.textContent = 'Enter a lane to generate the join command.'; return; }
+  const qs = new URLSearchParams({lane});
+  if(caps) qs.set('caps', caps);
+  if(id)   qs.set('id', id);
+  const url = location.origin + '/bootstrap.' + W_OS + '?' + qs.toString();
+  out.textContent = W_OS === 'ps1'
+    ? `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm '${url}' | iex"`
+    : `curl -fsSL '${url}' | sh`;
+}
+document.querySelectorAll('.osb').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('.osb').forEach(x=>x.classList.remove('sel'));
+  b.classList.add('sel'); W_OS = b.dataset.os; buildCmd();
+}));
+['w_lane','w_caps','w_id'].forEach(id=>document.getElementById(id).addEventListener('input',buildCmd));
+document.getElementById('w_copy').addEventListener('click',()=>{
+  const t=document.getElementById('w_cmd').textContent;
+  navigator.clipboard?.writeText(t); const b=document.getElementById('w_copy');
+  b.textContent='Copied'; setTimeout(()=>b.textContent='Copy',1200);
+});
 </script>
 </body>
 </html>

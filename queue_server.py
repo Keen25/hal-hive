@@ -34,9 +34,20 @@ import time
 from flask import Flask, Response, jsonify, request
 
 import hive_queue as q
+import bootstrap as bootstrap
 
 DASHBOARD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               'dashboard.html')
+HIVE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Files a fresh worker may pull over /download during bootstrap. Allowlisted so
+# the endpoint can never serve queue.db, tokens, or arbitrary paths.
+DOWNLOADABLE = {
+    'worker_loop.py': 'text/x-python',
+    'hive_caps.py':   'text/x-python',
+    'hive_queue.py':  'text/x-python',
+    'winsw.exe':      'application/octet-stream',
+}
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -77,7 +88,11 @@ def _authorized() -> bool:
 
 @app.before_request
 def _guard():
-    if request.method == 'GET' and request.path in ('/health', '/', '/dashboard'):
+    if request.method == 'GET' and (
+        request.path in ('/health', '/', '/dashboard', '/bootstrap.ps1',
+                         '/bootstrap.sh')
+        or request.path.startswith('/download/')
+    ):
         return None
     if not _authorized():
         return jsonify(error='unauthorized'), 401
@@ -86,6 +101,42 @@ def _guard():
 @app.get('/health')
 def health():
     return jsonify(ok=True)
+
+
+@app.get('/download/<path:name>')
+def download(name):
+    """Serve allowlisted worker assets to a bootstrapping node (LAN-trust, no
+    auth — the files are non-secret; the queue/copilot tokens live only in the
+    generated bootstrap scripts)."""
+    mime = DOWNLOADABLE.get(name)
+    if mime is None:
+        return jsonify(error='not found'), 404
+    path = os.path.join(HIVE_DIR, name)
+    if not os.path.isfile(path):
+        return jsonify(error='missing on server'), 404
+    with open(path, 'rb') as f:
+        return Response(f.read(), mimetype=mime)
+
+
+@app.get('/bootstrap.ps1')
+@app.get('/bootstrap.sh')
+def bootstrap_script():
+    """Return a ready-to-run worker setup script for a fresh box.
+
+    Query: lane (required), caps (comma/space list, optional), id (worker-id,
+    default '<lane>#1'). `.ps1` -> Windows/WinSW, `.sh` -> Linux(systemd)/
+    macOS(launchd). The queue + copilot tokens are injected server-side, so the
+    operator just runs the one-liner shown on the dashboard. LAN-trust, no auth
+    (same model as the dashboard, which also embeds the token)."""
+    os_kind = 'windows' if request.path.endswith('.ps1') else 'unix'
+    lane = (request.args.get('lane') or '').strip()
+    if not lane:
+        return Response('# error: ?lane= is required\n', status=400,
+                        mimetype='text/plain')
+    caps = request.args.get('caps', '')
+    wid = request.args.get('id', '')
+    body = bootstrap.build_script(os_kind, lane, caps, wid, TOKEN)
+    return Response(body, mimetype='text/plain')
 
 
 @app.get('/')
