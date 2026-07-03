@@ -30,6 +30,7 @@ import os
 import random
 import threading
 import time
+import hmac
 
 from flask import Flask, Response, jsonify, request
 
@@ -112,18 +113,25 @@ app = Flask(__name__)
 
 
 def _authorized() -> bool:
-    """True for the full-privilege control token."""
+    """True for the full-privilege control token. Constant-time compare (S4)."""
     hdr = request.headers.get('Authorization', '')
-    return hdr.startswith('Bearer ') and hdr[7:].strip() == TOKEN
+    if not hdr.startswith('Bearer '):
+        return False
+    return hmac.compare_digest(hdr[7:].strip(), TOKEN)
 
 
 def _read_authorized() -> bool:
-    """True for EITHER the control token or the read-only token (GET /status)."""
+    """True for EITHER the control token or the read-only token (GET /status).
+
+    Uses hmac.compare_digest and evaluates both comparisons (no short-circuit)
+    so auth never leaks token bytes via response timing. (S4)"""
     hdr = request.headers.get('Authorization', '')
     if not hdr.startswith('Bearer '):
         return False
     tok = hdr[7:].strip()
-    return tok == TOKEN or tok == RO_TOKEN
+    is_ctl = hmac.compare_digest(tok, TOKEN)
+    is_ro = hmac.compare_digest(tok, RO_TOKEN)
+    return is_ctl or is_ro
 
 
 @app.before_request
