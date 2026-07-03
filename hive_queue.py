@@ -508,13 +508,20 @@ def _park(cur: sqlite3.Cursor, task_id: str, reason: str) -> None:
 def verify_branch(branch: str, base_ref: str, scope: Optional[str]) -> tuple[bool, str]:
     """
     Build/test gate (§7). Rebase the branch onto the live base, then run the
-    verification build on VERIFY_HOST. Default lab implementation is a no-op pass;
-    override by setting HIVE_VERIFY_CMD to a shell command (run with cwd=lab.git).
-    Returns (ok, summary).
+    verification build on VERIFY_HOST via HIVE_VERIFY_CMD (a shell command run
+    with cwd=lab.git). Returns (ok, summary).
+
+    FAIL-CLOSED by default: if HIVE_VERIFY_CMD is unset the gate does NOT pass —
+    the task is parked `needs_attention` so unverified code can never fast-forward
+    into the base ref silently. To intentionally run without a build/test gate
+    (e.g. a throwaway lab), set HIVE_VERIFY_OPTIONAL=1 to opt out explicitly.
     """
     cmd = os.environ.get('HIVE_VERIFY_CMD')
     if not cmd:
-        return True, 'verify skipped (no HIVE_VERIFY_CMD set)'
+        if os.environ.get('HIVE_VERIFY_OPTIONAL', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+            return True, 'verify skipped (HIVE_VERIFY_OPTIONAL set; no HIVE_VERIFY_CMD)'
+        return False, ('verify gate fail-closed: set HIVE_VERIFY_CMD to a build/test '
+                       'command, or HIVE_VERIFY_OPTIONAL=1 to opt out explicitly')
     proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                           cwd=HIVE_DIR)
     tail = (proc.stdout + proc.stderr).strip().splitlines()[-5:]

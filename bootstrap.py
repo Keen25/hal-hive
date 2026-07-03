@@ -126,8 +126,14 @@ if (-not $copilot) {{
 }}
 if (-not $copilot) {{ Write-Warning "copilot CLI not found — install it, then restart hive-worker-$LANE" ; $copilot = 'C:\\npm-global\\copilot.cmd' }}
 
-# svc-hive local admin (runs the service)
-$u = 'svc-hive'; $p = ConvertTo-SecureString 'Passw0rd' -AsPlainText -Force
+# svc-hive local admin (runs the service).
+# Generate a STRONG RANDOM password per box — never a hardcoded/known secret,
+# never printed, never reused across machines. Lives only in the WinSW XML
+# (admin-readable) as WinSW needs the plaintext for a custom service account.
+$rb = New-Object 'System.Byte[]' 24
+[System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($rb)
+$PW = ([Convert]::ToBase64String($rb) -replace '[+/=]','x') + 'aA9!'
+$u = 'svc-hive'; $p = ConvertTo-SecureString $PW -AsPlainText -Force
 if (Get-LocalUser $u -EA SilentlyContinue) {{ Set-LocalUser $u -Password $p -PasswordNeverExpires $true }}
 else {{ New-LocalUser $u -Password $p -FullName 'HAL Hive Service' -PasswordNeverExpires | Out-Null }}
 if (-not ((Get-LocalGroupMember Administrators -EA SilentlyContinue).Name -match "\\\\$u$")) {{ Add-LocalGroupMember Administrators $u }}
@@ -151,7 +157,7 @@ $xml = @"
   <log mode="roll-by-size"><sizeThreshold>10240</sizeThreshold><keepFiles>5</keepFiles></log>
   <serviceaccount>
     <username>.\\svc-hive</username>
-    <password>Passw0rd</password>
+    <password>$PW</password>
     <allowservicelogonright>true</allowservicelogonright>
   </serviceaccount>
 </service>

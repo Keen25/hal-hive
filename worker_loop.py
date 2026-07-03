@@ -122,6 +122,20 @@ class Heartbeat:
 
 # ── The run ───────────────────────────────────────────────────────────────────
 
+def _git_auth_args() -> list:
+    """Inject the shared hive token as an HTTP header for smart-HTTP git ops.
+
+    The lab.git transport (git_http_server.py) now requires token auth. We pass
+    the token per-invocation via `-c http.extraheader=...` rather than embedding
+    it in the remote URL, so it never lands in .git/config on the throwaway clone.
+    HIVE_TOKEN is already exported to every worker service (WinSW/systemd/launchd).
+    """
+    tok = (os.environ.get('HIVE_GIT_TOKEN') or os.environ.get('HIVE_TOKEN') or '').strip()
+    if tok:
+        return ['-c', f'http.extraheader=Authorization: Bearer {tok}']
+    return []
+
+
 def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
     """
     Clone lab.git, branch, run copilot headless, commit, push. Returns dict with
@@ -140,11 +154,15 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
     with os.fdopen(prompt_fd, 'w', encoding='utf-8') as pf:
         pf.write(task['prompt'])
 
+    auth = _git_auth_args()
+
     def g(*a, cwd=run_dir):
-        return subprocess.run(['git', *a], cwd=cwd, capture_output=True, text=True)
+        # Auth header is harmless on local ops and required on the network ones
+        # (push); prepend it to every git call so remote-hitting subcommands work.
+        return subprocess.run(['git', *auth, *a], cwd=cwd, capture_output=True, text=True)
 
     try:
-        cl = subprocess.run(['git', 'clone', lab_git, run_dir],
+        cl = subprocess.run(['git', *auth, 'clone', lab_git, run_dir],
                             capture_output=True, text=True)
         if cl.returncode != 0:
             return {'exit_code': 1, 'error': f'clone failed: {cl.stderr.strip()}'}
