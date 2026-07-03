@@ -14,6 +14,7 @@ so we build the CGI environment by hand).
 import os
 import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 GIT_HTTP_BACKEND = os.environ.get(
@@ -63,7 +64,14 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         if ct:
             env["CONTENT_TYPE"] = ct
         cl = self.headers.get("Content-Length")
-        if cl:
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            # A chunked request has no up-front length. Do NOT set CONTENT_LENGTH:
+            # git-http-backend then reads its stdin to EOF. We de-chunk the body
+            # ourselves (self.rfile is the raw socket and is not auto-dechunked)
+            # before writing to the backend's stdin.
+            pass
+        elif cl:
             env["CONTENT_LENGTH"] = cl
         # git smart-http passes the service via these headers on some paths.
         gp = self.headers.get("Git-Protocol")
@@ -87,22 +95,73 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(500, "git-http-backend spawn failed: %s" % exc)
             return
 
-        # Stream the request body to the CGI stdin.
+        # Stream the request body to the CGI stdin on a background thread.
+        # This MUST be concurrent with reading stdout: git-http-backend
+        # (receive-pack) starts writing its response while still consuming the
+        # request pack, so its stdout pipe fills at ~64 KB. If we drained stdin
+        # fully before reading stdout, the backend would block on its stdout
+        # write while we block on our stdin write -> a pipe deadlock that aborts
+        # the connection (seen as "curl 55 Send failure: Broken pipe" on any
+        # push larger than one pipe buffer). A dedicated pump thread keeps both
+        # directions flowing.
         try:
-            remaining = int(env.get("CONTENT_LENGTH", "0") or "0")
+            content_length = int(env.get("CONTENT_LENGTH", "0") or "0")
         except ValueError:
-            remaining = 0
-        try:
+            content_length = 0
+        is_chunked = "chunked" in (self.headers.get("Transfer-Encoding") or "").lower()
+
+        def pump_fixed(remaining):
             while remaining > 0:
                 buf = self.rfile.read(min(CHUNK, remaining))
                 if not buf:
                     break
                 proc.stdin.write(buf)
                 remaining -= len(buf)
-            if proc.stdin:
-                proc.stdin.close()
-        except BrokenPipeError:
-            pass
+
+        def pump_chunked():
+            # Decode HTTP/1.1 chunked transfer-encoding from the raw socket:
+            # <hex-size>[;ext]\r\n <size bytes> \r\n ... 0\r\n <trailers> \r\n
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    break
+                size_field = size_line.split(b";", 1)[0].strip()
+                try:
+                    size = int(size_field, 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    # Consume trailer lines up to the terminating blank line.
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                remaining = size
+                while remaining > 0:
+                    buf = self.rfile.read(min(CHUNK, remaining))
+                    if not buf:
+                        break
+                    proc.stdin.write(buf)
+                    remaining -= len(buf)
+                self.rfile.read(2)  # trailing CRLF after each chunk
+
+        def pump_stdin():
+            try:
+                if is_chunked:
+                    pump_chunked()
+                else:
+                    pump_fixed(content_length)
+            except (BrokenPipeError, OSError):
+                pass
+            finally:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+        stdin_thread = threading.Thread(target=pump_stdin, daemon=True)
+        stdin_thread.start()
 
         # Parse the CGI header block from stdout, then stream the rest.
         header_data = b""
@@ -168,6 +227,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             pass
         finally:
+            stdin_thread.join(timeout=5)
             err = proc.stderr.read()
             proc.wait()
             if proc.returncode not in (0, None) and err:

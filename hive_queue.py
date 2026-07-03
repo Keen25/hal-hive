@@ -40,7 +40,8 @@ HEARTBEAT_RENEW   = '+15 minutes'    # §4 pulse renews the lease
 REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
 
 # Verify host used by the merge gate (§7). Overridable via env for tests.
 VERIFY_HOST = os.environ.get('HIVE_VERIFY_HOST', 'ar1')
@@ -112,6 +113,17 @@ CREATE TABLE IF NOT EXISTS task_deps (
 
 CREATE INDEX IF NOT EXISTS idx_tasks_claimable
     ON tasks(status, priority, created_at);
+
+CREATE TABLE IF NOT EXISTS workers (
+    worker_id    TEXT PRIMARY KEY,
+    lane         TEXT,
+    caps         TEXT,                          -- space-separated capability tags
+    host         TEXT,                          -- remote address as seen by the server
+    status       TEXT NOT NULL DEFAULT 'idle',  -- idle | busy
+    current_task TEXT,                          -- task_id when busy, else NULL
+    first_seen   DATETIME NOT NULL DEFAULT (datetime('now')),
+    last_seen    DATETIME NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -556,6 +568,82 @@ def merge_loop(stop: threading.Event, db_path: str = QUEUE_DB) -> None:
 
 # ── Status / control helpers ──────────────────────────────────────────────────
 
+def _task_title(prompt: str, limit: int = 72) -> str:
+    """Derive a short human label from a task prompt for at-a-glance dashboards.
+
+    The prompt may be a large embedded blob (e.g. a pre-fetched PR diff for
+    review). We want the intent, not the payload, so: take the first non-empty
+    line, strip a leading markdown heading / list marker, and cap the length.
+    Recognises the ADO-review prompt convention (a leading 'Review ... PR <n>'
+    or a '# PR <n>' heading) so those read nicely too."""
+    if not prompt:
+        return ''
+    line = ''
+    for raw in prompt.splitlines():
+        s = raw.strip()
+        if s:
+            line = s
+            break
+    line = line.lstrip('#>-*').strip()
+    if len(line) > limit:
+        line = line[:limit - 1].rstrip() + '…'
+    return line
+
+
+def upsert_worker(worker_id: str, lane: Optional[str] = None,
+                  caps=None, status: str = 'idle',
+                  current_task: Optional[str] = None,
+                  host: Optional[str] = None,
+                  db_path: str = QUEUE_DB) -> None:
+    """Register/refresh a worker's liveness row. Called by the server on every
+    /claim (idle heartbeat via the 25s long-poll) and /heartbeat (busy, 60s), so
+    an idle worker stays fresh without any extra client code. lane/caps/host are
+    preserved (COALESCE) when a later call omits them."""
+    if isinstance(caps, (list, tuple, set)):
+        caps = ' '.join(sorted(str(c) for c in caps))
+    with cursor(db_path) as cur:
+        cur.execute(
+            """
+            INSERT INTO workers
+                (worker_id, lane, caps, host, status, current_task,
+                 first_seen, last_seen)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            ON CONFLICT(worker_id) DO UPDATE SET
+                lane         = COALESCE(excluded.lane, workers.lane),
+                caps         = COALESCE(excluded.caps, workers.caps),
+                host         = COALESCE(excluded.host, workers.host),
+                status       = excluded.status,
+                current_task = excluded.current_task,
+                last_seen    = datetime('now')
+            """,
+            (worker_id, lane, caps, host, status, current_task),
+        )
+
+
+def list_workers(stale_after_s: int = WORKER_STALE_S,
+                 db_path: str = QUEUE_DB) -> list:
+    """Return every registered worker with a derived `online` flag and `age_s`
+    (seconds since last_seen). A worker past stale_after_s is treated offline."""
+    with cursor(db_path) as cur:
+        rows = cur.execute(
+            """SELECT worker_id, lane, caps, host, status, current_task,
+                      first_seen, last_seen,
+                      CAST((julianday('now') - julianday(last_seen)) * 86400
+                           AS INTEGER) AS age_s
+               FROM workers ORDER BY worker_id"""
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        age = d.get('age_s')
+        d['online'] = age is not None and age <= stale_after_s
+        # A stale row can't really be "busy" — reflect reality for the UI.
+        if not d['online'] and d['status'] == 'busy':
+            d['status'] = 'stale'
+        out.append(d)
+    return out
+
+
 def status_snapshot(db_path: str = QUEUE_DB) -> dict:
     with cursor(db_path) as cur:
         counts = {
@@ -566,13 +654,17 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         }
         rows = [dict(r) for r in cur.execute(
             """SELECT id, status, worker_id, worker, requires, priority, branch,
-                      commit_hash, error
+                      commit_hash, error, prompt
                FROM tasks ORDER BY
                  CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
                              WHEN 'pending' THEN 2 ELSE 3 END,
                  priority ASC, created_at ASC"""
         ).fetchall()]
-    return {'counts': counts, 'tasks': rows}
+    for row in rows:
+        # Replace the (potentially huge) prompt with a short human title so the
+        # dashboard shows intent, not the full payload, and stays lightweight.
+        row['title'] = _task_title(row.pop('prompt', ''))
+    return {'counts': counts, 'tasks': rows, 'workers': list_workers(db_path=db_path)}
 
 
 def cancel_task(task_id: str, db_path: str = QUEUE_DB) -> bool:

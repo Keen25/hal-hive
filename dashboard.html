@@ -57,6 +57,9 @@
   .worker:last-child{border-bottom:none;}
   .worker .wdot{width:8px;height:8px;border-radius:50%;background:var(--ok);}
   .worker .wdot.idle{background:var(--muted);}
+  .worker .wdot.off{background:var(--bad);box-shadow:0 0 6px var(--bad);}
+  .worker .wcaps{color:var(--muted);font-size:11px;margin-left:auto;font-family:ui-monospace,monospace;}
+  td.title{max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
   .btn { background:transparent; border:1px solid var(--border); color:var(--muted);
          border-radius:5px; padding:2px 8px; font-size:11px; cursor:pointer; }
   .btn:hover{ border-color:var(--bad); color:var(--bad); }
@@ -79,9 +82,9 @@
     <div>
       <h2>Tasks</h2>
       <div class="panel"><table id="tasktbl">
-        <thead><tr><th>ID</th><th>Status</th><th>Worker</th><th>Prio</th>
+        <thead><tr><th>ID</th><th>Task</th><th>Status</th><th>Worker</th><th>Prio</th>
           <th>Requires</th><th>Branch</th><th></th></tr></thead>
-        <tbody id="taskbody"><tr><td class="empty" colspan="7">loading…</td></tr></tbody>
+        <tbody id="taskbody"><tr><td class="empty" colspan="8">loading…</td></tr></tbody>
       </table></div>
     </div>
     <div>
@@ -132,6 +135,7 @@ function render(d){
   tasks.forEach(t=>{
     const tr=document.createElement('tr');
     tr.appendChild(cell(t.id,'mono'));
+    tr.appendChild(cell(t.title||'—','title'));
     const sc=document.createElement('td');
     sc.appendChild(el('span','badge b-'+t.status,t.status.replace('_',' ')));
     if(t.error){ const e=el('div','err',t.error); sc.appendChild(e);} tr.appendChild(sc);
@@ -146,23 +150,41 @@ function render(d){
     tr.appendChild(ac);
     tb.appendChild(tr);
   });
-  // workers (derived from active task ownership)
-  const wmap={};
-  tasks.forEach(t=>{ if(t.worker_id){ wmap[t.worker_id]=wmap[t.worker_id]||[];
-    if(['running','claimed'].includes(t.status)) wmap[t.worker_id].push(t.id);} });
-  // include pinned lanes that have no active task
-  tasks.forEach(t=>{ if(t.worker && !wmap[t.worker]) wmap[t.worker]=wmap[t.worker]||[]; });
+  // workers — prefer the real server-side registry (liveness heartbeats);
+  // fall back to deriving from task ownership for older servers.
   const wp=document.getElementById('workers'); wp.innerHTML='';
-  const wkeys=Object.keys(wmap);
-  if(!wkeys.length){ wp.appendChild(el('div','empty','no worker activity')); }
-  wkeys.sort().forEach(w=>{
-    const busy=wmap[w].length>0;
-    const row=el('div','worker');
-    row.appendChild(el('span','wdot'+(busy?'':' idle')));
-    row.appendChild(el('span','mono',w));
-    row.appendChild(el('span','muted', busy?('· '+wmap[w][0]):'· idle'));
-    wp.appendChild(row);
-  });
+  const workers = d.workers||[];
+  if(workers.length){
+    workers.forEach(w=>{
+      const online=w.online, busy=w.status==='busy';
+      const row=el('div','worker');
+      let dc='wdot'; if(!online){dc+=' off';} else if(!busy){dc+=' idle';}
+      row.appendChild(el('span',dc));
+      row.appendChild(el('span','mono',w.worker_id));
+      let detail;
+      if(!online) detail='· offline · '+fmtAge(w.age_s);
+      else if(busy) detail='· '+(w.current_task||'busy');
+      else detail='· idle';
+      row.appendChild(el('span','muted',detail));
+      if(w.lane) row.appendChild(el('span','wcaps',w.lane));
+      wp.appendChild(row);
+    });
+  } else {
+    const wmap={};
+    tasks.forEach(t=>{ if(t.worker_id){ wmap[t.worker_id]=wmap[t.worker_id]||[];
+      if(['running','claimed'].includes(t.status)) wmap[t.worker_id].push(t.id);} });
+    tasks.forEach(t=>{ if(t.worker && !wmap[t.worker]) wmap[t.worker]=wmap[t.worker]||[]; });
+    const wkeys=Object.keys(wmap);
+    if(!wkeys.length){ wp.appendChild(el('div','empty','no worker activity')); }
+    wkeys.sort().forEach(w=>{
+      const busy=wmap[w].length>0;
+      const row=el('div','worker');
+      row.appendChild(el('span','wdot'+(busy?'':' idle')));
+      row.appendChild(el('span','mono',w));
+      row.appendChild(el('span','muted', busy?('· '+wmap[w][0]):'· idle'));
+      wp.appendChild(row);
+    });
+  }
   // transports
   const tp=document.getElementById('transports'); tp.innerHTML='';
   [['queue REST',':5001','live'],['git smart-HTTP',':8418','lab.git clone+push']]
@@ -171,8 +193,10 @@ function render(d){
       row.appendChild(el('span','muted','· '+p+' '+s)); tp.appendChild(row); });
 }
 function cell(txt,cls){ return el('td',cls,txt==null?'':String(txt)); }
+function fmtAge(s){ if(s==null) return '?'; if(s<60) return s+'s ago';
+  if(s<3600) return Math.floor(s/60)+'m ago'; return Math.floor(s/3600)+'h ago'; }
 function row7(msg){ const tr=document.createElement('tr');
-  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=7; return tr; }
+  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=8; return tr; }
 async function cancel(id){
   if(!confirm('Cancel '+id+'?')) return;
   await fetch('/cancel',{method:'POST',headers:{...H,'Content-Type':'application/json'},

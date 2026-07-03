@@ -117,10 +117,18 @@ def claim():
     if not worker_id:
         return jsonify(error='worker_id required'), 400
 
+    host = request.remote_addr
+    # Register/refresh as idle up-front so an idle worker (which spends its life
+    # long-polling here) shows on the dashboard even before it claims anything.
+    q.upsert_worker(worker_id, lane=lane, caps=caps, status='idle',
+                    current_task=None, host=host)
+
     deadline = time.time() + CLAIM_LONGPOLL_S
     while True:
         task = q.claim_next(worker_id, lane, worker_caps=caps)
         if task is not None:
+            q.upsert_worker(worker_id, lane=lane, caps=caps, status='busy',
+                            current_task=task.id, host=host)
             return jsonify(
                 id=task.id, branch=task.branch, base_ref=task.base_ref,
                 prompt=task.prompt, scope=task.scope, attempts=task.attempts,
@@ -134,6 +142,9 @@ def claim():
 def heartbeat():
     body = request.get_json(force=True, silent=True) or {}
     alive = q.heartbeat(body['task_id'], body['worker_id'])
+    # A heartbeat means the worker is busy on this task — keep its liveness fresh.
+    q.upsert_worker(body['worker_id'], status='busy',
+                    current_task=body['task_id'], host=request.remote_addr)
     return jsonify(alive=alive), 200
 
 
