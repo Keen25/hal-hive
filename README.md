@@ -64,6 +64,33 @@ PowerShell run `trust-lab-ca.ps1 -CaPath C:\hive\ca.crt` (imports into
 `LocalMachine\Root` and sets git's `http.sslBackend=schannel`). Then point the
 worker at `https://<HAL-ip>:5001` / `https://<HAL-ip>:8418/lab.git`.
 
+> **Enabling TLS is a coordinated fleet cutover, not a per-box toggle.** Once
+> `HIVE_TLS_CERT`/`HIVE_TLS_KEY` are set and the servers restart, `:5001`/`:8418`
+> speak **https only** — every already-running worker still configured with
+> `http://` URLs stops connecting until it is reconfigured (and trusts the CA).
+> Plan to flip the servers and reconfigure existing workers together.
+
+### Newly-joined workers over TLS (automatic)
+
+`bootstrap.py` derives the scheme from HAL's TLS state, so **once TLS is on the
+dashboard join one-liner needs no change** — new workers are wired for https with
+zero manual trust step:
+
+- The generated queue/git URLs become `https://…` automatically (scheme follows
+  `_tls_enabled()`; force it independently with `HIVE_SCHEME=http|https`, e.g.
+  when a reverse proxy terminates TLS).
+- The lab **`ca.crt` is embedded in the script** and planted on the new box
+  (`$DIR/ca.crt`). Linux/macOS point `REQUESTS_CA_BUNDLE` + `GIT_SSL_CAINFO` at
+  it (no OS trust-store change, so no root needed); Windows imports it into
+  `LocalMachine\Root` (for IWR + git-schannel) *and* sets `REQUESTS_CA_BUNDLE`
+  (python-requests ignores the Windows store).
+- The dashboard's **first** fetch of the script uses `-k` / a cert-skip callback
+  (the fresh box does not trust the CA yet — TOFU on the lab net); every
+  subsequent fetch and all worker traffic is fully CA-verified.
+
+This closes the gap where flipping TLS on would otherwise hand freshly-joined
+workers `http://` URLs they could not connect with.
+
 ### Domain-wide trust (via the DC)
 
 For **domain-joined** Windows workers, push the CA once from the DC instead of

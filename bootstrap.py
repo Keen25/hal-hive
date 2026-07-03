@@ -37,19 +37,51 @@ def _copilot_token() -> str:
         return ''
 
 
+def _tls_enabled() -> bool:
+    """Is the control plane serving TLS? Mirrors queue_server/git_http_server:
+    on iff both cert+key are configured. `HIVE_SCHEME=http|https` forces it so
+    the generated scheme can be overridden independently of HAL's own sockets
+    (e.g. when a reverse proxy terminates TLS)."""
+    scheme = os.environ.get('HIVE_SCHEME', '').strip().lower()
+    if scheme in ('http', 'https'):
+        return scheme == 'https'
+    return bool(os.environ.get('HIVE_TLS_CERT') and os.environ.get('HIVE_TLS_KEY'))
+
+
+def _ca_pem() -> str:
+    """The lab CA cert workers must trust to verify HAL over TLS. Path mirrors
+    gen-lab-ca.sh: `$HIVE_TLS_CACERT`, else `$HIVE_CA_DIR/ca.crt`, else
+    `~/.hive-ca/ca.crt`. Empty string if absent (falls back to no CA pinning)."""
+    ca_dir = os.environ.get('HIVE_CA_DIR', os.path.expanduser('~/.hive-ca'))
+    path = os.environ.get('HIVE_TLS_CACERT', os.path.join(ca_dir, 'ca.crt'))
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ''
+
+
 def config() -> dict:
     """HAL-side endpoints + secrets baked into a bootstrap script.
 
     Overridable via env so HAL's LAN address isn't hard-coded:
       HIVE_HAL_IP        — HAL address workers dial back on (default .1)
-      HIVE_PUBLIC_URL    — queue/control-plane base   (default http://<ip>:5001)
-      HIVE_LAB_GIT_URL   — smart-HTTP git base        (default http://<ip>:8418/lab.git)
-    """
+      HIVE_PUBLIC_URL    — queue/control-plane base   (default <scheme>://<ip>:5001)
+      HIVE_LAB_GIT_URL   — smart-HTTP git base        (default <scheme>://<ip>:8418/lab.git)
+
+    Scheme follows HAL's TLS state (see `_tls_enabled`): when TLS is on, the
+    generated worker URLs are https:// AND the lab CA PEM is embedded so the new
+    worker trusts HAL without a manual trust step. This keeps "enable TLS" from
+    silently stranding freshly-joined workers on http://."""
     ip = os.environ.get('HIVE_HAL_IP', HAL_IP_DEFAULT)
+    tls = _tls_enabled()
+    scheme = 'https' if tls else 'http'
     return {
-        'queue': os.environ.get('HIVE_PUBLIC_URL', f'http://{ip}:5001'),
-        'git':   os.environ.get('HIVE_LAB_GIT_URL', f'http://{ip}:8418/lab.git'),
+        'queue': os.environ.get('HIVE_PUBLIC_URL', f'{scheme}://{ip}:5001'),
+        'git':   os.environ.get('HIVE_LAB_GIT_URL', f'{scheme}://{ip}:8418/lab.git'),
         'ghtok': _copilot_token(),
+        'tls':   tls,
+        'ca_pem': _ca_pem() if tls else '',
         'py_url': os.environ.get(
             'HIVE_PY_URL',
             'https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe'),
@@ -75,6 +107,19 @@ def build_script(os_kind: str, lane: str, caps: str, wid: str, token: str) -> st
 def _windows(lane, caps, wid, token, cfg) -> str:
     cap_args = ' '.join(f'--cap {c}' for c in caps)
     q, g, ght, pyurl = cfg['queue'], cfg['git'], cfg['ghtok'], cfg['py_url']
+    if cfg['tls'] and cfg['ca_pem']:
+        # Import the lab CA into LocalMachine\\Root so IWR (downloads) and
+        # git-over-schannel verify HAL; python-requests ignores the Windows
+        # store, so also point REQUESTS_CA_BUNDLE at the on-disk PEM.
+        ca_setup_ps = ("# TLS on: plant + trust the lab CA before any download\n"
+                       "Set-Content \"$DIR\\ca.crt\" -Encoding ascii -Value @'\n"
+                       + cfg['ca_pem'] + "\n'@\n"
+                       "certutil -addstore -f Root \"$DIR\\ca.crt\" | Out-Null\n"
+                       "[Environment]::SetEnvironmentVariable('REQUESTS_CA_BUNDLE', \"$DIR\\ca.crt\", 'Machine')\n")
+        ca_env_winsw = '  <env name="REQUESTS_CA_BUNDLE" value="$DIR\\ca.crt"/>\n'
+    else:
+        ca_setup_ps = ''
+        ca_env_winsw = ''
     return f'''#Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -82,7 +127,7 @@ $QUEUE = '{q}'; $GIT = '{g}'; $TOKEN = '{token}'; $GHTOK = '{ght}'
 $LANE = '{lane}'; $WID = '{wid}'; $DIR = 'C:\\hive'
 Write-Host "== HAL hive worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
 New-Item -ItemType Directory -Force $DIR | Out-Null
-
+{ca_setup_ps}
 function Test-Py($exe) {{
   try {{ $v = & $exe -c "import sys;print('%d.%d'%sys.version_info[:2])" 2>$null
         if ($LASTEXITCODE -eq 0 -and [version]$v -ge [version]'3.10') {{ return $v }} }} catch {{}}
@@ -150,7 +195,7 @@ $xml = @"
   <env name="HIVE_QUEUE_URL" value="$QUEUE"/>
   <env name="HIVE_TOKEN" value="$TOKEN"/>
   <env name="HIVE_LAB_GIT" value="$GIT"/>
-  <env name="HIVE_COPILOT_CMD" value="$copilot"/>
+{ca_env_winsw}  <env name="HIVE_COPILOT_CMD" value="$copilot"/>
   <startmode>Automatic</startmode>
   <onfailure action="restart" delay="10 sec"/>
   <resetfailure>1 hour</resetfailure>
@@ -180,6 +225,21 @@ Write-Host "== done. dashboard: $QUEUE/ =="
 def _unix(lane, caps, wid, token, cfg) -> str:
     cap_args = ' '.join(f'--cap {shlex.quote(c)}' for c in caps)
     q, g, ght = cfg['queue'], cfg['git'], cfg['ghtok']
+    if cfg['tls'] and cfg['ca_pem']:
+        # Plant the lab CA on the new box, then verify every fetch + all worker
+        # traffic against it: requests honours REQUESTS_CA_BUNDLE and git honours
+        # GIT_SSL_CAINFO, so no OS trust-store change (hence no root) is needed.
+        ca_write_sh = ('# TLS on: plant the lab CA so downloads + worker traffic verify HAL\n'
+                       'cat > "$DIR/ca.crt" <<\'CAEOF\'\n' + cfg['ca_pem'] + '\nCAEOF\n'
+                       'CACERT="--cacert $DIR/ca.crt"\n')
+        ca_env_systemd = ('Environment=REQUESTS_CA_BUNDLE=$DIR/ca.crt\n'
+                          'Environment=GIT_SSL_CAINFO=$DIR/ca.crt\n')
+        ca_env_plist = ('    <key>REQUESTS_CA_BUNDLE</key><string>$DIR/ca.crt</string>\n'
+                        '    <key>GIT_SSL_CAINFO</key><string>$DIR/ca.crt</string>\n')
+        ca_env_nohup = 'REQUESTS_CA_BUNDLE="$DIR/ca.crt" GIT_SSL_CAINFO="$DIR/ca.crt" '
+    else:
+        ca_write_sh = 'CACERT=""\n'
+        ca_env_systemd = ca_env_plist = ca_env_nohup = ''
     return f'''#!/bin/sh
 # HAL hive worker bootstrap (Linux/systemd or macOS/launchd)
 set -eu
@@ -187,7 +247,7 @@ QUEUE='{q}'; GIT='{g}'; TOKEN='{token}'; GHTOK='{ght}'
 LANE='{lane}'; WID='{wid}'; DIR="$HOME/.hive-worker"
 echo "== HAL hive worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
 mkdir -p "$DIR"
-
+{ca_write_sh}
 # 1. python3 + requests
 PY="$(command -v python3 || true)"
 [ -n "$PY" ] || {{ echo "ERROR: python3 not found — install it and re-run"; exit 1; }}
@@ -198,7 +258,7 @@ PY="$(command -v python3 || true)"
 
 # 2. worker code
 for f in worker_loop.py hive_caps.py hive_queue.py; do
-  curl -fsSL -H "Authorization: Bearer $TOKEN" "$QUEUE/download/$f" -o "$DIR/$f"
+  curl -fsSL $CACERT -H "Authorization: Bearer $TOKEN" "$QUEUE/download/$f" -o "$DIR/$f"
 done
 
 # 3. copilot CLI present?
@@ -229,7 +289,7 @@ Environment=HIVE_TOKEN=$TOKEN
 Environment=HIVE_LAB_GIT=$GIT
 Environment=GH_TOKEN=$GHTOK
 Environment=GITHUB_TOKEN=$GHTOK
-Restart=always
+{ca_env_systemd}Restart=always
 RestartSec=10
 
 [Install]
@@ -264,7 +324,7 @@ $PROGARGS
     <key>HIVE_LAB_GIT</key><string>$GIT</string>
     <key>GH_TOKEN</key><string>$GHTOK</string>
     <key>GITHUB_TOKEN</key><string>$GHTOK</string>
-  </dict>
+{ca_env_plist}  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict></plist>
@@ -278,7 +338,7 @@ else
   echo "no systemd/launchd — starting under nohup (not boot-persistent)"
   PYTHONUNBUFFERED=1 HIVE_QUEUE_URL="$QUEUE" HIVE_TOKEN="$TOKEN" HIVE_LAB_GIT="$GIT" \\
     GH_TOKEN="$GHTOK" GITHUB_TOKEN="$GHTOK" \\
-    nohup "$PY" $ARGS >"$DIR/worker.log" 2>&1 &
+    {ca_env_nohup}nohup "$PY" $ARGS >"$DIR/worker.log" 2>&1 &
   echo "pid $!  log $DIR/worker.log"
 fi
 echo "== done. dashboard: $QUEUE/ =="
