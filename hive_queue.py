@@ -43,9 +43,6 @@ MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 SCHEMA_VERSION = 5
 WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
 
-# Verify host used by the merge gate (§7). Overridable via env for tests.
-VERIFY_HOST = os.environ.get('HIVE_VERIFY_HOST', 'ar1')
-
 # Statuses considered "in flight" (hold a lease) for the reaper.
 _INFLIGHT = ('claimed', 'running')
 
@@ -461,13 +458,26 @@ def _git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
-def _rebase_bare(branch: str, base_ref: str) -> bool:
+def _remove_worktree(wt: str) -> None:
+    """Detach and delete a scratch worktree created by _rebase_worktree."""
+    import shutil
+    _git('worktree', 'remove', '--force', wt, check=False)
+    shutil.rmtree(wt, ignore_errors=True)
+    _git('worktree', 'prune', check=False)
+
+
+def _rebase_worktree(branch: str, base_ref: str) -> Optional[str]:
     """
-    Rebase `branch` onto `base_ref` inside a bare repo. Bare repos have no
-    worktree, so we attach a throwaway one, rebase there, then let the branch ref
-    follow. Returns True on clean rebase, False on conflict (worktree cleaned up).
+    Rebase `branch` onto `base_ref` inside a fresh scratch worktree of the bare
+    repo and, on success, RETURN the worktree path so the caller can run the
+    verify gate against the actual rebased tree (fixes the "verify runs in
+    HIVE_DIR" gap). The caller owns cleanup via _remove_worktree.
+
+    Returns None on rebase conflict (the worktree is cleaned up here). Bare repos
+    have no worktree, so we attach a throwaway one; the checked-out branch ref
+    follows the rebase.
     """
-    import tempfile, shutil
+    import tempfile
     # Rebase creates new commits, so git needs a committer identity even in a
     # scratch worktree (else it aborts with "Committer identity unknown", which
     # must NOT be misread as a merge conflict).
@@ -475,21 +485,18 @@ def _rebase_bare(branch: str, base_ref: str) -> bool:
            'GIT_AUTHOR_NAME': 'HAL', 'GIT_AUTHOR_EMAIL': 'hal@lab',
            'GIT_COMMITTER_NAME': 'HAL', 'GIT_COMMITTER_EMAIL': 'hal@lab'}
     wt = tempfile.mkdtemp(prefix='hive-rebase-')
-    try:
-        add = _git('worktree', 'add', '-f', '--checkout', wt, branch, check=False)
-        if add.returncode != 0:
-            return False
-        rb = subprocess.run(['git', 'rebase', base_ref], cwd=wt, env=env,
-                            capture_output=True, text=True)
-        if rb.returncode != 0:
-            subprocess.run(['git', 'rebase', '--abort'], cwd=wt, env=env,
-                           capture_output=True, text=True)
-            return False
-        return True
-    finally:
-        _git('worktree', 'remove', '--force', wt, check=False)
-        shutil.rmtree(wt, ignore_errors=True)
-        _git('worktree', 'prune', check=False)
+    add = _git('worktree', 'add', '-f', '--checkout', wt, branch, check=False)
+    if add.returncode != 0:
+        _remove_worktree(wt)
+        return None
+    rb = subprocess.run(['git', 'rebase', base_ref], cwd=wt, env=env,
+                        capture_output=True, text=True)
+    if rb.returncode != 0:
+        subprocess.run(['git', 'rebase', '--abort'], cwd=wt, env=env,
+                       capture_output=True, text=True)
+        _remove_worktree(wt)
+        return None
+    return wt
 
 
 def _deps_all_merged(cur: sqlite3.Cursor, task_id: str) -> bool:
@@ -529,11 +536,21 @@ def _park_task(db_path: str, task_id: str, reason: str) -> None:
         _park(cur, task_id, reason)
 
 
-def verify_branch(branch: str, base_ref: str, scope: Optional[str]) -> tuple[bool, str]:
+def verify_branch(branch: str, base_ref: str, scope: Optional[str],
+                  cwd: Optional[str] = None) -> tuple[bool, str]:
     """
-    Build/test gate (§7). Rebase the branch onto the live base, then run the
-    verification build on VERIFY_HOST via HIVE_VERIFY_CMD (a shell command run
-    with cwd=lab.git). Returns (ok, summary).
+    Build/test gate (§7). Runs HIVE_VERIFY_CMD (a shell command) against a
+    checkout of the rebased branch and returns (ok, summary).
+
+    `cwd` MUST be a worktree containing the rebased branch tip (the merge loop
+    passes the worktree from _rebase_worktree). Running the command there is what
+    makes the gate real — otherwise it would exercise unrelated content in the
+    hive tooling directory and prove nothing about the task. If `cwd` is None it
+    falls back to HIVE_DIR (kept only for ad-hoc/manual calls).
+
+    The command runs locally on the HAL host. Building code that requires a
+    different toolchain/OS (e.g. a Windows .NET build) is out of scope here and
+    tracked separately; there is no remote-host execution.
 
     FAIL-CLOSED by default: if HIVE_VERIFY_CMD is unset the gate does NOT pass —
     the task is parked `needs_attention` so unverified code can never fast-forward
@@ -547,7 +564,7 @@ def verify_branch(branch: str, base_ref: str, scope: Optional[str]) -> tuple[boo
         return False, ('verify gate fail-closed: set HIVE_VERIFY_CMD to a build/test '
                        'command, or HIVE_VERIFY_OPTIONAL=1 to opt out explicitly')
     proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                          cwd=HIVE_DIR)
+                          cwd=cwd or HIVE_DIR)
     tail = (proc.stdout + proc.stderr).strip().splitlines()[-5:]
     return proc.returncode == 0, ' | '.join(tail)
 
@@ -573,26 +590,32 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
         return
 
     # M2: rebase branch onto the LIVE base so we never merge stale. lab.git is
-    # bare (no worktree), so rebase runs in a scratch worktree; on success the
-    # rebased tip fast-forwards base_ref via `branch -f` (ff by construction).
-    if not _rebase_bare(branch, base_ref):
+    # bare (no worktree), so rebase runs in a scratch worktree; _rebase_worktree
+    # RETURNS that worktree so the verify gate can run against the rebased tip.
+    wt = _rebase_worktree(branch, base_ref)
+    if wt is None:
         _park_task(db_path, task_id, f'rebase conflict onto {base_ref}')
         return
 
-    # C5: build/test gate BEFORE merge — no unverified code lands.
-    ok, summary = verify_branch(branch, base_ref, task['scope'])
-    if not ok:
-        _park_task(db_path, task_id, f'verify failed: {summary}')
-        return
+    try:
+        # C5: build/test gate BEFORE merge — no unverified code lands. The gate
+        # runs in `wt` (the rebased checkout), so it exercises the task's actual
+        # code, not the hive tooling dir.
+        ok, summary = verify_branch(branch, base_ref, task['scope'], cwd=wt)
+        if not ok:
+            _park_task(db_path, task_id, f'verify failed: {summary}')
+            return
 
-    # Advance base_ref to the rebased branch tip (fast-forward in a bare repo).
-    res = _git('branch', '-f', base_ref, branch, check=False)
-    if res.returncode != 0:
-        _park_task(db_path, task_id, f'merge into {base_ref} failed: {res.stderr.strip()}')
-        return
-    tip = _git('rev-parse', branch, check=False).stdout.strip() or None
-    _set_status(db_path, task_id, 'merged', commit_hash=tip)
-    print(f'  ✅ merged {branch} → {base_ref} ({task_id})')
+        # Advance base_ref to the rebased branch tip (fast-forward in a bare repo).
+        res = _git('branch', '-f', base_ref, branch, check=False)
+        if res.returncode != 0:
+            _park_task(db_path, task_id, f'merge into {base_ref} failed: {res.stderr.strip()}')
+            return
+        tip = _git('rev-parse', branch, check=False).stdout.strip() or None
+        _set_status(db_path, task_id, 'merged', commit_hash=tip)
+        print(f'  ✅ merged {branch} → {base_ref} ({task_id})')
+    finally:
+        _remove_worktree(wt)
 
 
 def merge_once(db_path: str = QUEUE_DB) -> int:
