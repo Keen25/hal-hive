@@ -20,6 +20,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `ad-overload/` | AD load-generator utility |
 | `systemd/` | `--user` units: queue-server, `worker@`, git-daemon |
 | `briefs/` | per-task spec inputs |
+| `skills/` | Copilot CLI skills (`hive-queue-ops`, `hive-task-intake`) — backup of `~/.agents/skills/`; the live copies are what the agent loads |
 
 ## Run (systemd `--user`)
 
