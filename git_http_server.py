@@ -57,7 +57,7 @@ def _default_backend() -> str:
 
 GIT_HTTP_BACKEND = os.environ.get("GIT_HTTP_BACKEND") or _default_backend()
 PROJECT_ROOT = os.environ.get("GIT_PROJECT_ROOT", os.path.expanduser("~/hive"))
-BIND = os.environ.get("GIT_HTTP_BIND", "0.0.0.0")
+BIND = os.environ.get("GIT_HTTP_BIND")  # None -> dual-bind localhost + lab NIC (S2)
 PORT = int(os.environ.get("GIT_HTTP_PORT", "8418"))
 # Chunk size for streaming bodies between socket and the CGI process.
 CHUNK = 65536
@@ -327,6 +327,19 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
         sys.stderr.write("%s - %s\n" % (self.client_address[0], fmt % args))
 
 
+def _resolve_bind_addrs(override, default_lab_ip="192.168.100.1"):
+    """127.0.0.1 (HAL-local) + the lab-net NIC, NOT the corp interface, unless
+    GIT_HTTP_BIND overrides (comma-separated; '0.0.0.0' to bind all). Lab IP from
+    HIVE_LAB_IP. Absent addresses are skipped at bind time. (S2 #5)"""
+    if override:
+        return [h.strip() for h in override.split(",") if h.strip()]
+    lab = os.environ.get("HIVE_LAB_IP", default_lab_ip).strip()
+    addrs = ["127.0.0.1"]
+    if lab and lab not in addrs:
+        addrs.append(lab)
+    return addrs
+
+
 def main():
     if not AUTH_TOKEN:
         sys.stderr.write(
@@ -334,12 +347,24 @@ def main():
             "~/.hive/worker.token). Refusing to serve lab.git without auth.\n"
         )
         sys.exit(1)
-    httpd = ThreadingHTTPServer((BIND, PORT), GitHTTPHandler)
-    sys.stderr.write(
-        "hal-git-http serving %s on http://%s:%d (backend=%s, token-auth ON)\n"
-        % (PROJECT_ROOT, BIND, PORT, GIT_HTTP_BACKEND)
-    )
-    httpd.serve_forever()
+    addrs = _resolve_bind_addrs(BIND)
+    servers = []
+    for addr in addrs:
+        try:
+            httpd = ThreadingHTTPServer((addr, PORT), GitHTTPHandler)
+        except OSError as exc:
+            sys.stderr.write("skip bind %s:%d (%s)\n" % (addr, PORT, exc))
+            continue
+        servers.append(httpd)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        sys.stderr.write(
+            "hal-git-http serving %s on http://%s:%d (backend=%s, token-auth ON)\n"
+            % (PROJECT_ROOT, addr, PORT, GIT_HTTP_BACKEND)
+        )
+    if not servers:
+        sys.stderr.write("FATAL: could not bind any of %r:%d\n" % (addrs, PORT))
+        sys.exit(1)
+    threading.Event().wait()
 
 
 if __name__ == "__main__":

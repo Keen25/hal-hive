@@ -316,19 +316,59 @@ def status():
     return jsonify(q.status_snapshot()), 200
 
 
+def resolve_bind_addrs(override, default_lab_ip='192.168.100.1'):
+    """Addresses the control plane listens on (S2 #5).
+
+    Default (override unset): 127.0.0.1 for HAL-local access + the lab-net NIC
+    for workers, but NOT the corp interface, so the queue/git transport is not
+    exposed to the wider corporate network. Override with HIVE_BIND /
+    GIT_HTTP_BIND (comma-separated; e.g. '0.0.0.0' to bind all). The lab IP is
+    HIVE_LAB_IP (default 192.168.100.1). An address absent on the host is
+    skipped at bind time, so this never hard-fails without the lab NIC."""
+    if override:
+        return [h.strip() for h in override.split(',') if h.strip()]
+    lab = os.environ.get('HIVE_LAB_IP', default_lab_ip).strip()
+    addrs = ['127.0.0.1']
+    if lab and lab not in addrs:
+        addrs.append(lab)
+    return addrs
+
+
 def main():
     q.init_db()
     q.ensure_lab_repo()
     stop = threading.Event()
     threading.Thread(target=q.reaper_loop, args=(stop,), daemon=True).start()
     threading.Thread(target=q.merge_loop, args=(stop,), daemon=True).start()
-    host = os.environ.get('HIVE_BIND', '0.0.0.0')
+    from werkzeug.serving import make_server
+    addrs = resolve_bind_addrs(os.environ.get('HIVE_BIND'))
     port = int(os.environ.get('HIVE_PORT', '5001'))
-    print(f'[server] queue REST on {host}:{port} — reaper + merge-loop running')
-    print(f'[server] control token: Authorization: Bearer <HIVE_TOKEN>  (add/cancel/claim)')
+    print('[server] queue REST — reaper + merge-loop running')
+    print(f'[server] control token: Authorization: ******  (add/cancel/claim)')
     print(f'[server] read-only token (dashboard /status) -> {RO_TOKEN_FILE}')
-    # threaded=True so long-poll /claim calls don't block the reaper/other workers.
-    app.run(host=host, port=port, threaded=True)
+    servers = []
+    for addr in addrs:
+        try:
+            # threaded=True so long-poll /claim calls don't block reaper/others.
+            srv = make_server(addr, port, app, threaded=True)
+        except (OSError, SystemExit) as exc:
+            # werkzeug turns a bind failure into a printed msg + SystemExit(1),
+            # stdlib would raise OSError -- tolerate both so an absent NIC is skipped.
+            print(f'[server] skip bind {addr}:{port} ({exc or "bind failed"})')
+            continue
+        servers.append(srv)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f'[server] listening on http://{addr}:{port}')
+    if not servers:
+        raise SystemExit(f'[server] FATAL: could not bind any of {addrs}:{port}')
+    try:
+        stop.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        for srv in servers:
+            srv.shutdown()
 
 
 if __name__ == '__main__':
