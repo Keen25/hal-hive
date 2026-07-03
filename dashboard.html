@@ -140,9 +140,10 @@
         </div>
         <div class="cmdrow">
           <code id="w_cmd">Run on a fresh box to join the hive.</code>
+          <button type="button" id="w_settok" title="Set the control token used to authorize the join">Set token</button>
           <button type="button" id="w_copy" title="Copy">Copy</button>
         </div>
-        <div class="hint">One-liner is self-contained: it installs Python, the worker, copilot auth &amp; a boot-persistent service. Re-running re-provisions the same lane.</div>
+        <div class="hint">Joining a worker is a control action: click <b>Set token</b> and paste the control token (HIVE_TOKEN) — it stays in this browser tab only and is baked into the one-liner as an auth header. The script then installs Python, the worker, copilot auth &amp; a boot-persistent service. Re-running re-provisions the same lane.</div>
       </div>
     </div>
   </div>
@@ -352,9 +353,15 @@ function buildCmd(){
   if(caps) qs.set('caps', caps);
   if(id)   qs.set('id', id);
   const url = location.origin + '/bootstrap.' + W_OS + '?' + qs.toString();
+  // /bootstrap.* now requires the control token (S1). Bake the operator-supplied
+  // token (sessionStorage, never server-rendered) into the join one-liner as an
+  // auth header. If not set yet, show a placeholder + nudge to click "Set token".
+  const tok = ctlToken();
+  const tv = tok || '<HIVE_TOKEN>';
   out.textContent = W_OS === 'ps1'
-    ? `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm '${url}' | iex"`
-    : `curl -fsSL '${url}' | sh`;
+    ? `powershell -NoProfile -ExecutionPolicy Bypass -Command "irm -Headers @{Authorization='Bearer ${tv}'} '${url}' | iex"`
+    : `curl -fsSL -H 'Authorization: Bearer ${tv}' '${url}' | sh`;
+  if(!tok) out.textContent += W_OS === 'ps1' ? '   # click "Set token" first' : '   # click "Set token" first';
 }
 document.querySelectorAll('.osb').forEach(b=>b.addEventListener('click',()=>{
   document.querySelectorAll('.osb').forEach(x=>x.classList.remove('sel'));
@@ -380,6 +387,14 @@ function copyText(t){
     return Promise.resolve(ok);
   }catch(e){ return Promise.resolve(false); }
 }
+document.getElementById('w_settok').addEventListener('click',()=>{
+  const cur = ctlToken();
+  const t = prompt('Paste the control token (HIVE_TOKEN) used to authorize the join:', cur);
+  if(t===null) return;
+  if(t.trim()) sessionStorage.setItem('hive_ctl', t.trim());
+  else sessionStorage.removeItem('hive_ctl');
+  buildCmd();
+});
 document.getElementById('w_copy').addEventListener('click',()=>{
   const t=document.getElementById('w_cmd').textContent;
   const b=document.getElementById('w_copy');

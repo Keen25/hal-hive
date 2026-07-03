@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import os
 import random
+import sqlite3
 import threading
 import time
+import hmac
 
 from flask import Flask, Response, jsonify, request
 
@@ -112,34 +114,41 @@ app = Flask(__name__)
 
 
 def _authorized() -> bool:
-    """True for the full-privilege control token."""
+    """True for the full-privilege control token. Constant-time compare (S4)."""
     hdr = request.headers.get('Authorization', '')
-    return hdr.startswith('Bearer ') and hdr[7:].strip() == TOKEN
+    if not hdr.startswith('Bearer '):
+        return False
+    return hmac.compare_digest(hdr[7:].strip(), TOKEN)
 
 
 def _read_authorized() -> bool:
-    """True for EITHER the control token or the read-only token (GET /status)."""
+    """True for EITHER the control token or the read-only token (GET /status).
+
+    Uses hmac.compare_digest and evaluates both comparisons (no short-circuit)
+    so auth never leaks token bytes via response timing. (S4)"""
     hdr = request.headers.get('Authorization', '')
     if not hdr.startswith('Bearer '):
         return False
     tok = hdr[7:].strip()
-    return tok == TOKEN or tok == RO_TOKEN
+    is_ctl = hmac.compare_digest(tok, TOKEN)
+    is_ro = hmac.compare_digest(tok, RO_TOKEN)
+    return is_ctl or is_ro
 
 
 @app.before_request
 def _guard():
-    if request.method == 'GET' and (
-        request.path in ('/health', '/', '/dashboard', '/bootstrap.ps1',
-                         '/bootstrap.sh')
-        or request.path.startswith('/download/')
-    ):
+    # Truly public, secret-free GET endpoints (no token, no secrets served).
+    if request.method == 'GET' and request.path in ('/health', '/', '/dashboard'):
         return None
     # Read-only endpoints accept the low-privilege dashboard token as well.
     if request.method == 'GET' and request.path in READONLY_PATHS:
         if _read_authorized():
             return None
         return jsonify(error='unauthorized'), 401
-    # Everything else (claim/heartbeat/complete/add/cancel/prio) needs control.
+    # Everything else needs the control token — INCLUDING /bootstrap.* and
+    # /download/*, which serve the control + GH OAuth tokens (or the worker code
+    # that uses them). Previously these were unauthenticated, so anyone who could
+    # reach :5001 could pull both secrets. (S1 #4)
     if not _authorized():
         return jsonify(error='unauthorized'), 401
 
@@ -151,9 +160,11 @@ def health():
 
 @app.get('/download/<path:name>')
 def download(name):
-    """Serve allowlisted worker assets to a bootstrapping node (LAN-trust, no
-    auth — the files are non-secret; the queue/copilot tokens live only in the
-    generated bootstrap scripts)."""
+    """Serve allowlisted worker assets to a bootstrapping node.
+
+    Requires the control token (enforced by _guard) — the bootstrap script
+    authenticates these fetches with the token it was handed. Allowlisted so the
+    endpoint can never serve queue.db, tokens, or arbitrary paths."""
     mime = DOWNLOADABLE.get(name)
     if mime is None:
         return jsonify(error='not found'), 404
@@ -172,8 +183,12 @@ def bootstrap_script():
     Query: lane (required), caps (comma/space list, optional), id (worker-id,
     default '<lane>#1'). `.ps1` -> Windows/WinSW, `.sh` -> Linux(systemd)/
     macOS(launchd). The queue + copilot tokens are injected server-side, so the
-    operator just runs the one-liner shown on the dashboard. LAN-trust, no auth
-    (same model as the dashboard, which also embeds the token)."""
+    operator just runs the one-liner shown on the dashboard.
+
+    Requires the control token (enforced by _guard): the returned script embeds
+    the control + GH OAuth tokens, so joining a worker is a privileged action.
+    The dashboard builds the one-liner with the operator-supplied control token
+    (kept only in the browser), never rendering it into the page. (S1 #4)"""
     os_kind = 'windows' if request.path.endswith('.ps1') else 'unix'
     lane = (request.args.get('lane') or '').strip()
     if not lane:
@@ -261,15 +276,21 @@ def complete():
 @app.post('/add')
 def add():
     b = request.get_json(force=True, silent=True) or {}
-    q.add_task(
-        b['id'], b['prompt'], branch=b.get('branch'),
-        base_ref=b.get('base_ref', q.DEFAULT_BASE_REF), worker=b.get('worker'),
-        requires=b.get('requires'), scope=b.get('scope'),
-        priority=int(b.get('priority', 5)),
-        complexity=(int(b['complexity']) if b.get('complexity') is not None else None),
-        model=b.get('model'),
-        deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
-    )
+    try:
+        q.add_task(
+            b['id'], b['prompt'], branch=b.get('branch'),
+            base_ref=b.get('base_ref', q.DEFAULT_BASE_REF), worker=b.get('worker'),
+            requires=b.get('requires'), scope=b.get('scope'),
+            priority=int(b.get('priority', 5)),
+            complexity=(int(b['complexity']) if b.get('complexity') is not None else None),
+            model=b.get('model'),
+            deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
+        )
+    except KeyError as exc:
+        return jsonify(error=f'missing required field: {exc.args[0]}'), 400
+    except sqlite3.IntegrityError as exc:
+        # Duplicate task id (PK) or branch (UNIQUE) — a conflict, not a 500. (U4)
+        return jsonify(error=f'task already exists (id or branch conflict): {exc}'), 409
     return jsonify(id=b['id']), 201
 
 
@@ -279,9 +300,38 @@ def cancel():
     return jsonify(cancelled=q.cancel_task(b['task_id'])), 200
 
 
+@app.post('/requeue')
+def requeue():
+    """Re-enqueue a parked task (needs_attention|dead|cancelled) -> pending. (U1)"""
+    b = request.get_json(force=True, silent=True) or {}
+    task_id = b.get('task_id')
+    if not task_id:
+        return jsonify(error='task_id required'), 400
+    ok = q.requeue_task(task_id, reset_attempts=bool(b.get('reset_attempts', True)))
+    return jsonify(requeued=ok), 200
+
+
 @app.get('/status')
 def status():
     return jsonify(q.status_snapshot()), 200
+
+
+def resolve_bind_addrs(override, default_lab_ip='192.168.100.1'):
+    """Addresses the control plane listens on (S2 #5).
+
+    Default (override unset): 127.0.0.1 for HAL-local access + the lab-net NIC
+    for workers, but NOT the corp interface, so the queue/git transport is not
+    exposed to the wider corporate network. Override with HIVE_BIND /
+    GIT_HTTP_BIND (comma-separated; e.g. '0.0.0.0' to bind all). The lab IP is
+    HIVE_LAB_IP (default 192.168.100.1). An address absent on the host is
+    skipped at bind time, so this never hard-fails without the lab NIC."""
+    if override:
+        return [h.strip() for h in override.split(',') if h.strip()]
+    lab = os.environ.get('HIVE_LAB_IP', default_lab_ip).strip()
+    addrs = ['127.0.0.1']
+    if lab and lab not in addrs:
+        addrs.append(lab)
+    return addrs
 
 
 def main():
@@ -290,13 +340,35 @@ def main():
     stop = threading.Event()
     threading.Thread(target=q.reaper_loop, args=(stop,), daemon=True).start()
     threading.Thread(target=q.merge_loop, args=(stop,), daemon=True).start()
-    host = os.environ.get('HIVE_BIND', '0.0.0.0')
+    from werkzeug.serving import make_server
+    addrs = resolve_bind_addrs(os.environ.get('HIVE_BIND'))
     port = int(os.environ.get('HIVE_PORT', '5001'))
-    print(f'[server] queue REST on {host}:{port} — reaper + merge-loop running')
-    print(f'[server] control token: Authorization: Bearer <HIVE_TOKEN>  (add/cancel/claim)')
+    print('[server] queue REST — reaper + merge-loop running')
+    print(f'[server] control token: Authorization: ******  (add/cancel/claim)')
     print(f'[server] read-only token (dashboard /status) -> {RO_TOKEN_FILE}')
-    # threaded=True so long-poll /claim calls don't block the reaper/other workers.
-    app.run(host=host, port=port, threaded=True)
+    servers = []
+    for addr in addrs:
+        try:
+            # threaded=True so long-poll /claim calls don't block reaper/others.
+            srv = make_server(addr, port, app, threaded=True)
+        except (OSError, SystemExit) as exc:
+            # werkzeug turns a bind failure into a printed msg + SystemExit(1),
+            # stdlib would raise OSError -- tolerate both so an absent NIC is skipped.
+            print(f'[server] skip bind {addr}:{port} ({exc or "bind failed"})')
+            continue
+        servers.append(srv)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        print(f'[server] listening on http://{addr}:{port}')
+    if not servers:
+        raise SystemExit(f'[server] FATAL: could not bind any of {addrs}:{port}')
+    try:
+        stop.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        for srv in servers:
+            srv.shutdown()
 
 
 if __name__ == '__main__':

@@ -105,10 +105,10 @@ if (-not $py) {{
 & $py -m pip install --quiet --disable-pip-version-check requests | Out-Null
 
 foreach ($f in 'worker_loop.py','hive_caps.py','hive_queue.py') {{
-  Invoke-WebRequest "$QUEUE/download/$f" -OutFile "$DIR\\$f" -UseBasicParsing
+  Invoke-WebRequest "$QUEUE/download/$f" -OutFile "$DIR\\$f" -Headers @{{Authorization="Bearer $TOKEN"}} -UseBasicParsing
 }}
 $winsw = "$DIR\\hive-worker-$LANE.exe"
-if (-not (Test-Path $winsw)) {{ Invoke-WebRequest "$QUEUE/download/winsw.exe" -OutFile $winsw -UseBasicParsing }}
+if (-not (Test-Path $winsw)) {{ Invoke-WebRequest "$QUEUE/download/winsw.exe" -OutFile $winsw -Headers @{{Authorization="Bearer $TOKEN"}} -UseBasicParsing }}
 
 # copilot auth (machine env so the service account inherits it)
 [Environment]::SetEnvironmentVariable('GH_TOKEN', $GHTOK, 'Machine')
@@ -198,7 +198,7 @@ PY="$(command -v python3 || true)"
 
 # 2. worker code
 for f in worker_loop.py hive_caps.py hive_queue.py; do
-  curl -fsSL "$QUEUE/download/$f" -o "$DIR/$f"
+  curl -fsSL -H "Authorization: Bearer $TOKEN" "$QUEUE/download/$f" -o "$DIR/$f"
 done
 
 # 3. copilot CLI present?
