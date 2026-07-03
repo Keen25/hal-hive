@@ -73,6 +73,36 @@ def _load_token() -> str:
 
 TOKEN = _load_token()
 
+RO_TOKEN_FILE = os.path.expanduser('~/.hive/readonly.token')
+
+
+def _load_ro_token() -> str:
+    """Low-privilege READ-ONLY token for the dashboard.
+
+    Distinct from the control TOKEN so the no-auth dashboard HTML can carry a
+    token that only grants GET /status — never add/cancel/claim. Resolved from
+    $HIVE_RO_TOKEN or ~/.hive/readonly.token (auto-generated on first run).
+    """
+    tok = os.environ.get('HIVE_RO_TOKEN')
+    if tok:
+        return tok.strip()
+    if os.path.exists(RO_TOKEN_FILE):
+        with open(RO_TOKEN_FILE) as f:
+            return f.read().strip()
+    tok = os.urandom(24).hex()
+    os.makedirs(os.path.dirname(RO_TOKEN_FILE), exist_ok=True)
+    with open(RO_TOKEN_FILE, 'w') as f:
+        f.write(tok + '\n')
+    os.chmod(RO_TOKEN_FILE, 0o600)
+    print(f'[server] generated read-only token -> {RO_TOKEN_FILE}')
+    return tok
+
+
+RO_TOKEN = _load_ro_token()
+
+# GET endpoints a read-only token may reach (the control token also works).
+READONLY_PATHS = frozenset({'/status'})
+
 # ── Long-poll tuning (§6) ─────────────────────────────────────────────────────
 
 CLAIM_LONGPOLL_S = 25       # max server-side wait for /claim
@@ -82,8 +112,18 @@ app = Flask(__name__)
 
 
 def _authorized() -> bool:
+    """True for the full-privilege control token."""
     hdr = request.headers.get('Authorization', '')
     return hdr.startswith('Bearer ') and hdr[7:].strip() == TOKEN
+
+
+def _read_authorized() -> bool:
+    """True for EITHER the control token or the read-only token (GET /status)."""
+    hdr = request.headers.get('Authorization', '')
+    if not hdr.startswith('Bearer '):
+        return False
+    tok = hdr[7:].strip()
+    return tok == TOKEN or tok == RO_TOKEN
 
 
 @app.before_request
@@ -94,6 +134,12 @@ def _guard():
         or request.path.startswith('/download/')
     ):
         return None
+    # Read-only endpoints accept the low-privilege dashboard token as well.
+    if request.method == 'GET' and request.path in READONLY_PATHS:
+        if _read_authorized():
+            return None
+        return jsonify(error='unauthorized'), 401
+    # Everything else (claim/heartbeat/complete/add/cancel/prio) needs control.
     if not _authorized():
         return jsonify(error='unauthorized'), 401
 
@@ -144,10 +190,11 @@ def bootstrap_script():
 def dashboard():
     """Serve the single-page control-plane dashboard.
 
-    The page is unauthenticated (host-only LAN trust model, same as the
-    git-http transport), but the API it polls (/status, /cancel) still requires
-    the bearer token — so the server injects the token into the page. Nothing
-    beyond this LAN can reach the port, and the workers already hold the token.
+    The page is unauthenticated (host-only LAN trust). It embeds only the
+    low-privilege READ-ONLY token so its /status polling works; that token
+    cannot add/cancel/claim. The full control token is NEVER rendered into the
+    HTML — for control actions (cancel) the operator pastes the control token
+    into the page, and it lives only in their browser's sessionStorage.
     """
     try:
         with open(DASHBOARD_FILE, encoding='utf-8') as f:
@@ -155,7 +202,7 @@ def dashboard():
     except OSError as exc:
         return Response(f'dashboard unavailable: {exc}', status=500,
                         mimetype='text/plain')
-    html = html.replace('%TOKEN%', TOKEN)
+    html = html.replace('%RO_TOKEN%', RO_TOKEN)
     return Response(html, mimetype='text/html')
 
 
@@ -246,7 +293,8 @@ def main():
     host = os.environ.get('HIVE_BIND', '0.0.0.0')
     port = int(os.environ.get('HIVE_PORT', '5001'))
     print(f'[server] queue REST on {host}:{port} — reaper + merge-loop running')
-    print(f'[server] token: Authorization: Bearer {TOKEN}')
+    print(f'[server] control token: Authorization: Bearer <HIVE_TOKEN>  (add/cancel/claim)')
+    print(f'[server] read-only token (dashboard /status) -> {RO_TOKEN_FILE}')
     # threaded=True so long-poll /claim calls don't block the reaper/other workers.
     app.run(host=host, port=port, threaded=True)
 

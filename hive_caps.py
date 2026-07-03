@@ -166,9 +166,13 @@ def classify_complexity(prompt: str) -> dict:
 
     if complex_hit:
         c = 3
-    elif _SIMPLE_RX.search(text) and len(text) < _SIMPLE_MAXLEN:
+    elif (_SIMPLE_RX.search(text) and len(text) < _SIMPLE_MAXLEN
+          and len([ln for ln in text.splitlines() if ln.strip()]) <= 1):
+        # Fail-upward: only a SINGLE-instruction, short, mechanically-worded
+        # prompt earns the cheap tier. A multi-line prompt is several steps —
+        # never silently downgrade that to haiku.
         c = 1
-        reasons.append('short, mechanical edit')
+        reasons.append('short, single mechanical edit')
     else:
         c = 2
         if not reasons:

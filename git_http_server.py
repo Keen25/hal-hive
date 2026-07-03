@@ -23,14 +23,39 @@ by hand).
 import base64
 import hmac
 import os
+import shutil
 import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-GIT_HTTP_BACKEND = os.environ.get(
-    "GIT_HTTP_BACKEND", "/usr/libexec/git-core/git-http-backend"
-)
+
+def _default_backend() -> str:
+    """Locate git-http-backend on any OS (Linux/macOS/Windows).
+
+    The CGI lives in git's exec-path, which differs per platform/install
+    (Fedora `/usr/libexec/git-core`, Homebrew `/opt/homebrew/.../git-core`,
+    Git-for-Windows `…\\mingw64\\libexec\\git-core\\git-http-backend.exe`). Ask
+    git itself via `git --exec-path` rather than hardcoding, then fall back to a
+    PATH lookup, then the historical Linux default.
+    """
+    exe = "git-http-backend.exe" if os.name == "nt" else "git-http-backend"
+    try:
+        ep = subprocess.run(["git", "--exec-path"], capture_output=True,
+                            text=True, timeout=5)
+        if ep.returncode == 0 and ep.stdout.strip():
+            cand = os.path.join(ep.stdout.strip(), exe)
+            if os.path.isfile(cand):
+                return cand
+    except (OSError, subprocess.SubprocessError):
+        pass
+    found = shutil.which(exe)
+    if found:
+        return found
+    return "/usr/libexec/git-core/" + exe
+
+
+GIT_HTTP_BACKEND = os.environ.get("GIT_HTTP_BACKEND") or _default_backend()
 PROJECT_ROOT = os.environ.get("GIT_PROJECT_ROOT", os.path.expanduser("~/hive"))
 BIND = os.environ.get("GIT_HTTP_BIND", "0.0.0.0")
 PORT = int(os.environ.get("GIT_HTTP_PORT", "8418"))
