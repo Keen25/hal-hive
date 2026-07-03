@@ -383,6 +383,29 @@ def _tls_context():
     return ctx
 
 
+def _enable_partial_clone():
+    """Partial clone (`git clone --filter=blob:none`) needs uploadpack.allowFilter
+    set on the SERVER repo (Sc4 #13). Set it idempotently on each served bare repo
+    at startup so workers can blobless-clone lab.git; full-clone cost otherwise
+    scales with repo size × task count. Survives fresh seeds/redeploys.
+
+    Writes the bare repo's config file directly (`--file <repo>/config`) rather
+    than `git -C <repo> config`: a global `safe.bareRepository=explicit` makes the
+    latter fail with "not in a git directory" on a bare repo."""
+    for repo in ALLOWED_REPOS:
+        path = os.path.join(PROJECT_ROOT, repo)
+        cfg = os.path.join(path, "config")
+        if not os.path.isfile(cfg):
+            continue
+        try:
+            subprocess.run(
+                ["git", "config", "--file", cfg, "uploadpack.allowFilter", "true"],
+                check=False, capture_output=True,
+            )
+        except Exception as exc:  # noqa: BLE001 — never let this block serving
+            sys.stderr.write("warn: allowFilter on %s failed (%s)\n" % (path, exc))
+
+
 def main():
     if not AUTH_TOKEN:
         sys.stderr.write(
@@ -390,6 +413,7 @@ def main():
             "~/.hive/worker.token). Refusing to serve lab.git without auth.\n"
         )
         sys.exit(1)
+    _enable_partial_clone()
     addrs = _resolve_bind_addrs(BIND)
     ctx = _tls_context()
     scheme = "https" if ctx else "http"
