@@ -341,6 +341,20 @@ def resolve_bind_addrs(override, default_lab_ip='192.168.100.1'):
     return addrs
 
 
+def build_ssl_context():
+    """Return an ssl.SSLContext when HIVE_TLS_CERT and HIVE_TLS_KEY are both set,
+    else None (plain HTTP). Terminates TLS so control/RO tokens no longer transit
+    in clear text (issue #8 / S5). Use gen-lab-ca.sh to mint the cert/key."""
+    cert = os.environ.get('HIVE_TLS_CERT')
+    key = os.environ.get('HIVE_TLS_KEY')
+    if not (cert and key):
+        return None
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(certfile=cert, keyfile=key)
+    return ctx
+
+
 def main():
     q.init_db()
     q.ensure_lab_repo()
@@ -350,14 +364,18 @@ def main():
     from werkzeug.serving import make_server
     addrs = resolve_bind_addrs(os.environ.get('HIVE_BIND'))
     port = int(os.environ.get('HIVE_PORT', '5001'))
+    ssl_ctx = build_ssl_context()
+    scheme = 'https' if ssl_ctx else 'http'
     print('[server] queue REST — reaper + merge-loop running')
     print(f'[server] control token: Authorization: ******  (add/cancel/claim)')
     print(f'[server] read-only token (dashboard /status) -> {RO_TOKEN_FILE}')
+    if not ssl_ctx:
+        print('[server] TLS OFF — set HIVE_TLS_CERT/HIVE_TLS_KEY to encrypt (issue #8)')
     servers = []
     for addr in addrs:
         try:
             # threaded=True so long-poll /claim calls don't block reaper/others.
-            srv = make_server(addr, port, app, threaded=True)
+            srv = make_server(addr, port, app, threaded=True, ssl_context=ssl_ctx)
         except (OSError, SystemExit) as exc:
             # werkzeug turns a bind failure into a printed msg + SystemExit(1),
             # stdlib would raise OSError -- tolerate both so an absent NIC is skipped.
@@ -365,7 +383,7 @@ def main():
             continue
         servers.append(srv)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        print(f'[server] listening on http://{addr}:{port}')
+        print(f'[server] listening on {scheme}://{addr}:{port}')
     if not servers:
         raise SystemExit(f'[server] FATAL: could not bind any of {addrs}:{port}')
     try:
