@@ -11,7 +11,8 @@ EnvironmentFile=-%h/.hive/hive.env
 # git:// push deadlocks the Git-for-Windows client (sideband/pipe-buffer
 # half-duplex deadlock in receive-pack). Smart-HTTP is fully request/response
 # framed and does not hit that bug, so remote workers clone+push over this.
-Environment=GIT_HTTP_BIND=0.0.0.0
+# Bind default is localhost + lab NIC (S2 #5); set GIT_HTTP_BIND=0.0.0.0 in the
+# env file for all interfaces, or HIVE_LAB_IP if the lab NIC != 192.168.100.1.
 Environment=GIT_HTTP_PORT=8418
 Environment=GIT_PROJECT_ROOT=%h/hive
 Environment=GIT_HTTP_BACKEND=/usr/libexec/git-core/git-http-backend

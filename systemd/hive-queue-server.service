@@ -7,10 +7,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/hive
-# HIVE_PORT / HIVE_BIND / HIVE_VERIFY_CMD can be overridden via an env file.
+# HIVE_PORT / HIVE_BIND / HIVE_LAB_IP / HIVE_VERIFY_CMD can be overridden via an env file.
+# Bind default is localhost + lab NIC (S2 #5). Set HIVE_BIND=0.0.0.0 in the env
+# file to expose on all interfaces, or HIVE_LAB_IP if the lab NIC != 192.168.100.1.
 EnvironmentFile=-%h/.hive/hive.env
 Environment=HIVE_PORT=5001
-Environment=HIVE_BIND=0.0.0.0
 Environment=PYTHONUNBUFFERED=1
 ExecStartPre=/usr/bin/python3 %h/hive/halctl.py init
 ExecStart=/usr/bin/python3 %h/hive/queue_server.py
