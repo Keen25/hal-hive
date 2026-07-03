@@ -131,8 +131,13 @@
   </div>
 </div>
 <script>
-const TOKEN = "%TOKEN%";
-const H = { 'Authorization': 'Bearer ' + TOKEN };
+const RO_TOKEN = "%RO_TOKEN%";
+// Read-only token embedded server-side: only good for GET /status.
+const H = { 'Authorization': 'Bearer ' + RO_TOKEN };
+// Control token is NEVER embedded in this page. For cancel, the operator pastes
+// it once; it lives only in this browser tab's sessionStorage.
+function ctlToken(){ return sessionStorage.getItem('hive_ctl') || ''; }
+function ctlHeaders(){ return {'Authorization':'Bearer '+ctlToken(),'Content-Type':'application/json'}; }
 const ORDER = ['running','claimed','pending','done','verifying','needs_attention','merged','cancelled','dead'];
 
 function el(t, cls, txt){ const e=document.createElement(t); if(cls)e.className=cls;
@@ -240,9 +245,19 @@ function fmtAge(s){ if(s==null) return '?'; if(s<60) return s+'s ago';
 function row7(msg){ const tr=document.createElement('tr');
   tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=9; return tr; }
 async function cancel(id){
+  if(!ctlToken()){
+    const t = prompt('Cancel is a control action. Paste the control token (HIVE_TOKEN):');
+    if(!t) return;
+    sessionStorage.setItem('hive_ctl', t.trim());
+  }
   if(!confirm('Cancel '+id+'?')) return;
-  await fetch('/cancel',{method:'POST',headers:{...H,'Content-Type':'application/json'},
+  const r = await fetch('/cancel',{method:'POST',headers:ctlHeaders(),
     body:JSON.stringify({task_id:id})});
+  if(r.status===401){
+    sessionStorage.removeItem('hive_ctl');
+    alert('Control token rejected — cleared. Try cancel again to re-enter it.');
+    return;
+  }
   poll();
 }
 setInterval(()=>document.getElementById('clock').textContent=new Date().toLocaleTimeString(),1000);
