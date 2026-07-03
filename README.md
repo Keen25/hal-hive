@@ -64,5 +64,34 @@ PowerShell run `trust-lab-ca.ps1 -CaPath C:\hive\ca.crt` (imports into
 `LocalMachine\Root` and sets git's `http.sslBackend=schannel`). Then point the
 worker at `https://<HAL-ip>:5001` / `https://<HAL-ip>:8418/lab.git`.
 
+### Domain-wide trust (via the DC)
+
+For **domain-joined** Windows workers, push the CA once from the DC instead of
+running `trust-lab-ca.ps1` on every box. Note the store: it must go into
+**Trusted Root Certification Authorities** — *not* Trusted Publishers, which is
+for code-signing and is ignored by TLS validation.
+
+- **Group Policy (recommended):** Group Policy Management → a GPO linked to the
+  workers' OU → Computer Configuration → Policies → Windows Settings → Security
+  Settings → Public Key Policies → **Trusted Root Certification Authorities** →
+  Import `ca.crt`. Members pick it up on the next `gpupdate /force` / reboot.
+- **Enterprise store (autoenrollment):** on the DC,
+  `certutil -dspublish -f ca.crt RootCA` — publishes the CA to AD; domain members
+  auto-download it into their Root store.
+
+Caveats: GPO/dspublish reach **domain-joined** machines only — standalone/workgroup
+workers still need the manual `trust-lab-ca.ps1` import. Recent Git for Windows
+defaults to `http.sslBackend=schannel` (uses the Windows Root store, so GPO trust
+covers git too); if a worker's git uses the OpenSSL/mingw backend it consults its
+own `ca-bundle.crt`, which GPO does not touch — set schannel or PEM-append there.
+
+### The dashboard
+
+The dashboard is served by `queue_server` itself at `/dashboard`, so it rides the
+same port and cert — enable TLS and it is automatically at
+`https://<HAL-ip>:5001/dashboard`. Its API calls are all relative
+(`location.origin`), so they follow the scheme with no change. Over https the
+copy-to-clipboard button also gains the native secure-context path.
+
 Both servers share one cert/key pair. The CA key never leaves HAL. Only the
 public `ca.crt` is distributed. All `*.key`/`*.crt`/`*.pem` are gitignored.

@@ -15,6 +15,12 @@
     scp ~/.hive-ca/ca.crt <win-user>@ar1:C:\hive\ca.crt
   (or paste it via your existing WinRM push path).
 
+  NOTE: for DOMAIN-JOINED workers, prefer pushing the CA from the DC once via
+  Group Policy (Computer Config -> Public Key Policies -> Trusted Root
+  Certification Authorities) or `certutil -dspublish -f ca.crt RootCA`, instead
+  of running this per box. See the README "Domain-wide trust" section. This
+  script is for standalone/workgroup boxes or a quick one-off.
+
 .PARAMETER CaPath
   Path to ca.crt on the Windows box. Default: .\ca.crt
 
