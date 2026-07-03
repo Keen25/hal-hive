@@ -128,18 +128,18 @@ def _read_authorized() -> bool:
 
 @app.before_request
 def _guard():
-    if request.method == 'GET' and (
-        request.path in ('/health', '/', '/dashboard', '/bootstrap.ps1',
-                         '/bootstrap.sh')
-        or request.path.startswith('/download/')
-    ):
+    # Truly public, secret-free GET endpoints (no token, no secrets served).
+    if request.method == 'GET' and request.path in ('/health', '/', '/dashboard'):
         return None
     # Read-only endpoints accept the low-privilege dashboard token as well.
     if request.method == 'GET' and request.path in READONLY_PATHS:
         if _read_authorized():
             return None
         return jsonify(error='unauthorized'), 401
-    # Everything else (claim/heartbeat/complete/add/cancel/prio) needs control.
+    # Everything else needs the control token — INCLUDING /bootstrap.* and
+    # /download/*, which serve the control + GH OAuth tokens (or the worker code
+    # that uses them). Previously these were unauthenticated, so anyone who could
+    # reach :5001 could pull both secrets. (S1 #4)
     if not _authorized():
         return jsonify(error='unauthorized'), 401
 
@@ -151,9 +151,11 @@ def health():
 
 @app.get('/download/<path:name>')
 def download(name):
-    """Serve allowlisted worker assets to a bootstrapping node (LAN-trust, no
-    auth — the files are non-secret; the queue/copilot tokens live only in the
-    generated bootstrap scripts)."""
+    """Serve allowlisted worker assets to a bootstrapping node.
+
+    Requires the control token (enforced by _guard) — the bootstrap script
+    authenticates these fetches with the token it was handed. Allowlisted so the
+    endpoint can never serve queue.db, tokens, or arbitrary paths."""
     mime = DOWNLOADABLE.get(name)
     if mime is None:
         return jsonify(error='not found'), 404
@@ -172,8 +174,12 @@ def bootstrap_script():
     Query: lane (required), caps (comma/space list, optional), id (worker-id,
     default '<lane>#1'). `.ps1` -> Windows/WinSW, `.sh` -> Linux(systemd)/
     macOS(launchd). The queue + copilot tokens are injected server-side, so the
-    operator just runs the one-liner shown on the dashboard. LAN-trust, no auth
-    (same model as the dashboard, which also embeds the token)."""
+    operator just runs the one-liner shown on the dashboard.
+
+    Requires the control token (enforced by _guard): the returned script embeds
+    the control + GH OAuth tokens, so joining a worker is a privileged action.
+    The dashboard builds the one-liner with the operator-supplied control token
+    (kept only in the browser), never rendering it into the page. (S1 #4)"""
     os_kind = 'windows' if request.path.endswith('.ps1') else 'unix'
     lane = (request.args.get('lane') or '').strip()
     if not lane:
