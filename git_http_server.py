@@ -59,6 +59,11 @@ GIT_HTTP_BACKEND = os.environ.get("GIT_HTTP_BACKEND") or _default_backend()
 PROJECT_ROOT = os.environ.get("GIT_PROJECT_ROOT", os.path.expanduser("~/hive"))
 BIND = os.environ.get("GIT_HTTP_BIND")  # None -> dual-bind localhost + lab NIC (S2)
 PORT = int(os.environ.get("GIT_HTTP_PORT", "8418"))
+# S6 (#9): GIT_HTTP_EXPORT_ALL + GIT_PROJECT_ROOT=~/hive would let git-http-backend
+# serve ANY bare repo under ~/hive. The hive only needs lab.git, so route only
+# requests whose first path segment is an allowed repo (comma-sep override).
+ALLOWED_REPOS = {r.strip() for r in
+                 os.environ.get("GIT_HTTP_REPOS", "lab.git").split(",") if r.strip()}
 # Chunk size for streaming bodies between socket and the CGI process.
 CHUNK = 65536
 
@@ -117,13 +122,37 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
             pass
         return False
 
+    def _repo_allowed(self) -> bool:
+        """S6 (#9): only serve requests under an allowed repo. Reject path
+        traversal and any repo not in ALLOWED_REPOS with 404 (don't confirm what
+        else exists under PROJECT_ROOT)."""
+        path = self.path.split("?", 1)[0]
+        segs = [s for s in path.split("/") if s]
+        if not segs or ".." in segs or segs[0] not in ALLOWED_REPOS:
+            body = b"404 not found\n"
+            self.send_response(404)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except OSError:
+                pass
+            return False
+        return True
+
     def do_GET(self):
         if not self._require_auth():
+            return
+        if not self._repo_allowed():
             return
         self._run_cgi("GET")
 
     def do_POST(self):
         if not self._require_auth():
+            return
+        if not self._repo_allowed():
             return
         self._run_cgi("POST")
 

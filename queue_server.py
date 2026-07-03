@@ -238,7 +238,14 @@ def claim():
 
     deadline = time.time() + CLAIM_LONGPOLL_S
     while True:
-        task = q.claim_next(worker_id, lane, worker_caps=caps)
+        try:
+            task = q.claim_next(worker_id, lane, worker_caps=caps)
+        except sqlite3.OperationalError as exc:
+            # Sc3 (#12): claim_next already retries transient locks; if it still
+            # fails, tell the worker to back off (503, retryable) instead of 500.
+            if 'locked' in str(exc).lower() or 'busy' in str(exc).lower():
+                return jsonify(error='queue busy, retry'), 503
+            raise
         if task is not None:
             q.upsert_worker(worker_id, lane=lane, caps=caps, status='busy',
                             current_task=task.id, host=host)
