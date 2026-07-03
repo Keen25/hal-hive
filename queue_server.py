@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import random
+import sqlite3
 import threading
 import time
 import hmac
@@ -275,15 +276,21 @@ def complete():
 @app.post('/add')
 def add():
     b = request.get_json(force=True, silent=True) or {}
-    q.add_task(
-        b['id'], b['prompt'], branch=b.get('branch'),
-        base_ref=b.get('base_ref', q.DEFAULT_BASE_REF), worker=b.get('worker'),
-        requires=b.get('requires'), scope=b.get('scope'),
-        priority=int(b.get('priority', 5)),
-        complexity=(int(b['complexity']) if b.get('complexity') is not None else None),
-        model=b.get('model'),
-        deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
-    )
+    try:
+        q.add_task(
+            b['id'], b['prompt'], branch=b.get('branch'),
+            base_ref=b.get('base_ref', q.DEFAULT_BASE_REF), worker=b.get('worker'),
+            requires=b.get('requires'), scope=b.get('scope'),
+            priority=int(b.get('priority', 5)),
+            complexity=(int(b['complexity']) if b.get('complexity') is not None else None),
+            model=b.get('model'),
+            deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
+        )
+    except KeyError as exc:
+        return jsonify(error=f'missing required field: {exc.args[0]}'), 400
+    except sqlite3.IntegrityError as exc:
+        # Duplicate task id (PK) or branch (UNIQUE) — a conflict, not a 500. (U4)
+        return jsonify(error=f'task already exists (id or branch conflict): {exc}'), 409
     return jsonify(id=b['id']), 201
 
 
