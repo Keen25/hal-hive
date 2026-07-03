@@ -141,10 +141,11 @@ def main():
                          'e.g. --require os:windows --require msbuild')
     pa.add_argument('--scope', help='build/test scope for the verify gate')
     pa.add_argument('--priority', type=int, default=5)
-    pa.add_argument('--complexity', required=True,
+    pa.add_argument('--complexity', default='auto',
                     choices=['1', '2', '3', 'auto'],
-                    help='required. model tier: 1=haiku(simple) 2=sonnet(standard) '
-                         '3=opus(complex), or "auto" to classify from the prompt')
+                    help='model tier: 1=haiku(simple) 2=sonnet(standard) '
+                         '3=opus(complex), or "auto" to classify from the prompt '
+                         '(default: auto)')
     pa.add_argument('--dep', action='append', help='dependency task id (repeatable)')
     pa.add_argument('--max-attempts', type=int, default=3)
     pa.set_defaults(fn=cmd_add)
