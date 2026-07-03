@@ -510,6 +510,25 @@ def _park(cur: sqlite3.Cursor, task_id: str, reason: str) -> None:
     print(f'  ⚠️  parked {task_id}: {reason}')
 
 
+def _set_status(db_path: str, task_id: str, status: str,
+                commit_hash: Optional[str] = None) -> None:
+    """Short-lived write for a single merge-loop state transition. Keeping each
+    flip in its own tiny cursor block means the (slow) git rebase + verify
+    subprocesses in _merge_one run with NO DB cursor open, so they can never
+    stall other writers regardless of the connection's isolation level."""
+    with cursor(db_path) as cur:
+        if commit_hash is not None:
+            cur.execute("UPDATE tasks SET status=?, commit_hash=? WHERE id=?",
+                        (status, commit_hash, task_id))
+        else:
+            cur.execute("UPDATE tasks SET status=? WHERE id=?", (status, task_id))
+
+
+def _park_task(db_path: str, task_id: str, reason: str) -> None:
+    with cursor(db_path) as cur:
+        _park(cur, task_id, reason)
+
+
 def verify_branch(branch: str, base_ref: str, scope: Optional[str]) -> tuple[bool, str]:
     """
     Build/test gate (§7). Rebase the branch onto the live base, then run the
@@ -533,56 +552,67 @@ def verify_branch(branch: str, base_ref: str, scope: Optional[str]) -> tuple[boo
     return proc.returncode == 0, ' | '.join(tail)
 
 
-def _merge_one(cur: sqlite3.Cursor, task: sqlite3.Row) -> None:
+def _merge_one(db_path: str, task: sqlite3.Row) -> None:
+    """Rebase → verify → fast-forward one 'done' task into its base_ref.
+
+    The git rebase and the verify subprocess can be slow (a real build/test).
+    They run here with NO DB cursor open; only the short state transitions
+    (verifying / merged / needs_attention) touch the database, each in its own
+    _set_status / _park_task write. The merge loop stays single-threaded
+    (serialized merges) but never holds a lock across the slow work.
+    """
     branch, base_ref = task['branch'], task['base_ref'] or DEFAULT_BASE_REF
-    cur.execute("UPDATE tasks SET status='verifying' WHERE id=?", (task['id'],))
+    task_id = task['id']
+    _set_status(db_path, task_id, 'verifying')
 
     # base_ref is guaranteed to exist (ensure_lab_repo seeds a root commit), so we
     # always rebase then fast-forward — no orphan-seed special case.
     if _git('rev-parse', '--verify', f'refs/heads/{base_ref}',
             check=False).returncode != 0:
-        _park(cur, task['id'], f'base_ref {base_ref} missing (run ensure_lab_repo)')
+        _park_task(db_path, task_id, f'base_ref {base_ref} missing (run ensure_lab_repo)')
         return
 
     # M2: rebase branch onto the LIVE base so we never merge stale. lab.git is
     # bare (no worktree), so rebase runs in a scratch worktree; on success the
     # rebased tip fast-forwards base_ref via `branch -f` (ff by construction).
     if not _rebase_bare(branch, base_ref):
-        _park(cur, task['id'], f'rebase conflict onto {base_ref}')
+        _park_task(db_path, task_id, f'rebase conflict onto {base_ref}')
         return
 
     # C5: build/test gate BEFORE merge — no unverified code lands.
     ok, summary = verify_branch(branch, base_ref, task['scope'])
     if not ok:
-        _park(cur, task['id'], f'verify failed: {summary}')
+        _park_task(db_path, task_id, f'verify failed: {summary}')
         return
 
     # Advance base_ref to the rebased branch tip (fast-forward in a bare repo).
     res = _git('branch', '-f', base_ref, branch, check=False)
     if res.returncode != 0:
-        _park(cur, task['id'], f'merge into {base_ref} failed: {res.stderr.strip()}')
+        _park_task(db_path, task_id, f'merge into {base_ref} failed: {res.stderr.strip()}')
         return
     tip = _git('rev-parse', branch, check=False).stdout.strip() or None
-    cur.execute(
-        "UPDATE tasks SET status='merged', commit_hash=? WHERE id=?",
-        (tip, task['id']),
-    )
-    print(f'  ✅ merged {branch} → {base_ref} ({task["id"]})')
+    _set_status(db_path, task_id, 'merged', commit_hash=tip)
+    print(f'  ✅ merged {branch} → {base_ref} ({task_id})')
 
 
 def merge_once(db_path: str = QUEUE_DB) -> int:
-    """Process all mergeable 'done' tasks, oldest-first, serialized. Returns count."""
-    merged = 0
+    """Process all mergeable 'done' tasks, oldest-first, serialized. Returns count.
+
+    Snapshots the mergeable set under a short read cursor, then closes it before
+    doing any (slow) git/verify work in _merge_one — so the rebase/verify
+    subprocesses never run with a DB cursor held open.
+    """
     with cursor(db_path) as cur:
         rows = cur.execute(
             """SELECT * FROM tasks WHERE status='done'
                ORDER BY done_at ASC"""
         ).fetchall()
-        for task in rows:
-            if not _deps_all_merged(cur, task['id']):
-                continue
-            _merge_one(cur, task)
-            merged += 1
+        mergeable = [t for t in rows if _deps_all_merged(cur, t['id'])]
+
+    merged = 0
+    for task in mergeable:
+        _merge_one(db_path, task)
+        merged += 1
     return merged
 
 
