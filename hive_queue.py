@@ -19,6 +19,7 @@ Design source: gist hal-phase9.1-hardening.md.
 from __future__ import annotations
 
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -59,6 +60,32 @@ def connect(db_path: str = QUEUE_DB) -> sqlite3.Connection:
     conn.execute('PRAGMA foreign_keys = ON;')       # enforce task_deps integrity
     conn.execute('PRAGMA synchronous = NORMAL;')    # WAL-safe, fast enough for a lab
     return conn
+
+
+# Sc3 (#12): busy_timeout makes SQLite *wait* for a lock, but under sustained
+# write contention (every worker long-polling /claim + the merge loop + reaper)
+# the wait can still expire and raise "database is locked", which surfaced as a
+# 500 on /claim. Retry the whole transaction a few times with jittered backoff so
+# a transient lock degrades to a slightly slower claim instead of an error.
+BUSY_RETRIES = 6
+_BUSY_BASE_S = 0.05
+
+
+def _is_locked_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and \
+        ('locked' in str(exc).lower() or 'busy' in str(exc).lower())
+
+
+def with_retry(fn, *args, retries: int = BUSY_RETRIES, **kwargs):
+    """Run fn(*args, **kwargs), retrying on a transient SQLite lock. Any other
+    error (or exhausting retries) propagates unchanged."""
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if not _is_locked_error(exc) or attempt == retries - 1:
+                raise
+            time.sleep(_BUSY_BASE_S * (2 ** attempt) + random.uniform(0, _BUSY_BASE_S))
 
 
 @contextmanager
@@ -268,6 +295,14 @@ class ClaimedTask:
 def claim_next(worker_id: str, worker_lane: Optional[str] = None,
                worker_caps: Optional[set[str]] = None,
                db_path: str = QUEUE_DB) -> Optional[ClaimedTask]:
+    """Atomically claim the highest-priority claimable task, retrying on a
+    transient SQLite lock (Sc3 #12). See _claim_next_once for the claim logic."""
+    return with_retry(_claim_next_once, worker_id, worker_lane, worker_caps, db_path)
+
+
+def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
+                     worker_caps: Optional[set[str]] = None,
+                     db_path: str = QUEUE_DB) -> Optional[ClaimedTask]:
     """
     Atomically claim the highest-priority claimable task and return it, or None.
 
