@@ -713,7 +713,8 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         }
         rows = [dict(r) for r in cur.execute(
             """SELECT id, status, worker_id, worker, requires, priority,
-                      complexity, model, branch, commit_hash, error, prompt
+                      complexity, model, branch, commit_hash, error, prompt,
+                      created_at, done_at
                FROM tasks ORDER BY
                  CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
                              WHEN 'pending' THEN 2 ELSE 3 END,
