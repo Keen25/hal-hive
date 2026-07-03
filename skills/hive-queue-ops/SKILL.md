@@ -135,7 +135,7 @@ GET  /health                              -> {ok: true}   (no auth)
 ```
 
 Env: `HIVE_PORT` (5001), `HIVE_BIND` (0.0.0.0), `HIVE_TOKEN`, `HIVE_VERIFY_CMD`,
-`HIVE_VERIFY_HOST` (ar1), `HIVE_QUEUE_URL`, `HIVE_LAB_GIT`.
+`HIVE_VERIFY_OPTIONAL`, `HIVE_QUEUE_URL`, `HIVE_LAB_GIT`.
 
 ## The verify gate
 
