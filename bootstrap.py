@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import shlex
+from xml.sax.saxutils import escape as _xml_escape
 
 HAL_IP_DEFAULT = '192.168.100.1'
 COPILOT_TOKEN_FILE = os.path.expanduser('~/.hive/copilot.token')
@@ -247,6 +248,18 @@ Write-Host "== done. dashboard: $QUEUE/ =="
 
 def _unix(lane, caps, wid, token, cfg) -> str:
     cap_args = ' '.join(f'--cap {shlex.quote(c)}' for c in caps)
+    # launchd ProgramArguments must be one <string> per argv token — build them
+    # in Python so caps (or a $HOME/$DIR containing spaces) are never re-split by
+    # the shell. $PY/$DIR/$WID/$LANE expand at runtime in the unquoted heredoc;
+    # WID/LANE are charset-validated, caps are XML-escaped here.
+    _prog = ['    <string>$PY</string>',
+             '    <string>$DIR/worker_loop.py</string>',
+             '    <string>--worker-id</string>', '    <string>$WID</string>',
+             '    <string>--lane</string>', '    <string>$LANE</string>']
+    for c in caps:
+        _prog += ['    <string>--cap</string>',
+                  f'    <string>{_xml_escape(c)}</string>']
+    prog_args_xml = '\n'.join(_prog)
     q, g, ght = cfg['queue'], cfg['git'], cfg['ghtok']
     if cfg['tls'] and cfg['ca_pem']:
         # Plant the lab CA on the new box, then verify every fetch + all worker
@@ -327,17 +340,13 @@ elif [ "$OS" = "Darwin" ]; then
   # --- launchd (per-user LaunchAgent) ---
   PL="$HOME/Library/LaunchAgents/com.hal.hive-worker-$LANE.plist"
   mkdir -p "$HOME/Library/LaunchAgents"
-  # ProgramArguments: python3 + each ARGS word as its own <string>
-  PROGARGS="    <string>$PY</string>"
-  for a in $ARGS; do PROGARGS="$PROGARGS
-    <string>$a</string>"; done
   cat > "$PL" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>com.hal.hive-worker-$LANE</string>
   <key>ProgramArguments</key><array>
-$PROGARGS
+{prog_args_xml}
   </array>
   <key>WorkingDirectory</key><string>$DIR</string>
   <key>EnvironmentVariables</key><dict>

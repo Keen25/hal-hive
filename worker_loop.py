@@ -280,7 +280,15 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
 
         g('add', '-A')
         if g('diff', '--cached', '--quiet').returncode != 0:
-            g('commit', '-m', f'{tid}: automated dispatch')
+            ci = g('commit', '-m', f'{tid}: automated dispatch')
+            if ci.returncode != 0:
+                # A failed commit would leave `branch` pointing at base_ref, so
+                # the subsequent push reports "up-to-date" (exit 0) and the empty
+                # branch would be reported as a successful run and silently merged
+                # as a no-op. Fail explicitly instead.
+                return {'exit_code': 1,
+                        'error': f'git commit failed: {ci.stderr.strip()}',
+                        'log_path': log_path}
         else:
             return {'exit_code': 1, 'error': 'no changes produced', 'log_path': log_path}
 
