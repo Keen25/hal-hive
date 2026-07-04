@@ -32,6 +32,32 @@ import time
 import requests
 
 import hive_queue as q   # only used for LAB_GIT path + local git; DB via REST
+import hive_log
+
+log = hive_log.get_logger('hive.worker')
+
+# How much of the worker copilot log to ship back to HAL on /complete (U2 #16).
+# The full JSONL can be large; the tail is what matters for failure triage.
+LOG_TAIL_BYTES = int(os.environ.get('HIVE_LOG_TAIL_BYTES', '16384'))
+
+
+def _read_log_tail(path: str | None, max_bytes: int = LOG_TAIL_BYTES) -> str | None:
+    """Return the last ``max_bytes`` of the worker copilot log as text, or None.
+    Reads from the end so a multi-MB JSONL never loads fully into memory."""
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        size = os.path.getsize(path)
+        with open(path, 'rb') as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, os.SEEK_END)
+            data = f.read()
+        text = data.decode('utf-8', errors='replace')
+        if size > max_bytes:
+            text = f'…[truncated, showing last {max_bytes} of {size} bytes]…\n' + text
+        return text
+    except OSError as e:
+        return f'[worker: could not read log tail: {e}]'
 
 HEARTBEAT_INTERVAL_S = 60
 POLL_BACKOFF_S       = 3         # sleep when /claim returns empty (204)
@@ -106,11 +132,11 @@ class Heartbeat:
         while not self._stop.wait(HEARTBEAT_INTERVAL_S):
             try:
                 if not self.client.heartbeat(self.task_id, self.worker_id):
-                    print(f'  [hb] lease lost for {self.task_id} — abandoning')
+                    log.warning('heartbeat: lease lost for %s — abandoning', self.task_id)
                     self.abandon.set()
                     return
             except Exception as e:
-                print(f'  [hb] error: {e}')
+                log.warning('heartbeat error: %s', e)
 
     def __enter__(self):
         self._t.start()
@@ -177,7 +203,8 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         cl = subprocess.run(['git', *auth, *clone_args],
                             capture_output=True, text=True)
         if cl.returncode != 0:
-            return {'exit_code': 1, 'error': f'clone failed: {cl.stderr.strip()}'}
+            return {'exit_code': 1, 'error': f'clone failed: {cl.stderr.strip()}',
+                    'log_path': log_path}
 
         # base_ref may not exist yet on a fresh repo — branch from HEAD if so.
         if g('rev-parse', '--verify', f'origin/{base_ref}').returncode == 0:
@@ -223,12 +250,13 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
 def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
          caps: list[str] | None = None):
     caps = caps or []
-    print(f'[worker {worker_id}] lane={lane} caps={sorted(caps)} — polling {client.base}')
+    log.info('worker %s up: lane=%s caps=%s — polling %s',
+             worker_id, lane, sorted(caps), client.base)
     while True:
         try:
             task = client.claim(worker_id, lane, caps)
         except Exception as e:
-            print(f'[worker {worker_id}] claim error: {e}; backing off')
+            log.warning('worker %s claim error: %s; backing off', worker_id, e)
             time.sleep(POLL_BACKOFF_S)
             continue
 
@@ -236,22 +264,33 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
             continue  # long-poll already waited server-side
 
         tid = task['id']
-        print(f'[worker {worker_id}] claimed {tid} (attempt {task["attempts"]})')
+        log.info('worker %s claimed %s (attempt %s)', worker_id, tid, task['attempts'])
         t0 = time.time()
         with Heartbeat(client, tid, worker_id) as hb:
             result = run_task(task, worker_id, lab_git)
             if hb.abandon.is_set():
-                print(f'[worker {worker_id}] {tid} abandoned (reaped); not reporting')
+                log.warning('worker %s: %s abandoned (reaped); not reporting',
+                            worker_id, tid)
                 continue
+
+        # Ship the copilot log tail back so failures are triageable from HAL
+        # (U2 #16), then delete the worker-local temp log to avoid leaking it.
+        log_path = result.get('log_path')
+        log_tail = _read_log_tail(log_path)
+        if log_path and os.path.exists(log_path):
+            try:
+                os.remove(log_path)
+            except OSError:
+                pass
 
         status = client.complete(
             task_id=tid, worker_id=worker_id, exit_code=result.get('exit_code', 1),
             commit_hash=result.get('commit_hash'), log_path=result.get('log_path'),
-            error=result.get('error'),
+            log_tail=log_tail, error=result.get('error'),
         )
         dt = time.time() - t0
-        print(f'[worker {worker_id}] {tid} -> {status} ({dt:.1f}s) '
-              f'{result.get("error") or result.get("commit_hash","")}')
+        log.info('worker %s: %s -> %s (%.1fs) %s', worker_id, tid, status, dt,
+                 result.get('error') or result.get('commit_hash', ''))
 
 
 def _default_caps(lane: str | None) -> list[str]:

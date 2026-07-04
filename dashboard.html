@@ -168,6 +168,14 @@
   </div>
   <div class="hint">Joining a worker is a control action: click <b>Set token</b> and paste the control token (HIVE_TOKEN) — it stays in this browser tab only and is baked into the one-liner as an auth header. The script then installs Python, the worker, copilot auth &amp; a boot-persistent service. Re-running re-provisions the same lane.</div>
 </dialog>
+
+<dialog id="log_dlg" class="modal">
+  <form method="dialog" class="modal-head">
+    <h2>Worker log <span id="log_tid" class="mono muted"></span></h2>
+    <button class="x" value="close" aria-label="Close" title="Close">&#10005;</button>
+  </form>
+  <pre id="log_body" style="max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12px;margin:0;padding:8px;background:#0b0e14;border:1px solid var(--border);border-radius:6px">loading…</pre>
+</dialog>
 <script>
 const RO_TOKEN = "%RO_TOKEN%";
 // Read-only token embedded server-side: only good for GET /status.
@@ -272,6 +280,7 @@ function render(d){
     tr.appendChild(cell(t.branch||'—','mono muted'));
     tr.appendChild(timeCell(t));
     const ac=document.createElement('td');
+    const lb=el('button','btn','log'); lb.onclick=()=>viewLog(t.id); ac.appendChild(lb);
     if(!['merged','cancelled','dead'].includes(t.status)){
       const b=el('button','btn','cancel'); b.onclick=()=>cancel(t.id); ac.appendChild(b);}
     tr.appendChild(ac);
@@ -356,6 +365,21 @@ async function cancel(id){
     return;
   }
   poll();
+}
+async function viewLog(id){
+  const dlg=document.getElementById('log_dlg');
+  document.getElementById('log_tid').textContent=id;
+  const body=document.getElementById('log_body');
+  body.textContent='loading…';
+  if(typeof dlg.showModal==='function') dlg.showModal();
+  try{
+    const r=await fetch('/logs/'+encodeURIComponent(id),{headers:H});
+    if(r.status===404){ body.textContent='No log stored for this task yet.'; return; }
+    if(!r.ok){ body.textContent='Failed to load log ('+r.status+').'; return; }
+    const txt=await r.text();
+    body.textContent=txt||'(empty log)';
+    body.scrollTop=body.scrollHeight;
+  }catch(e){ body.textContent='Error loading log: '+e; }
 }
 setInterval(()=>document.getElementById('clock').textContent=new Date().toLocaleTimeString(),1000);
 initSortHeaders(); updateSortHeaders();
