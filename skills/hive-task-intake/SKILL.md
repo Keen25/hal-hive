@@ -78,5 +78,7 @@ Two cooperating pieces (both in `~/hive/`, single vocabulary in `hive_caps.py`):
 - Worker caps are probed **at startup**. If you install a toolchain on a worker,
   restart it (`systemctl --user restart hive-worker@<lane>`) to re-advertise.
 - Adding a new capability = add the tag in `hive_caps._TOOL_CAPS` (probe side)
-  **and** `hive_caps._RULES` (classifier side). Same string on both sides or the
-  gate never matches.
+  **and** the classifier side. For a generic build/platform signal, extend
+  `hive_caps._BUILTIN_RULES`; for a **product-specific** rule, add it to a JSON
+  pack in `classifier_rules.d/` (e.g. `activeroles.json`) instead of editing code
+  (F3 #22). Same tag string on both sides or the gate never matches.

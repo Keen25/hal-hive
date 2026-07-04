@@ -1,0 +1,8 @@
+[
+  {
+    "pattern": "\\b(active\\s*roles|\\bars\\b|oi\\.ldap|edsva|adsi)\\b",
+    "tags": ["os:windows", "build:dotnet"],
+    "reason": "ActiveRoles/OI.Ldap builds only work on Windows (ar1) — SHA1 strong-name + multi-address-connect break the Linux build",
+    "ignorecase": true
+  }
+]

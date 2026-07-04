@@ -19,6 +19,16 @@ import platform
 import re
 import shutil
 
+# Prefer the shared hive logging config when it's available (it may not be on a
+# checkout that predates hive_log.py), otherwise fall back to stdlib logging so
+# this module has no hard dependency and still works standalone / on workers.
+try:
+    import hive_log
+    log = hive_log.get_logger('hive.caps')
+except ImportError:
+    import logging
+    log = logging.getLogger('hive.caps')
+
 # ---------------------------------------------------------------------------
 # Canonical tag vocabulary. Adding a new capability = add it in BOTH the probe
 # table and (if a prompt can imply it) the classifier table below.
@@ -77,11 +87,13 @@ def probe_caps(lane: str | None = None) -> set[str]:
 
 # (compiled regex, tags-it-implies, human reason). First match wins per tag;
 # all matching rules union their tags.
-_RULES: list[tuple[re.Pattern, set[str], str]] = [
-    (re.compile(r'\b(active\s*roles|\bars\b|oi\.ldap|edsva|adsi)\b', re.I),
-     {'os:windows', 'build:dotnet'},
-     'ActiveRoles/OI.Ldap builds only work on Windows (ar1) — SHA1 strong-name '
-     '+ multi-address-connect break the Linux build'),
+#
+# F3 (#22): only PRODUCT-AGNOSTIC build/platform rules are baked in here. Any
+# product-specific rule (e.g. "ActiveRoles/OI.Ldap -> os:windows") lives in an
+# external rule pack loaded by _load_rule_packs() below, so this engine is reusable
+# across products without editing code. The ActiveRoles pack ships in
+# classifier_rules.d/activeroles.json.
+_BUILTIN_RULES: list[tuple[re.Pattern, set[str], str]] = [
     (re.compile(r'\b(msbuild|\.sln\b|\.csproj\b|dotnet\s+(build|publish|restore|test)|nuget)\b', re.I),
      {'build:dotnet'},
      '.NET/MSBuild build'),
@@ -99,6 +111,84 @@ _RULES: list[tuple[re.Pattern, set[str], str]] = [
     (re.compile(r'\bdocker\b|\bdockerfile\b|\bcompose\b', re.I),
      {'has:docker'}, 'Docker workload'),
 ]
+
+
+def _compile_rule(entry: dict) -> tuple[re.Pattern, set[str], str] | None:
+    """Turn one JSON rule dict into a compiled (regex, tags, reason) triple, or
+    None if malformed. Schema:
+      {"pattern": str, "tags": [str,...], "reason": str, "ignorecase": bool?}
+    A bad entry is skipped with a warning so one typo never takes intake down."""
+    try:
+        pattern = entry['pattern']
+        tags = set(entry['tags'])
+        reason = entry.get('reason', 'external rule')
+        if not isinstance(pattern, str) or not all(isinstance(t, str) for t in tags):
+            raise TypeError('pattern must be str and tags must be list[str]')
+        flags = re.I if entry.get('ignorecase', True) else 0
+        return (re.compile(pattern, flags), tags, reason)
+    except (KeyError, TypeError, ValueError, re.error) as exc:
+        log.warning('skipping malformed classifier rule %r: %s', entry, exc)
+        return None
+
+
+def _load_rule_packs() -> list[tuple[re.Pattern, set[str], str]]:
+    """F3 (#22): load product-specific classifier rules from external packs so
+    the engine stays product-agnostic. Sources, in order (all optional, all
+    additive):
+      1. every *.json in classifier_rules.d/ next to this module (bundled packs;
+         ships the ActiveRoles pack). Override the dir with HIVE_CLASSIFIER_RULES_DIR;
+         set it empty to load no bundled packs.
+      2. HIVE_CLASSIFIER_RULES_FILE (or ~/.hive/classifier_rules.json) — a single
+         operator rule file.
+      3. HIVE_CLASSIFIER_RULES — inline JSON in the environment.
+    Each source is a JSON list of rule dicts (see _compile_rule). Missing/broken
+    sources are ignored; individual bad rules are skipped, not fatal."""
+    import glob
+    import json
+    raw_lists: list = []
+
+    default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               'classifier_rules.d')
+    rules_dir = os.environ.get('HIVE_CLASSIFIER_RULES_DIR', default_dir)
+    if rules_dir:
+        for path in sorted(glob.glob(os.path.join(rules_dir, '*.json'))):
+            try:
+                with open(path) as fh:
+                    raw_lists.append(json.load(fh))
+            except (OSError, ValueError) as exc:
+                log.warning('skipping classifier rule pack %s: %s', path, exc)
+
+    user_file = os.environ.get('HIVE_CLASSIFIER_RULES_FILE',
+                               os.path.expanduser('~/.hive/classifier_rules.json'))
+    try:
+        with open(user_file) as fh:
+            raw_lists.append(json.load(fh))
+    except (OSError, ValueError):
+        pass
+
+    if os.environ.get('HIVE_CLASSIFIER_RULES'):
+        try:
+            raw_lists.append(json.loads(os.environ['HIVE_CLASSIFIER_RULES']))
+        except ValueError as exc:
+            log.warning('ignoring bad HIVE_CLASSIFIER_RULES env JSON: %s', exc)
+
+    compiled: list[tuple[re.Pattern, set[str], str]] = []
+    for entries in raw_lists:
+        if not isinstance(entries, list):
+            log.warning('classifier rule pack must be a JSON list, got %s',
+                        type(entries).__name__)
+            continue
+        for entry in entries:
+            if isinstance(entry, dict):
+                rule = _compile_rule(entry)
+                if rule:
+                    compiled.append(rule)
+    return compiled
+
+
+# Product packs extend the generic engine. Built-ins first so their reasons read
+# before product-specific ones; order does not affect the unioned tag result.
+_RULES: list[tuple[re.Pattern, set[str], str]] = _BUILTIN_RULES + _load_rule_packs()
 
 # tokens that signal the prompt is too vague to classify confidently
 _VAGUE = re.compile(r'\b(fix|investigate|look\s+into|the\s+flaky|something|'
