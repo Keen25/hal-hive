@@ -479,8 +479,9 @@ def complete_task(
                    SET status='dead', done_at=datetime('now'),
                        exit_code=?, log_path=?, log_tail=?, error=?,
                        lease_expires=NULL, heartbeat_at=NULL
-                   WHERE id=?""",
-                (exit_code, log_path, log_tail, error, task_id),
+                   WHERE id=? AND worker_id=?
+                     AND status IN ('claimed','running')""",
+                (exit_code, log_path, log_tail, error, task_id, worker_id),
             )
             return 'dead'
 
@@ -495,8 +496,10 @@ def complete_task(
                    not_before=datetime('now', ?),
                    lease_expires=NULL, heartbeat_at=NULL,
                    exit_code=?, log_path=?, log_tail=?, error=?
-               WHERE id=?""",
-            (f'+{backoff} seconds', exit_code, log_path, log_tail, error, task_id),
+               WHERE id=? AND worker_id=?
+                 AND status IN ('claimed','running')""",
+            (f'+{backoff} seconds', exit_code, log_path, log_tail, error,
+             task_id, worker_id),
         )
         return 'pending'
 

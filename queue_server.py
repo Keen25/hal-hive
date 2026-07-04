@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -203,6 +204,15 @@ def bootstrap_script():
                         mimetype='text/plain')
     caps = request.args.get('caps', '')
     wid = request.args.get('id', '')
+    # lane/id are interpolated into the generated PowerShell/sh (only caps is
+    # shell-quoted in bootstrap.py). Reject anything outside a safe charset so a
+    # value like  x'; <cmd>;'  can't break out of the single-quoted literal and
+    # inject into the script. Defense-in-depth — /bootstrap is control-token
+    # gated — but cheap and closes the hole regardless.
+    _SAFE = re.compile(r'^[A-Za-z0-9._#-]+$')
+    if not _SAFE.match(lane) or (wid and not _SAFE.match(wid)):
+        return Response('# error: lane/id must match [A-Za-z0-9._#-]+\n',
+                        status=400, mimetype='text/plain')
     body = bootstrap.build_script(os_kind, lane, caps, wid, TOKEN)
     return Response(body, mimetype='text/plain')
 
