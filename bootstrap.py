@@ -149,7 +149,7 @@ if (-not $py) {{
 }}
 & $py -m pip install --quiet --disable-pip-version-check requests | Out-Null
 
-foreach ($f in 'worker_loop.py','hive_caps.py','hive_queue.py') {{
+foreach ($f in 'worker_loop.py','hive_caps.py','hive_queue.py','hive_log.py') {{
   Invoke-WebRequest "$QUEUE/download/$f" -OutFile "$DIR\\$f" -Headers @{{Authorization="Bearer $TOKEN"}} -UseBasicParsing
 }}
 $winsw = "$DIR\\hive-worker-$LANE.exe"
@@ -257,7 +257,7 @@ PY="$(command -v python3 || true)"
   echo "WARN: could not auto-install requests; ensure it is importable"
 
 # 2. worker code
-for f in worker_loop.py hive_caps.py hive_queue.py; do
+for f in worker_loop.py hive_caps.py hive_queue.py hive_log.py; do
   curl -fsSL $CACERT -H "Authorization: Bearer $TOKEN" "$QUEUE/download/$f" -o "$DIR/$f"
 done
 

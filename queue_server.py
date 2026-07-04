@@ -36,7 +36,10 @@ import hmac
 from flask import Flask, Response, jsonify, request
 
 import hive_queue as q
+import hive_log
 import bootstrap as bootstrap
+
+log = hive_log.get_logger('hive.server')
 
 DASHBOARD_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               'dashboard.html')
@@ -48,6 +51,7 @@ DOWNLOADABLE = {
     'worker_loop.py': 'text/x-python',
     'hive_caps.py':   'text/x-python',
     'hive_queue.py':  'text/x-python',
+    'hive_log.py':    'text/x-python',
     'winsw.exe':      'application/octet-stream',
 }
 
@@ -69,7 +73,7 @@ def _load_token() -> str:
     with open(TOKEN_FILE, 'w') as f:
         f.write(tok + '\n')
     os.chmod(TOKEN_FILE, 0o600)
-    print(f'[server] generated worker token -> {TOKEN_FILE}')
+    log.info('generated worker token -> %s', TOKEN_FILE)
     return tok
 
 
@@ -96,14 +100,15 @@ def _load_ro_token() -> str:
     with open(RO_TOKEN_FILE, 'w') as f:
         f.write(tok + '\n')
     os.chmod(RO_TOKEN_FILE, 0o600)
-    print(f'[server] generated read-only token -> {RO_TOKEN_FILE}')
+    log.info('generated read-only token -> %s', RO_TOKEN_FILE)
     return tok
 
 
 RO_TOKEN = _load_ro_token()
 
 # GET endpoints a read-only token may reach (the control token also works).
-READONLY_PATHS = frozenset({'/status'})
+# /logs/<task> is matched by prefix in _guard (it carries a path parameter).
+READONLY_PATHS = frozenset({'/status', '/metrics'})
 
 # ── Long-poll tuning (§6) ─────────────────────────────────────────────────────
 
@@ -141,7 +146,9 @@ def _guard():
     if request.method == 'GET' and request.path in ('/health', '/', '/dashboard'):
         return None
     # Read-only endpoints accept the low-privilege dashboard token as well.
-    if request.method == 'GET' and request.path in READONLY_PATHS:
+    # /logs/<task> is read-only observability, matched by prefix (path param).
+    if request.method == 'GET' and (request.path in READONLY_PATHS
+                                    or request.path.startswith('/logs/')):
         if _read_authorized():
             return None
         return jsonify(error='unauthorized'), 401
@@ -275,7 +282,8 @@ def complete():
     status = q.complete_task(
         b['task_id'], b['worker_id'], int(b.get('exit_code', 1)),
         commit_hash=b.get('commit_hash'), turns=b.get('turns'),
-        cost_pr=b.get('cost_pr'), log_path=b.get('log_path'), error=b.get('error'),
+        cost_pr=b.get('cost_pr'), log_path=b.get('log_path'),
+        log_tail=b.get('log_tail'), error=b.get('error'),
     )
     return jsonify(status=status), 200
 
@@ -323,6 +331,25 @@ def status():
     return jsonify(q.status_snapshot()), 200
 
 
+@app.get('/metrics')
+def metrics():
+    """Fleet counters since server start (claims, merges, parks, dead-letters,
+    …) plus current per-status task counts. Read-only (U5 #19)."""
+    snap = q.status_snapshot()
+    return jsonify(counters=hive_log.snapshot(), task_counts=snap['counts']), 200
+
+
+@app.get('/logs/<task_id>')
+def logs(task_id):
+    """Return the stored tail of a task's worker copilot log as plain text, so
+    failure triage no longer requires SSHing the worker (U2 #16). 404 if the
+    task is unknown or produced no log."""
+    tail = q.get_log_tail(task_id)
+    if tail is None:
+        return jsonify(error=f'no log for task {task_id}'), 404
+    return Response(tail, mimetype='text/plain; charset=utf-8')
+
+
 def resolve_bind_addrs(override, default_lab_ip='192.168.100.1'):
     """Addresses the control plane listens on (S2 #5).
 
@@ -366,11 +393,11 @@ def main():
     port = int(os.environ.get('HIVE_PORT', '5001'))
     ssl_ctx = build_ssl_context()
     scheme = 'https' if ssl_ctx else 'http'
-    print('[server] queue REST — reaper + merge-loop running')
-    print(f'[server] control token: Authorization: ******  (add/cancel/claim)')
-    print(f'[server] read-only token (dashboard /status) -> {RO_TOKEN_FILE}')
+    log.info('queue REST — reaper + merge-loop running')
+    log.info('control token loaded (add/cancel/claim authorized)')
+    log.info('read-only token (dashboard /status,/metrics,/logs) -> %s', RO_TOKEN_FILE)
     if not ssl_ctx:
-        print('[server] TLS OFF — set HIVE_TLS_CERT/HIVE_TLS_KEY to encrypt (issue #8)')
+        log.warning('TLS OFF — set HIVE_TLS_CERT/HIVE_TLS_KEY to encrypt (issue #8)')
     servers = []
     for addr in addrs:
         try:
@@ -379,11 +406,11 @@ def main():
         except (OSError, SystemExit) as exc:
             # werkzeug turns a bind failure into a printed msg + SystemExit(1),
             # stdlib would raise OSError -- tolerate both so an absent NIC is skipped.
-            print(f'[server] skip bind {addr}:{port} ({exc or "bind failed"})')
+            log.warning('skip bind %s:%s (%s)', addr, port, exc or 'bind failed')
             continue
         servers.append(srv)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        print(f'[server] listening on {scheme}://{addr}:{port}')
+        log.info('listening on %s://%s:%s', scheme, addr, port)
     if not servers:
         raise SystemExit(f'[server] FATAL: could not bind any of {addrs}:{port}')
     try:

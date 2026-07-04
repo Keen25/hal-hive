@@ -29,6 +29,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
+import hive_log
+
+log = hive_log.get_logger('hive.queue')
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 HIVE_DIR   = os.path.expanduser(os.environ.get('HIVE_DIR', '~/hive'))
@@ -42,7 +46,7 @@ REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
 
 # Statuses considered "in flight" (hold a lease) for the reaper.
@@ -129,6 +133,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     turns         INTEGER,
     cost_pr       REAL,
     log_path      TEXT,
+    log_tail      TEXT,                        -- last KBs of the worker copilot log (U2 #16)
     error         TEXT
 );
 
@@ -167,6 +172,10 @@ def init_db(db_path: str = QUEUE_DB) -> None:
             cur.execute('ALTER TABLE tasks ADD COLUMN complexity INTEGER')
         if 'model' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN model TEXT')
+        # Migration v5 -> v6: store the tail of the worker copilot log so failure
+        # triage no longer requires SSHing the worker (U2 #16).
+        if 'log_tail' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN log_tail TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -227,7 +236,7 @@ def ensure_lab_repo(lab_git: str = LAB_GIT, base_ref: str = DEFAULT_BASE_REF) ->
                        capture_output=True, text=True)
         subprocess.run(['git', 'push', 'origin', base_ref], cwd=wt, check=True,
                        capture_output=True, text=True)
-        print(f'[lab] seeded empty root commit on {base_ref} in {lab_git}')
+        log.info('seeded empty root commit on %s in %s', base_ref, lab_git)
     finally:
         shutil.rmtree(wt, ignore_errors=True)
 
@@ -297,7 +306,15 @@ def claim_next(worker_id: str, worker_lane: Optional[str] = None,
                db_path: str = QUEUE_DB) -> Optional[ClaimedTask]:
     """Atomically claim the highest-priority claimable task, retrying on a
     transient SQLite lock (Sc3 #12). See _claim_next_once for the claim logic."""
-    return with_retry(_claim_next_once, worker_id, worker_lane, worker_caps, db_path)
+    return with_retry(_claim_next_once_metered, worker_id, worker_lane, worker_caps, db_path)
+
+
+def _claim_next_once_metered(worker_id, worker_lane, worker_caps, db_path):
+    task = _claim_next_once(worker_id, worker_lane, worker_caps, db_path)
+    if task is not None:
+        hive_log.incr('claims')
+        log.info('claimed %s by %s (lane=%s)', task.id, worker_id, worker_lane)
+    return task
 
 
 def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
@@ -409,6 +426,7 @@ def complete_task(
     turns: Optional[int] = None,
     cost_pr: Optional[float] = None,
     log_path: Optional[str] = None,
+    log_tail: Optional[str] = None,
     error: Optional[str] = None,
     db_path: str = QUEUE_DB,
 ) -> str:
@@ -417,6 +435,7 @@ def complete_task(
     Failure -> retry with exponential backoff, or dead-letter at max_attempts.
     Returns the resulting status.
     """
+    hive_log.incr('completes')
     success = exit_code == 0 and bool(commit_hash)
     with cursor(db_path) as cur:
         row = cur.execute(
@@ -430,32 +449,40 @@ def complete_task(
                 """UPDATE tasks
                    SET status='done', done_at=datetime('now'),
                        exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
-                       lease_expires=NULL, heartbeat_at=NULL
+                       log_tail=?, lease_expires=NULL, heartbeat_at=NULL
                    WHERE id=? AND worker_id=?""",
-                (exit_code, commit_hash, turns, cost_pr, log_path, task_id, worker_id),
+                (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
+                 task_id, worker_id),
             )
             return 'done'
 
         if row['attempts'] >= row['max_attempts']:
+            hive_log.incr('dead_letters')
+            log.warning('dead-lettered %s after %d attempts: %s',
+                        task_id, row['attempts'], (error or '').strip()[:200])
             cur.execute(
                 """UPDATE tasks
                    SET status='dead', done_at=datetime('now'),
-                       exit_code=?, log_path=?, error=?,
+                       exit_code=?, log_path=?, log_tail=?, error=?,
                        lease_expires=NULL, heartbeat_at=NULL
                    WHERE id=?""",
-                (exit_code, log_path, error, task_id),
+                (exit_code, log_path, log_tail, error, task_id),
             )
             return 'dead'
 
+        hive_log.incr('retries')
         backoff = 2 ** row['attempts'] * 30      # 60s, 120s, 240s, ...
+        log.info('retrying %s in %ds (attempt %d/%d): %s',
+                 task_id, backoff, row['attempts'], row['max_attempts'],
+                 (error or '').strip()[:200])
         cur.execute(
             """UPDATE tasks
                SET status='pending', worker_id=NULL,
                    not_before=datetime('now', ?),
                    lease_expires=NULL, heartbeat_at=NULL,
-                   exit_code=?, log_path=?, error=?
+                   exit_code=?, log_path=?, log_tail=?, error=?
                WHERE id=?""",
-            (f'+{backoff} seconds', exit_code, log_path, error, task_id),
+            (f'+{backoff} seconds', exit_code, log_path, log_tail, error, task_id),
         )
         return 'pending'
 
@@ -485,9 +512,10 @@ def reaper_loop(stop: threading.Event, db_path: str = QUEUE_DB) -> None:
         try:
             n = reap_once(db_path)
             if n:
-                print(f'[reaper] requeued/dead-lettered {n} orphaned task(s)')
+                hive_log.incr('reaped', n)
+                log.info('reaper requeued/dead-lettered %d orphaned task(s)', n)
         except Exception as e:  # never let the reaper die
-            print(f'[reaper] error: {e}')
+            log.error('reaper error: %s', e)
         stop.wait(REAPER_INTERVAL_S)
 
 
@@ -557,7 +585,8 @@ def _park(cur: sqlite3.Cursor, task_id: str, reason: str) -> None:
                             lease_expires=NULL WHERE id=?""",
         (reason, task_id),
     )
-    print(f'  ⚠️  parked {task_id}: {reason}')
+    hive_log.incr('parks')
+    log.warning('parked %s: %s', task_id, reason)
 
 
 def _set_status(db_path: str, task_id: str, status: str,
@@ -673,7 +702,8 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
             return
         tip = _git('rev-parse', branch, check=False).stdout.strip() or None
         _set_status(db_path, task_id, 'merged', commit_hash=tip, clear_lease=True)
-        print(f'  ✅ merged {branch} → {base_ref} ({task_id})')
+        hive_log.incr('merges')
+        log.info('merged %s → %s (%s)', branch, base_ref, task_id)
     finally:
         _remove_worktree(wt)
 
@@ -695,7 +725,7 @@ def _sweep_stale_verifying(db_path: str) -> int:
         )
         n = cur.rowcount
     if n:
-        print(f'[merge] recovered {n} stale verifying task(s) -> done')
+        log.info('merge loop recovered %d stale verifying task(s) -> done', n)
     return n
 
 
@@ -726,7 +756,7 @@ def merge_loop(stop: threading.Event, db_path: str = QUEUE_DB) -> None:
         try:
             merge_once(db_path)
         except Exception as e:  # never let the merge loop die
-            print(f'[merge] error: {e}')
+            log.error('merge loop error: %s', e)
         stop.wait(MERGE_INTERVAL_S)
 
 
@@ -830,6 +860,19 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         # dashboard shows intent, not the full payload, and stays lightweight.
         row['title'] = _task_title(row.pop('prompt', ''))
     return {'counts': counts, 'tasks': rows, 'workers': list_workers(db_path=db_path)}
+
+
+def get_log_tail(task_id: str, db_path: str = QUEUE_DB) -> Optional[str]:
+    """Return the stored tail of the worker copilot log for a task, or None if
+    the task is unknown or produced no log (U2 #16). This is what makes failure
+    triage possible from HAL without SSHing the worker."""
+    with cursor(db_path) as cur:
+        row = cur.execute(
+            'SELECT log_tail FROM tasks WHERE id=?', (task_id,)
+        ).fetchone()
+    if row is None:
+        return None
+    return row['log_tail']
 
 
 def cancel_task(task_id: str, db_path: str = QUEUE_DB) -> bool:
