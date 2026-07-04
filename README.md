@@ -6,6 +6,10 @@ is a live control plane; nothing blocks while the fleet runs.
 
 Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 
+> **Scaling?** ~10 workers is feasible today with no redesign; the ceiling is
+> the serialized merge+verify loop, not worker count. See
+> [Scaling & known limits](#scaling--known-limits-honest-take).
+
 ## Layout
 
 | File | Role |
@@ -122,3 +126,58 @@ copy-to-clipboard button also gains the native secure-context path.
 
 Both servers share one cert/key pair. The CA key never leaves HAL. Only the
 public `ca.crt` is distributed. All `*.key`/`*.crt`/`*.pem` are gitignored.
+
+## Scaling & known limits (honest take)
+
+The queue/claim/lease/reaper/merge core is built for a small distributed fleet,
+not a datacenter. We'd rather state the ceiling than pretend it isn't there.
+
+### ~10 workers: feasible today, no redesign
+
+- **SQLite single writer** is nowhere near saturated. Per-worker writes are a
+  microsecond `claim` txn (`BEGIN IMMEDIATE`: one `SELECT pending` + one
+  `UPDATE`), an idle-poll `upsert_worker` (~1/s), and a `/heartbeat` (60s while
+  busy). 10 workers ≈ 10–15 tiny write-txns/sec vs WAL's tens-of-thousands/sec
+  headroom. `busy_timeout=5000` is effectively never hit at this scale.
+- **Werkzeug dev server** (`make_server(addr, port, app, threaded=True)`) parks
+  ~12 threads (10 long-poll `/claim` + reaper + merge). Comfortable; it strains
+  in the hundreds, not at 10.
+- **`claim_next`** cap-matches in Python over `pending` rows — O(pending), not
+  O(workers). Independent of fleet size.
+
+### The real ceiling is merge throughput, not worker count
+
+`merge_loop` is single-threaded and serialized, and each merge does a fresh
+temp-worktree rebase **plus a full `HIVE_VERIFY_CMD` build/test**:
+
+```
+sustained merge rate ≈ 1 / (rebase + full_verify_build)
+```
+
+So beyond a point, adding workers hides copilot-run latency but does **not**
+raise integration throughput — `done` tasks queue behind one serialized verify.
+Nothing is lost (the queue stays correct); wall-clock parallelism is just capped
+by the merge loop. If verify is a multi-minute .NET build, the merge loop is the
+whole system's throughput. See #10.
+
+### To actually realize ~10 workers
+
+- **#13 — done.** Workers now `git clone --filter=blob:none` (partial clone) and
+  the server sets `uploadpack.allowFilter`, so clone cost no longer scales with
+  repo size per task over the LAN.
+- **#10 — remaining.** Run verify on the worker (it already has the clone) and
+  reserve the merge loop for the fast-forward. This decouples merge rate from
+  build time and is the one change still needed to comfortably hit ~10.
+
+### Beyond ~25–30 workers (not there yet)
+
+- **#11** — move off the dev WSGI server (waitress/gunicorn) and split
+  reaper+merge into a **single** dedicated process (never run N copies).
+- **#12 — done.** Writers already carry a bounded `SQLITE_BUSY` retry
+  (`with_retry` + `busy_timeout=5000`), so lock contention degrades gracefully
+  rather than 500-ing `/claim`.
+- At that scale, reconsider SQLite → Postgres for the queue.
+
+Tracking: #23 (review roundup). Correctness core (atomic claim, lease/heartbeat/
+reaper, fail-closed verify, dead-letter) is solid; these are throughput and
+operability limits, called out on purpose.
