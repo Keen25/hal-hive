@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 import threading
@@ -63,6 +64,29 @@ HEARTBEAT_INTERVAL_S = 60
 POLL_BACKOFF_S       = 3         # sleep when /claim returns empty (204)
 COPILOT_TIMEOUT_S    = 840
 
+# S3 (#6): keep every per-task artifact (clone, log, prompt) under one directory
+# the operator can lock down with an ACL, instead of the account-wide system
+# TEMP. On the least-privilege Windows worker the bootstrap points this at
+# C:\hive\work (Full Control: svc-hive only). Unset = use the system default
+# temp dir (prior behaviour), so nothing changes on hosts that don't set it.
+WORK_DIR = os.environ.get('HIVE_WORK_DIR') or None
+if WORK_DIR:
+    os.makedirs(WORK_DIR, exist_ok=True)
+
+# S3 (#6): the copilot permission flags are overridable so an operator can scope
+# the agent down (e.g. per-tool allows) WITHOUT editing code. The default is the
+# lab-proven set — a narrower `--allow-all-tools` blocks writes outside CWD and
+# breaks real tasks — so existing workers are unaffected. Set HIVE_COPILOT_PERMS
+# (a shell-quoted flag string, may be empty) to override.
+_DEFAULT_COPILOT_PERMS = ['--no-ask-user', '--allow-all', '--autopilot']
+
+
+def _copilot_perms() -> list[str]:
+    override = os.environ.get('HIVE_COPILOT_PERMS')
+    if override is None:
+        return list(_DEFAULT_COPILOT_PERMS)
+    return shlex.split(override)
+
 
 def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
     """Build the copilot invocation. The executable is configurable via
@@ -82,8 +106,7 @@ def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
     so cheap work runs on a cheap model and complex work on a frontier one. When
     absent, copilot uses its configured default."""
     exe = os.environ.get('HIVE_COPILOT_CMD', 'copilot')
-    argv = [exe, '-p', prompt_ref, '--no-ask-user',
-            '--allow-all', '--autopilot', '--output-format', 'json']
+    argv = [exe, '-p', prompt_ref, *_copilot_perms(), '--output-format', 'json']
     if model:
         argv += ['--model', model]
     return argv
@@ -168,15 +191,15 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
     exit_code, commit_hash, log_path, error.
     """
     branch, base_ref, tid = task['branch'], task['base_ref'], task['id']
-    run_dir = tempfile.mkdtemp(prefix=f'{tid}-')
+    run_dir = tempfile.mkdtemp(prefix=f'{tid}-', dir=WORK_DIR)
     # Log lives OUTSIDE the clone so `git add -A` never commits it (a log inside
     # run_dir pollutes every commit and causes cross-task rebase conflicts).
-    log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl')
+    log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl', dir=WORK_DIR)
     os.close(log_fd)
     # Prompt also lives outside the clone and is fed to copilot via `-p @file`
     # (see _copilot_argv): a large embedded prompt overflows the Windows argv
     # limit (WinError 206). Writing it inside run_dir would also get committed.
-    prompt_fd, prompt_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.prompt')
+    prompt_fd, prompt_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.prompt', dir=WORK_DIR)
     with os.fdopen(prompt_fd, 'w', encoding='utf-8') as pf:
         pf.write(task['prompt'])
 
