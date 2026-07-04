@@ -69,6 +69,29 @@ Each pack is a JSON list of rules:
 Reuse for another product = drop a new `*.json` in `classifier_rules.d/` (or
 point `HIVE_CLASSIFIER_RULES_FILE` at it); no code change.
 
+## Worker privilege model (S3 #6)
+
+A queued prompt is **arbitrary code**: the worker runs `copilot` with broad tool
+access (`--allow-all`) to actually build/edit/push. So anyone who can `POST /add`
+(the control token — keep it secret, see S1) can execute code on every worker.
+That is inherent to a code-execution worker; the design goal is to **cap the
+blast radius**, not pretend it's zero.
+
+Controls in place:
+
+| Control | Effect |
+|--------|--------|
+| **Non-admin service account** | On Windows the worker service (`svc-hive`) runs as a **standard user**, never a local Administrator. `bootstrap.py` removes it from `Administrators` on (re)provision. A task can no longer own the box. |
+| **Per-task sandbox dir** | All clones/logs/prompts live under `HIVE_WORK_DIR` (Windows: `C:\hive\work`, Full Control to `svc-hive` only, also the account's `TEMP`). Unset = system temp (Linux `--user` unit already runs unprivileged). |
+| **Scoped copilot perms** | `HIVE_COPILOT_PERMS` overrides the copilot permission flags without a code change (default = the lab-proven `--no-ask-user --allow-all --autopilot`; a narrower `--allow-all-tools` blocks writes outside CWD and breaks tasks). Tighten per-deployment as your task mix allows. |
+| **Control-token gating + TLS** | Only the control token can `/add`/`/claim`/`/cancel`; enable TLS (below) so tokens aren't sniffable on the wire. |
+
+**Residual, accepted risk:** a holder of the control token still gets
+**standard-user** RCE on workers. On the host-only lab net with a secret control
+token this is an accepted risk; on a shared/less-trusted network, additionally
+scope `HIVE_COPILOT_PERMS`, run workers in throwaway VMs/containers, and rotate
+the control token.
+
 ## TLS (optional, issue #8 / S5)
 
 By default the control plane (`:5001`) and git transport (`:8418`) serve **plain

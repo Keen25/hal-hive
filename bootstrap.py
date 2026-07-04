@@ -171,7 +171,7 @@ if (-not $copilot) {{
 }}
 if (-not $copilot) {{ Write-Warning "copilot CLI not found — install it, then restart hive-worker-$LANE" ; $copilot = 'C:\\npm-global\\copilot.cmd' }}
 
-# svc-hive local admin (runs the service).
+# svc-hive service account (runs the worker service — LEAST PRIVILEGE, S3 #6).
 # Generate a STRONG RANDOM password per box — never a hardcoded/known secret,
 # never printed, never reused across machines. Lives only in the WinSW XML
 # (admin-readable) as WinSW needs the plaintext for a custom service account.
@@ -181,7 +181,27 @@ $PW = ([Convert]::ToBase64String($rb) -replace '[+/=]','x') + 'aA9!'
 $u = 'svc-hive'; $p = ConvertTo-SecureString $PW -AsPlainText -Force
 if (Get-LocalUser $u -EA SilentlyContinue) {{ Set-LocalUser $u -Password $p -PasswordNeverExpires $true }}
 else {{ New-LocalUser $u -Password $p -FullName 'HAL Hive Service' -PasswordNeverExpires | Out-Null }}
-if (-not ((Get-LocalGroupMember Administrators -EA SilentlyContinue).Name -match "\\\\$u$")) {{ Add-LocalGroupMember Administrators $u }}
+# S3 (#6): svc-hive runs as a STANDARD USER, never a local admin. A queued
+# prompt is arbitrary code (copilot runs with broad tool access), so the service
+# account must not be able to own the box. Undo Administrators from any earlier
+# provision, then grant only what the worker needs.
+if ((Get-LocalGroupMember Administrators -EA SilentlyContinue).Name -match "\\\\$u$") {{
+  Remove-LocalGroupMember Administrators $u -EA SilentlyContinue
+  Write-Host "removed $u from Administrators (least-privilege, S3 #6)"
+}}
+# Per-task sandbox: all clones/logs/prompts land under $DIR\\work (see the
+# HIVE_WORK_DIR / TEMP env in the service XML below) so a task can only write
+# where the worker explicitly contains it.
+$WORK = "$DIR\\work"
+New-Item -ItemType Directory -Force $WORK | Out-Null
+# Grant svc-hive Modify on the code/token dir and Full control on the sandbox
+# (inherited to children); no new access for anyone else.
+icacls $DIR  /grant "${{u}}:(OI)(CI)M" | Out-Null
+icacls $WORK /grant "${{u}}:(OI)(CI)F" | Out-Null
+# copilot is installed under an npm-global dir the account may not read by
+# default — grant read/execute so a non-admin service can still launch the CLI.
+$copDir = Split-Path $copilot -Parent
+if ($copDir -and (Test-Path $copDir)) {{ icacls $copDir /grant "${{u}}:(OI)(CI)RX" | Out-Null }}
 
 $xml = @"
 <service>
@@ -196,6 +216,9 @@ $xml = @"
   <env name="HIVE_TOKEN" value="$TOKEN"/>
   <env name="HIVE_LAB_GIT" value="$GIT"/>
 {ca_env_winsw}  <env name="HIVE_COPILOT_CMD" value="$copilot"/>
+  <env name="HIVE_WORK_DIR" value="$WORK"/>
+  <env name="TEMP" value="$WORK"/>
+  <env name="TMP" value="$WORK"/>
   <startmode>Automatic</startmode>
   <onfailure action="restart" delay="10 sec"/>
   <resetfailure>1 hour</resetfailure>
