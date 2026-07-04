@@ -19,6 +19,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps |
 | `halctl.py` | control CLI: `add` / `status` / `cancel` / `prio` / `classify` |
 | `hive_caps.py` | capability vocabulary — `probe_caps()` (worker) + `classify_prompt()` (intake) |
+| `classifier_rules.d/` | external classifier rule packs (product-specific `requires` rules; ships `activeroles.json`) |
 | `gen-lab-ca.sh` | mint the lab CA + hive server cert (TLS, issue #8) |
 | `trust-lab-ca.ps1` | trust the lab CA on a Windows worker (ar1) |
 | `dispatch_dag.py` | legacy synchronous DAG dispatcher (kept, not the live path) |
@@ -42,6 +43,31 @@ python3 halctl.py status
   `HIVE_TOKEN`, `LAB_PASS`). Scripts read `LAB_PASS` from the environment — source
   `~/.hive/hive.env` first, or they exit with a clear error.
 - `queue.db`, `lab.git/`, and worker clones are runtime state (gitignored).
+
+## Classifier rule packs (intake `requires`, F3 #22)
+
+`classify_prompt()` infers a task's `requires` tags. The engine ships only
+**product-agnostic** build/platform rules (`.NET`, Go, Node, Rust, Python,
+Docker, "on Windows"). **Product-specific** rules live in external JSON packs so
+the classifier is reusable across products without editing code.
+
+Sources (all optional, all additive — a bad rule is skipped, never fatal):
+
+| Source | Purpose |
+|--------|---------|
+| `classifier_rules.d/*.json` next to `hive_caps.py` | bundled packs; ships `activeroles.json` (Active Roles/OI.Ldap → `os:windows build:dotnet`). Override the dir with `HIVE_CLASSIFIER_RULES_DIR`; set it empty to load none. |
+| `HIVE_CLASSIFIER_RULES_FILE` (or `~/.hive/classifier_rules.json`) | one operator rule file |
+| `HIVE_CLASSIFIER_RULES` | inline JSON list in the environment |
+
+Each pack is a JSON list of rules:
+
+```json
+[{ "pattern": "\\bactive\\s*roles\\b", "tags": ["os:windows", "build:dotnet"],
+   "reason": "why this maps here", "ignorecase": true }]
+```
+
+Reuse for another product = drop a new `*.json` in `classifier_rules.d/` (or
+point `HIVE_CLASSIFIER_RULES_FILE` at it); no code change.
 
 ## TLS (optional, issue #8 / S5)
 
