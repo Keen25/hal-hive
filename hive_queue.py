@@ -781,6 +781,14 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
         # ref and silently dropping the commits that advanced it. Never `branch
         # -f`, which would rewind base on any drift.
         tip = _git('rev-parse', branch, check=False).stdout.strip() or None
+        if not tip:
+            # Defensive: after a successful rebase `branch` resolves to the
+            # rebased tip, so this should be unreachable — but guard anyway so a
+            # vanished/empty branch parks the task instead of passing None into
+            # subprocess (TypeError) and crash-looping this merge tick forever.
+            _park_task(db_path, task_id,
+                       f'merge into {base_ref} failed: branch {branch} missing or empty')
+            return
         res = _git('update-ref', f'refs/heads/{base_ref}', tip, base_old, check=False)
         if res.returncode != 0:
             _park_task(db_path, task_id,
@@ -815,6 +823,33 @@ def _sweep_stale_verifying(db_path: str) -> int:
     return n
 
 
+def _park_orphaned_dependents(db_path: str) -> int:
+    """Park pending tasks whose dependency can never merge (dead/cancelled).
+
+    A task stays claimable only while every dep is 'merged'; the claim query
+    silently skips a task with an unmet dep. If that dep terminates dead or
+    cancelled it will never reach 'merged', so the dependent would sit 'pending'
+    forever, invisible. Move such tasks to 'needs_attention' (the human queue)
+    so an operator can cancel or re-parent them instead of them vanishing."""
+    with cursor(db_path) as cur:
+        rows = cur.execute(
+            """SELECT d.task_id AS tid, dep.id AS dep_id, dep.status AS dep_status
+               FROM task_deps d
+               JOIN tasks dep ON dep.id = d.depends_on
+               JOIN tasks t   ON t.id  = d.task_id
+               WHERE t.status = 'pending'
+                 AND dep.status IN ('dead', 'cancelled')
+               GROUP BY d.task_id"""
+        ).fetchall()
+        for r in rows:
+            _park(cur, r['tid'],
+                  f"dependency {r['dep_id']} is {r['dep_status']} and can never "
+                  f"merge — resolve or cancel this task")
+    if rows:
+        log.info('parked %d task(s) blocked by dead/cancelled deps', len(rows))
+    return len(rows)
+
+
 def merge_once(db_path: str = QUEUE_DB) -> int:
     """Process all mergeable 'done' tasks, oldest-first, serialized. Returns count.
 
@@ -823,6 +858,7 @@ def merge_once(db_path: str = QUEUE_DB) -> int:
     subprocesses never run with a DB cursor held open.
     """
     _sweep_stale_verifying(db_path)  # recover crash-orphaned 'verifying' first
+    _park_orphaned_dependents(db_path)  # surface tasks blocked by dead/cancelled deps
     with cursor(db_path) as cur:
         rows = cur.execute(
             """SELECT * FROM tasks WHERE status='done'
