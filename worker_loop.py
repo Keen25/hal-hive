@@ -149,9 +149,11 @@ class QueueClient:
         r.raise_for_status()
         return r.json()
 
-    def heartbeat(self, task_id: str, worker_id: str) -> bool:
+    def heartbeat(self, task_id: str, worker_id: str,
+                  lease_token: str | None = None) -> bool:
         r = requests.post(f'{self.base}/heartbeat',
-                          json={'task_id': task_id, 'worker_id': worker_id},
+                          json={'task_id': task_id, 'worker_id': worker_id,
+                                'lease_token': lease_token},
                           headers=self.h, timeout=15)
         r.raise_for_status()
         return r.json().get('alive', False)
@@ -166,8 +168,10 @@ class QueueClient:
 
 class Heartbeat:
     """Renews the lease every HEARTBEAT_INTERVAL_S; signals abandon if reaped."""
-    def __init__(self, client: QueueClient, task_id: str, worker_id: str):
+    def __init__(self, client: QueueClient, task_id: str, worker_id: str,
+                 lease_token: str | None = None):
         self.client, self.task_id, self.worker_id = client, task_id, worker_id
+        self.lease_token = lease_token
         self.abandon = threading.Event()
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
@@ -175,7 +179,8 @@ class Heartbeat:
     def _run(self):
         while not self._stop.wait(HEARTBEAT_INTERVAL_S):
             try:
-                if not self.client.heartbeat(self.task_id, self.worker_id):
+                if not self.client.heartbeat(self.task_id, self.worker_id,
+                                             self.lease_token):
                     log.warning('heartbeat: lease lost for %s — abandoning', self.task_id)
                     self.abandon.set()
                     return
@@ -331,9 +336,10 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
             continue  # long-poll already waited server-side
 
         tid = task['id']
+        ltok = task.get('lease_token')
         log.info('worker %s claimed %s (attempt %s)', worker_id, tid, task['attempts'])
         t0 = time.time()
-        with Heartbeat(client, tid, worker_id) as hb:
+        with Heartbeat(client, tid, worker_id, ltok) as hb:
             result = run_task(task, worker_id, lab_git)
             if hb.abandon.is_set():
                 log.warning('worker %s: %s abandoned (reaped); not reporting',
@@ -355,6 +361,7 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
             commit_hash=result.get('commit_hash'), log_path=result.get('log_path'),
             log_tail=log_tail, verified=result.get('verified'),
             verified_base=result.get('verified_base'), error=result.get('error'),
+            lease_token=ltok,
         )
         dt = time.time() - t0
         log.info('worker %s: %s -> %s (%.1fs) %s', worker_id, tid, status, dt,

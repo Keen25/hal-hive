@@ -269,7 +269,7 @@ def claim():
             return jsonify(
                 id=task.id, branch=task.branch, base_ref=task.base_ref,
                 prompt=task.prompt, scope=task.scope, attempts=task.attempts,
-                model=task.model,
+                model=task.model, lease_token=task.lease_token,
             ), 200
         if time.time() >= deadline:
             return '', 204
@@ -279,7 +279,8 @@ def claim():
 @app.post('/heartbeat')
 def heartbeat():
     body = request.get_json(force=True, silent=True) or {}
-    alive = q.heartbeat(body['task_id'], body['worker_id'])
+    alive = q.heartbeat(body['task_id'], body['worker_id'],
+                        lease_token=body.get('lease_token'))
     # A heartbeat means the worker is busy on this task — keep its liveness fresh.
     q.upsert_worker(body['worker_id'], status='busy',
                     current_task=body['task_id'], host=request.remote_addr)
@@ -295,6 +296,7 @@ def complete():
         cost_pr=b.get('cost_pr'), log_path=b.get('log_path'),
         log_tail=b.get('log_tail'), verified=b.get('verified'),
         verified_base=b.get('verified_base'), error=b.get('error'),
+        lease_token=b.get('lease_token'),
     )
     return jsonify(status=status), 200
 
