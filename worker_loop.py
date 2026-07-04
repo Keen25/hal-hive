@@ -25,6 +25,7 @@ import argparse
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -260,10 +261,15 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         g('config', 'user.email', 'hal@lab')
         g('config', 'user.name', f'HAL worker {worker_id}')
 
-        with open(log_path, 'w') as log:
+        # NB: bind the file handle to `logf`, NOT `log` — `log` is the module
+        # logger (defined at import) and a `with ... as log` would shadow it for
+        # the rest of this function, so the `log.info(...)` after the verify step
+        # would crash on the closed file object (AttributeError), turning an
+        # already-pushed task into a reported failure.
+        with open(log_path, 'w') as logf:
             proc = subprocess.run(
                 _copilot_argv(f'@{prompt_path}', model=task.get('model')),
-                cwd=run_dir, stdout=log, stderr=subprocess.STDOUT,
+                cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT,
                 timeout=COPILOT_TIMEOUT_S, text=True,
             )
 
@@ -299,6 +305,11 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
             os.remove(prompt_path)
         except OSError:
             pass
+        # Reclaim the per-task clone. Without this every task leaves a full
+        # working tree + .git behind under WORK_DIR (on the least-priv Windows
+        # worker that is C:\hive\work), eventually filling the volume until
+        # `git clone` fails and the worker can no longer complete any task.
+        shutil.rmtree(run_dir, ignore_errors=True)
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
