@@ -46,7 +46,7 @@ REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
 
 # Statuses considered "in flight" (hold a lease) for the reaper.
@@ -134,6 +134,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     cost_pr       REAL,
     log_path      TEXT,
     log_tail      TEXT,                        -- last KBs of the worker copilot log (U2 #16)
+    verified      INTEGER,                      -- worker-side verify (Sc1 #10): NULL=not run, 0=failed, 1=passed
+    verified_base TEXT,                         -- base_ref sha the worker verified against (drift check)
     error         TEXT
 );
 
@@ -176,6 +178,14 @@ def init_db(db_path: str = QUEUE_DB) -> None:
         # triage no longer requires SSHing the worker (U2 #16).
         if 'log_tail' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN log_tail TEXT')
+        # Migration v6 -> v7: worker-side verify (Sc1 #10) — the worker runs the
+        # build/test gate in its own clone (parallel) and reports the result plus
+        # the base sha it verified against, so the serial merge loop can skip the
+        # re-verify when there is no rebase drift.
+        if 'verified' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN verified INTEGER')
+        if 'verified_base' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN verified_base TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -427,6 +437,8 @@ def complete_task(
     cost_pr: Optional[float] = None,
     log_path: Optional[str] = None,
     log_tail: Optional[str] = None,
+    verified: Optional[bool] = None,
+    verified_base: Optional[str] = None,
     error: Optional[str] = None,
     db_path: str = QUEUE_DB,
 ) -> str:
@@ -449,9 +461,11 @@ def complete_task(
                 """UPDATE tasks
                    SET status='done', done_at=datetime('now'),
                        exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
-                       log_tail=?, lease_expires=NULL, heartbeat_at=NULL
+                       log_tail=?, verified=?, verified_base=?,
+                       lease_expires=NULL, heartbeat_at=NULL
                    WHERE id=? AND worker_id=?""",
                 (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
+                 (None if verified is None else int(bool(verified))), verified_base,
                  task_id, worker_id),
             )
             return 'done'
@@ -687,10 +701,36 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
         return
 
     try:
-        # C5: build/test gate BEFORE merge — no unverified code lands. The gate
-        # runs in `wt` (the rebased checkout), so it exercises the task's actual
-        # code, not the hive tooling dir.
-        ok, summary = verify_branch(branch, base_ref, task['scope'], cwd=wt)
+        # Sc1 (#10): the worker may have already run the build/test gate in its
+        # own clone (in parallel with every other worker). We trust that result
+        # ONLY when the tree we are about to fast-forward is byte-identical to the
+        # tree the worker actually tested — i.e. rebasing onto the live base
+        # produced exactly the worker's verified commit tree. That is a stronger,
+        # provably-sound guard than "the base sha didn't move": it also holds up
+        # if the agent produced merge commits or non-linear history that a rebase
+        # would otherwise reshape. Any mismatch (base drifted, rebase reshaped the
+        # tree, or the worker reported no verify) falls back to the server gate,
+        # preserving fail-closed safety — no unverified tree can land.
+        worker_verified = task['verified']          # None=not run, 0=failed, 1=passed
+        worker_commit = task['commit_hash']
+        worker_tree = _git('rev-parse', f'{worker_commit}^{{tree}}',
+                           check=False).stdout.strip() if worker_commit else ''
+        rebased_tree = subprocess.run(
+            ['git', 'rev-parse', 'HEAD^{tree}'], cwd=wt,
+            capture_output=True, text=True).stdout.strip()
+        trees_match = bool(worker_tree) and worker_tree == rebased_tree
+        trust_worker = worker_verified is not None and trees_match
+        if trust_worker:
+            ok = bool(worker_verified)
+            summary = ('verified on worker (rebased tree identical)' if ok
+                       else 'verify failed on worker (rebased tree identical)')
+            log.info('merge %s: trusting worker verify (%s), base=%s',
+                     task_id, 'pass' if ok else 'fail', task['verified_base'])
+        else:
+            # C5: build/test gate BEFORE merge — no unverified code lands. The gate
+            # runs in `wt` (the rebased checkout), so it exercises the task's actual
+            # code, not the hive tooling dir.
+            ok, summary = verify_branch(branch, base_ref, task['scope'], cwd=wt)
         if not ok:
             _park_task(db_path, task_id, f'verify failed: {summary}')
             return

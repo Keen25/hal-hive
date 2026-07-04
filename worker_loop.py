@@ -88,6 +88,26 @@ def _copilot_perms() -> list[str]:
     return shlex.split(override)
 
 
+def _worker_verify(cwd: str) -> tuple[bool, bool, str]:
+    """Run the build/test gate in the worker's OWN clone (Sc1 #10) so verify
+    happens in parallel across workers instead of serially in the merge loop.
+
+    Returns (ran, ok, summary). ``ran`` is False when HIVE_VERIFY_CMD is unset —
+    the worker then reports no verify and the merge loop runs the gate as before
+    (fully backward compatible). Uses the same HIVE_VERIFY_CMD contract as the
+    server-side gate, but read from the worker's own environment."""
+    cmd = os.environ.get('HIVE_VERIFY_CMD')
+    if not cmd:
+        return False, False, 'no HIVE_VERIFY_CMD on worker'
+    try:
+        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                              cwd=cwd, timeout=COPILOT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return True, False, 'worker verify timed out'
+    tail = (proc.stdout + proc.stderr).strip().splitlines()[-5:]
+    return True, proc.returncode == 0, ' | '.join(tail)
+
+
 def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
     """Build the copilot invocation. The executable is configurable via
     HIVE_COPILOT_CMD because the CLI is not always named `copilot` on PATH —
@@ -232,6 +252,10 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         # base_ref may not exist yet on a fresh repo — branch from HEAD if so.
         if g('rev-parse', '--verify', f'origin/{base_ref}').returncode == 0:
             g('checkout', base_ref)
+        # Sc1 (#10): record the base sha the branch is built on, so the merge
+        # loop can tell whether the base moved (rebase drift) before trusting a
+        # worker-side verify.
+        base_sha = g('rev-parse', 'HEAD').stdout.strip() or None
         g('checkout', '-b', branch)
         g('config', 'user.email', 'hal@lab')
         g('config', 'user.name', f'HAL worker {worker_id}')
@@ -255,8 +279,17 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
                     'log_path': log_path}
 
         commit = g('rev-parse', 'HEAD').stdout.strip()
-        return {'exit_code': proc.returncode, 'commit_hash': commit,
-                'log_path': log_path}
+        # Sc1 (#10): run the build/test gate here (parallel across workers). The
+        # merge loop trusts this result when the base hasn't drifted, otherwise it
+        # re-verifies the rebased tree. verified_base lets it detect that drift.
+        ran, vok, vsummary = _worker_verify(run_dir)
+        result = {'exit_code': proc.returncode, 'commit_hash': commit,
+                  'log_path': log_path, 'verified_base': base_sha}
+        if ran:
+            result['verified'] = vok
+            log.info('worker verify %s for %s: %s',
+                     'passed' if vok else 'FAILED', tid, vsummary)
+        return result
     except subprocess.TimeoutExpired:
         return {'exit_code': 124, 'error': 'copilot timed out', 'log_path': log_path}
     except Exception as e:
@@ -309,7 +342,8 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
         status = client.complete(
             task_id=tid, worker_id=worker_id, exit_code=result.get('exit_code', 1),
             commit_hash=result.get('commit_hash'), log_path=result.get('log_path'),
-            log_tail=log_tail, error=result.get('error'),
+            log_tail=log_tail, verified=result.get('verified'),
+            verified_base=result.get('verified_base'), error=result.get('error'),
         )
         dt = time.time() - t0
         log.info('worker %s: %s -> %s (%.1fs) %s', worker_id, tid, status, dt,
