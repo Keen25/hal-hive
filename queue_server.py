@@ -283,7 +283,8 @@ def complete():
         b['task_id'], b['worker_id'], int(b.get('exit_code', 1)),
         commit_hash=b.get('commit_hash'), turns=b.get('turns'),
         cost_pr=b.get('cost_pr'), log_path=b.get('log_path'),
-        log_tail=b.get('log_tail'), error=b.get('error'),
+        log_tail=b.get('log_tail'), verified=b.get('verified'),
+        verified_base=b.get('verified_base'), error=b.get('error'),
     )
     return jsonify(status=status), 200
 

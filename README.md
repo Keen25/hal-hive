@@ -196,32 +196,44 @@ not a datacenter. We'd rather state the ceiling than pretend it isn't there.
 
 ### The real ceiling is merge throughput, not worker count
 
-`merge_loop` is single-threaded and serialized, and each merge does a fresh
-temp-worktree rebase **plus a full `HIVE_VERIFY_CMD` build/test**:
+`merge_loop` is single-threaded and serialized. Historically each merge also ran
+a fresh temp-worktree rebase **plus a full `HIVE_VERIFY_CMD` build/test**, so
+`done` tasks queued behind one serialized build — the whole system's throughput
+was `1 / (rebase + full_verify_build)` no matter how many workers ran.
 
-```
-sustained merge rate ≈ 1 / (rebase + full_verify_build)
-```
-
-So beyond a point, adding workers hides copilot-run latency but does **not**
-raise integration throughput — `done` tasks queue behind one serialized verify.
-Nothing is lost (the queue stays correct); wall-clock parallelism is just capped
-by the merge loop. If verify is a multi-minute .NET build, the merge loop is the
-whole system's throughput. See #10.
+**#10 — done (worker-side verify).** Workers now run the build/test gate in their
+own clone, **in parallel**, and report the result plus the base sha they built on
+(`verified` / `verified_base`, schema v7). The serial merge loop **trusts that
+result only when the rebased tree it is about to fast-forward is byte-identical to
+the tree the worker actually tested** (it compares the rebased worktree's tree to
+the tree of the worker's reported commit). That is a provably-sound guard: if the
+base drifted, or the agent's history reshaped the tree under rebase, the trees
+differ and the merge loop **re-verifies** with the server-side gate. Fail-closed
+safety is unchanged: unverified/failed trees never land, and a worker-side fail is
+re-checked (not sticky) if a later rebase produces a different tree. Enable it by
+setting `HIVE_VERIFY_CMD` in the **worker's** environment (same command contract
+as the server gate); unset = old behaviour (merge loop verifies). Net effect:
+verify cost moves off the single merge thread onto the N-wide worker pool, so
+merge rate decouples from build time whenever the rebase is a clean no-op.
 
 ### To actually realize ~10 workers
 
-- **#13 — done.** Workers now `git clone --filter=blob:none` (partial clone) and
-  the server sets `uploadpack.allowFilter`, so clone cost no longer scales with
-  repo size per task over the LAN.
-- **#10 — remaining.** Run verify on the worker (it already has the clone) and
-  reserve the merge loop for the fast-forward. This decouples merge rate from
-  build time and is the one change still needed to comfortably hit ~10.
+- **#13 — done.** Workers `git clone --filter=blob:none` (partial clone) and the
+  server sets `uploadpack.allowFilter`, so clone cost no longer scales with repo
+  size per task over the LAN.
+- **#10 — done.** Worker-side parallel verify + drift-guarded merge (above).
 
 ### Beyond ~25–30 workers (not there yet)
 
-- **#11** — move off the dev WSGI server (waitress/gunicorn) and split
-  reaper+merge into a **single** dedicated process (never run N copies).
+- **#11 — accepted limit (documented, deferred).** The control plane still uses
+  the Werkzeug dev server with `reaper_loop`/`merge_loop` as **in-process**
+  threads, and `claim_next` serializes on the one SQLite writer. This is fine to
+  ~10–15 workers (see the write-rate math above). To scale past it, move serving
+  to waitress/gunicorn **and** split reaper+merge into a single dedicated process
+  — you must never run N copies of the merge loop (they'd race the fast-forward).
+  Not worth the operational complexity until the fleet is well past current
+  scale; the throughput bottleneck it addresses is downstream of #10, which is
+  now fixed.
 - **#12 — done.** Writers already carry a bounded `SQLITE_BUSY` retry
   (`with_retry` + `busy_timeout=5000`), so lock contention degrades gracefully
   rather than 500-ing `/claim`.
