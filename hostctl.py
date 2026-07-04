@@ -148,13 +148,18 @@ def service_env(kind: str, ctl: str, ro: str, cfg: dict) -> dict:
     qport, gport = cfg["queue_port"], cfg["git_port"]
     if kind == "queue":
         e = {**common, "HIVE_TOKEN": ctl, "HIVE_RO_TOKEN": ro,
-             "HIVE_PORT": str(qport), "HIVE_BIND": "0.0.0.0"}
+             "HIVE_PORT": str(qport)}
+        if cfg.get("bind"):
+            e["HIVE_BIND"] = cfg["bind"]
         if cfg["verify_optional"]:
             e["HIVE_VERIFY_OPTIONAL"] = "1"
         return e
     if kind == "git":
-        return {**common, "HIVE_TOKEN": ctl, "GIT_HTTP_PORT": str(gport),
-                "GIT_HTTP_BIND": "0.0.0.0", "GIT_PROJECT_ROOT": state}
+        e = {**common, "HIVE_TOKEN": ctl, "GIT_HTTP_PORT": str(gport),
+             "GIT_PROJECT_ROOT": state}
+        if cfg.get("bind"):
+            e["GIT_HTTP_BIND"] = cfg["bind"]
+        return e
     if kind == "worker":
         e = {**common, "HIVE_TOKEN": ctl,
              "HIVE_QUEUE_URL": f"http://127.0.0.1:{qport}",
@@ -492,6 +497,11 @@ def main(argv=None):
                              "uninstall", "print-join", "doctor"])
     ap.add_argument("--queue-port", type=int, default=DEFAULTS["queue_port"])
     ap.add_argument("--git-port", type=int, default=DEFAULTS["git_port"])
+    ap.add_argument("--bind", default="",
+                    help="Bind address for the control plane + git transport. "
+                         "Empty (default) inherits the servers' secure default "
+                         "(127.0.0.1 + lab NIC only, never the corp interface). "
+                         "Pass 0.0.0.0 to expose on all interfaces (opt-in).")
     ap.add_argument("--no-worker", action="store_true",
                     help="do not install a local worker on lane 'hal'")
     ap.add_argument("--verify-optional", action="store_true",
@@ -505,7 +515,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     cfg = {"queue_port": a.queue_port, "git_port": a.git_port,
            "with_worker": not a.no_worker, "verify_optional": a.verify_optional,
-           "name_prefix": a.name_prefix,
+           "name_prefix": a.name_prefix, "bind": a.bind,
            "state_dir": os.path.abspath(os.path.expanduser(a.state_dir))}
     if a.command == "install":
         cmd_install(cfg, a.dry_run)

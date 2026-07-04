@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import random
 import re
+import secrets
 import sqlite3
 import subprocess
 import threading
@@ -46,7 +47,7 @@ REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
 
 # Statuses considered "in flight" (hold a lease) for the reaper.
@@ -186,6 +187,12 @@ def init_db(db_path: str = QUEUE_DB) -> None:
             cur.execute('ALTER TABLE tasks ADD COLUMN verified INTEGER')
         if 'verified_base' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN verified_base TEXT')
+        # Migration v7 -> v8: per-claim lease token. Identifies a specific claim
+        # attempt so a stale /complete (or /heartbeat) from a prior attempt — even
+        # by the SAME worker_id that later re-claimed the reaped task — cannot
+        # mutate the current claim's state.
+        if 'lease_token' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN lease_token TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -309,6 +316,7 @@ class ClaimedTask:
     scope: Optional[str]
     attempts: int
     model: Optional[str] = None
+    lease_token: Optional[str] = None
 
 
 def claim_next(worker_id: str, worker_lane: Optional[str] = None,
@@ -374,24 +382,28 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
             conn.execute('COMMIT;')
             return None
 
+        lease_token = secrets.token_hex(8)
         conn.execute(
             """
             UPDATE tasks
             SET status        = 'claimed',
                 worker_id     = :wid,
+                lease_token   = :ltok,
                 attempts      = attempts + 1,
                 claimed_at    = datetime('now'),
                 heartbeat_at  = datetime('now'),
                 lease_expires = datetime('now', :lease)
             WHERE id = :tid
             """,
-            {'wid': worker_id, 'tid': chosen['id'], 'lease': f'+{LEASE_MINUTES} minutes'},
+            {'wid': worker_id, 'ltok': lease_token, 'tid': chosen['id'],
+             'lease': f'+{LEASE_MINUTES} minutes'},
         )
         conn.execute('COMMIT;')
         return ClaimedTask(
             id=chosen['id'], branch=chosen['branch'], base_ref=chosen['base_ref'],
             prompt=chosen['prompt'], scope=chosen['scope'],
             attempts=chosen['attempts'] + 1, model=chosen['model'],
+            lease_token=lease_token,
         )
     except Exception:
         conn.execute('ROLLBACK;')
@@ -411,8 +423,14 @@ def mark_running(task_id: str, worker_id: str, db_path: str = QUEUE_DB) -> None:
 
 # ── Heartbeat (fixes C3) ───────────────────────────────────────────────────────
 
-def heartbeat(task_id: str, worker_id: str, db_path: str = QUEUE_DB) -> bool:
-    """Renew the lease. Returns False if the task was reaped/reassigned (stop work)."""
+def heartbeat(task_id: str, worker_id: str, db_path: str = QUEUE_DB,
+              lease_token: Optional[str] = None) -> bool:
+    """Renew the lease. Returns False if the task was reaped/reassigned (stop work).
+
+    When `lease_token` is supplied it must match the token stored at claim time,
+    so a worker that lost its claim (reaped, then re-claimed by anyone — including
+    a new claim by the same worker_id) is told to abandon rather than renewing a
+    lease it no longer owns."""
     with cursor(db_path) as cur:
         cur.execute(
             """
@@ -420,8 +438,9 @@ def heartbeat(task_id: str, worker_id: str, db_path: str = QUEUE_DB) -> bool:
             SET heartbeat_at  = datetime('now'),
                 lease_expires = datetime('now', ?)
             WHERE id = ? AND worker_id = ? AND status IN ('claimed','running')
+              AND (? IS NULL OR lease_token = ?)
             """,
-            (HEARTBEAT_RENEW, task_id, worker_id),
+            (HEARTBEAT_RENEW, task_id, worker_id, lease_token, lease_token),
         )
         return cur.rowcount > 0
 
@@ -441,14 +460,24 @@ def complete_task(
     verified_base: Optional[str] = None,
     error: Optional[str] = None,
     db_path: str = QUEUE_DB,
+    lease_token: Optional[str] = None,
 ) -> str:
     """
     Record the outcome of a run. Success -> 'done' (merge loop takes it from here).
     Failure -> retry with exponential backoff, or dead-letter at max_attempts.
-    Returns the resulting status.
+    Returns the resulting status, or 'stale' if the completion did not apply
+    (the task was cancelled, reassigned, or this is a late completion from a
+    superseded claim — see the ownership guards below).
+
+    Every branch is guarded by `worker_id`, an active status, and (when supplied)
+    the per-claim `lease_token`. This prevents a late/duplicate completion from a
+    prior attempt — even one from the same worker_id that re-claimed the task —
+    from clobbering the current claim, and prevents a completion from flipping a
+    cancelled/merged task back into the pipeline.
     """
     hive_log.incr('completes')
     success = exit_code == 0 and bool(commit_hash)
+    guard = "worker_id=? AND status IN ('claimed','running') AND (? IS NULL OR lease_token=?)"
     with cursor(db_path) as cur:
         row = cur.execute(
             'SELECT attempts, max_attempts FROM tasks WHERE id=?', (task_id,)
@@ -458,16 +487,19 @@ def complete_task(
 
         if success:
             cur.execute(
-                """UPDATE tasks
+                f"""UPDATE tasks
                    SET status='done', done_at=datetime('now'),
                        exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
                        log_tail=?, verified=?, verified_base=?,
                        lease_expires=NULL, heartbeat_at=NULL
-                   WHERE id=? AND worker_id=?""",
+                   WHERE id=? AND {guard}""",
                 (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
                  (None if verified is None else int(bool(verified))), verified_base,
-                 task_id, worker_id),
+                 task_id, worker_id, lease_token, lease_token),
             )
+            if cur.rowcount == 0:
+                log.warning('ignored stale/late success for %s by %s', task_id, worker_id)
+                return 'stale'
             return 'done'
 
         if row['attempts'] >= row['max_attempts']:
@@ -475,15 +507,15 @@ def complete_task(
             log.warning('dead-lettered %s after %d attempts: %s',
                         task_id, row['attempts'], (error or '').strip()[:200])
             cur.execute(
-                """UPDATE tasks
+                f"""UPDATE tasks
                    SET status='dead', done_at=datetime('now'),
                        exit_code=?, log_path=?, log_tail=?, error=?,
                        lease_expires=NULL, heartbeat_at=NULL
-                   WHERE id=? AND worker_id=?
-                     AND status IN ('claimed','running')""",
-                (exit_code, log_path, log_tail, error, task_id, worker_id),
+                   WHERE id=? AND {guard}""",
+                (exit_code, log_path, log_tail, error,
+                 task_id, worker_id, lease_token, lease_token),
             )
-            return 'dead'
+            return 'dead' if cur.rowcount else 'stale'
 
         hive_log.incr('retries')
         backoff = 2 ** row['attempts'] * 30      # 60s, 120s, 240s, ...
@@ -491,17 +523,16 @@ def complete_task(
                  task_id, backoff, row['attempts'], row['max_attempts'],
                  (error or '').strip()[:200])
         cur.execute(
-            """UPDATE tasks
+            f"""UPDATE tasks
                SET status='pending', worker_id=NULL,
                    not_before=datetime('now', ?),
                    lease_expires=NULL, heartbeat_at=NULL,
                    exit_code=?, log_path=?, log_tail=?, error=?
-               WHERE id=? AND worker_id=?
-                 AND status IN ('claimed','running')""",
+               WHERE id=? AND {guard}""",
             (f'+{backoff} seconds', exit_code, log_path, log_tail, error,
-             task_id, worker_id),
+             task_id, worker_id, lease_token, lease_token),
         )
-        return 'pending'
+        return 'pending' if cur.rowcount else 'stale'
 
 
 # ── Reaper (fixes C3) ─────────────────────────────────────────────────────────
@@ -698,6 +729,9 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
     # M2: rebase branch onto the LIVE base so we never merge stale. lab.git is
     # bare (no worktree), so rebase runs in a scratch worktree; _rebase_worktree
     # RETURNS that worktree so the verify gate can run against the rebased tip.
+    # Capture the base tip we rebase onto so the final ref move can be a
+    # compare-and-swap (see the update-ref below) — never a blind force-move.
+    base_old = _git('rev-parse', f'refs/heads/{base_ref}', check=False).stdout.strip()
     wt = _rebase_worktree(branch, base_ref)
     if wt is None:
         _park_task(db_path, task_id, f'rebase conflict onto {base_ref}')
@@ -738,12 +772,21 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
             _park_task(db_path, task_id, f'verify failed: {summary}')
             return
 
-        # Advance base_ref to the rebased branch tip (fast-forward in a bare repo).
-        res = _git('branch', '-f', base_ref, branch, check=False)
-        if res.returncode != 0:
-            _park_task(db_path, task_id, f'merge into {base_ref} failed: {res.stderr.strip()}')
-            return
+        # Advance base_ref to the rebased branch tip. Use update-ref as a
+        # compare-and-swap against the base tip we rebased onto (base_old): the
+        # rebased branch is by construction a descendant of base_old, so this is
+        # a true fast-forward. If base_ref moved since (it should not — the merge
+        # loop is single-threaded — but an external push or a future second
+        # merger would), the CAS fails and we park rather than force-moving the
+        # ref and silently dropping the commits that advanced it. Never `branch
+        # -f`, which would rewind base on any drift.
         tip = _git('rev-parse', branch, check=False).stdout.strip() or None
+        res = _git('update-ref', f'refs/heads/{base_ref}', tip, base_old, check=False)
+        if res.returncode != 0:
+            _park_task(db_path, task_id,
+                       f'merge into {base_ref} failed (base moved under merge; '
+                       f'expected {base_old[:8]}): {res.stderr.strip()}')
+            return
         _set_status(db_path, task_id, 'merged', commit_hash=tip, clear_lease=True)
         hive_log.incr('merges')
         log.info('merged %s → %s (%s)', branch, base_ref, task_id)
@@ -922,7 +965,7 @@ def cancel_task(task_id: str, db_path: str = QUEUE_DB) -> bool:
     """Cancel a task in any pre-merge state."""
     with cursor(db_path) as cur:
         cur.execute(
-            """UPDATE tasks SET status='cancelled',
+            """UPDATE tasks SET status='cancelled', worker_id=NULL, lease_token=NULL,
                    lease_expires=NULL, heartbeat_at=NULL
                WHERE id=? AND status NOT IN ('merged','cancelled','dead')""",
             (task_id,),
