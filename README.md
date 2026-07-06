@@ -16,9 +16,10 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 |------|------|
 | `hive_queue.py` | queue core — schema, atomic `claim` (dep-gate + lease + capability match), reaper, merge-loop |
 | `queue_server.py` | REST control plane (bearer-token auth), reaper + merge-loop threads |
-| `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps |
-| `halctl.py` | control CLI: `add` / `status` / `cancel` / `prio` / `classify` |
+| `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps; **version-driven self-update** |
+| `halctl.py` | control CLI: `add` / `status` / `workers` / `update` / `cancel` / `prio` / `classify` |
 | `hive_caps.py` | capability vocabulary — `probe_caps()` (worker) + `classify_prompt()` (intake) |
+| `hive_version.py` | single source of truth for the worker code version (`CODE_VERSION`); bump to release a fleet self-update |
 | `classifier_rules.d/` | external classifier rule packs (product-specific `requires` rules; ships `activeroles.json`) |
 | `gen-lab-ca.sh` | mint the lab CA + swarm server cert (TLS, issue #8) |
 | `trust-lab-ca.ps1` | trust the lab CA on a Windows worker (ar1) |
@@ -35,6 +36,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 systemctl --user status  hive-queue-server hive-worker@hal hive-git-daemon
 python3 halctl.py add "<prompt>" --require build:dotnet   # or use the hive-task-intake skill
 python3 halctl.py status
+python3 halctl.py workers                                 # per-worker quirks: host, install dir, os/build caps, code version
 ```
 
 ## Secrets & state (NOT in this repo)
@@ -43,6 +45,58 @@ python3 halctl.py status
   `HIVE_TOKEN`, `LAB_PASS`). Scripts read `LAB_PASS` from the environment — source
   `~/.hive/hive.env` first, or they exit with a clear error.
 - `queue.db`, `lab.git/`, and worker clones are runtime state (gitignored).
+
+## Worker self-update + registry (version-driven, in-band)
+
+Workers update themselves — no WinRM, no manual file copy. The upgrade is
+**worker-native daemon code** (download → verify → swap → restart), *not* a
+copilot task, so it is not subject to the agent safety model that refuses
+task-driven self-modification.
+
+**How it works**
+
+- `hive_version.py` holds `CODE_VERSION` (a monotonic int) — the single source
+  of truth. `GET /version` serves it plus a per-file **sha256 manifest**.
+- Every `/claim` response (including the empty 204 long-poll return) carries
+  `X-Hive-Code-Version` (the fleet's current version) and, when an update is
+  requested for that worker, `X-Hive-Update-To`. Zero extra polling.
+- When **idle**, a worker that sees a target it hasn't reached fetches the
+  allowlisted assets, verifies each against the manifest sha256, **compile-checks**
+  every `.py` before swapping, backs up the old file (`*.bak-<ts>`), swaps, and
+  exits with code `42`. WinSW `onfailure`/systemd `Restart` respawn it into the
+  new code. A hash mismatch or syntax error **aborts without touching disk** — a
+  bad push can never brick a worker on restart.
+
+**Two triggers** (same primitive):
+
+| Mode | Trigger | Use |
+|------|---------|-----|
+| **A — command** | `halctl update --worker <lane>` or `--all` sets `workers.update_to`; the worker acts on its next idle claim. | operator-gated, canary-able (default) |
+| **B — auto** | worker with `HIVE_AUTO_UPDATE=1` self-updates whenever the advertised version is newer. | zero-touch, forward-only, opt-in per box |
+
+```bash
+# edit worker_loop.py etc., then:
+#   1. bump CODE_VERSION in hive_version.py
+#   2. restart hive-queue-server  (re-reads /version + manifest)
+python3 halctl.py update --all            # roll to the whole fleet
+python3 halctl.py update --worker sql1#1  # or canary one lane first
+python3 halctl.py workers                 # watch update_to clear as each reaches the target
+```
+
+**Worker registry** — each worker self-reports its identity on every claim so the
+control plane always knows **where** it runs (prevents "pushed to the wrong copy"
+blips, e.g. a worker on `D:\hive` while an operator assumes `C:\hive`):
+
+| Field | Meaning |
+|-------|---------|
+| `code_version` | the worker's running `CODE_VERSION` (⚠ badge when it differs from the server) |
+| `install_dir` | directory the worker actually runs from |
+| `hostname` / `host` | the box's own machine name / its address as seen by the server |
+| `python_exe` | interpreter running the worker |
+| `caps` | probed toolset (`os:`, `build:`, `has:`, `role:`, `arch:`) |
+
+`halctl workers` prints these per worker; the dashboard shows a compact
+`os · build-tools` line with the full identity on hover.
 
 ## Classifier rule packs (intake `requires`, F3 #22)
 

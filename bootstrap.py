@@ -172,7 +172,7 @@ if (-not $py) {{
 }}
 & $py -m pip install --quiet --disable-pip-version-check requests | Out-Null
 
-foreach ($f in 'worker_loop.py','hive_caps.py','hive_queue.py','hive_log.py') {{
+foreach ($f in 'worker_loop.py','hive_caps.py','hive_queue.py','hive_log.py','hive_version.py') {{
   Invoke-WebRequest "$QUEUE/download/$f" -OutFile "$DIR\\$f" -Headers @{{Authorization="Bearer $TOKEN"}} -UseBasicParsing
 }}
 $winsw = "$DIR\\hive-worker-$LANE.exe"
@@ -193,6 +193,40 @@ if (-not $copilot) {{
   }}
 }}
 if (-not $copilot) {{ Write-Warning "copilot CLI not found — install it, then restart hive-worker-$LANE" ; $copilot = 'C:\\npm-global\\copilot.cmd' }}
+
+# MSBuild discovery -> machine PATH so the worker advertises build:msbuild.
+# probe_caps() is which()-only (PATH-based, no subprocess); Visual Studio installs
+# MSBuild OFF the PATH (e.g. D:\\VS2022\\MSBuild\\Current\\Bin\\MSBuild.exe), so a
+# builder box would false-negative build:msbuild unless its dir is registered here.
+# Non-fatal: a box without VS just skips this (no build:msbuild cap advertised).
+try {{
+  $msb = $null
+  $vswhere = "${{env:ProgramFiles(x86)}}\\Microsoft Visual Studio\\Installer\\vswhere.exe"
+  if (Test-Path $vswhere) {{
+    $msb = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -find MSBuild\\**\\Bin\\MSBuild.exe 2>$null | Select-Object -First 1
+  }}
+  if (-not $msb) {{
+    # vswhere absent or install unregistered (custom drive) — bounded disk probe.
+    $roots = @('D:\\VS2022','D:\\Program Files\\Microsoft Visual Studio','D:\\Microsoft Visual Studio',
+               'C:\\Program Files\\Microsoft Visual Studio','C:\\Program Files (x86)\\Microsoft Visual Studio')
+    foreach ($root in $roots) {{
+      if (Test-Path $root) {{
+        $hit = Get-ChildItem -Path $root -Filter MSBuild.exe -Recurse -Depth 6 -ErrorAction SilentlyContinue |
+               Where-Object {{ $_.FullName -match '\\\\Bin\\\\MSBuild\\.exe$' }} | Select-Object -First 1
+        if ($hit) {{ $msb = $hit.FullName; break }}
+      }}
+    }}
+  }}
+  if ($msb) {{
+    $msbDir = Split-Path $msb -Parent
+    $machinePath = [Environment]::GetEnvironmentVariable('Path','Machine')
+    if (($machinePath -split ';') -notcontains $msbDir) {{
+      [Environment]::SetEnvironmentVariable('Path', ($machinePath.TrimEnd(';') + ';' + $msbDir), 'Machine')
+      Write-Host "recorded MSBuild on machine PATH: $msbDir"
+    }} else {{ Write-Host "MSBuild already on machine PATH: $msbDir" }}
+    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+  }} else {{ Write-Host "no MSBuild found (not a builder box) — skipping build:msbuild" }}
+}} catch {{ Write-Warning "MSBuild discovery failed: $_" }}
 
 # svc-hive service account (runs the worker service — LEAST PRIVILEGE, S3 #6).
 # Generate a STRONG RANDOM password per box — never a hardcoded/known secret,
@@ -315,7 +349,7 @@ PY="$(command -v python3 || true)"
   echo "WARN: could not auto-install requests; ensure it is importable"
 
 # 2. worker code
-for f in worker_loop.py hive_caps.py hive_queue.py hive_log.py; do
+for f in worker_loop.py hive_caps.py hive_queue.py hive_log.py hive_version.py; do
   curl -fsSL $CACERT -H "Authorization: Bearer $TOKEN" "$QUEUE/download/$f" -o "$DIR/$f"
 done
 

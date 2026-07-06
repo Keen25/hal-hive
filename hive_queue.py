@@ -47,7 +47,7 @@ REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 
 # Max length of the human-readable task summary shown on the dashboard/CLI in
 # place of the full prompt. Kept short so it fits one table cell / status line.
@@ -162,6 +162,11 @@ CREATE TABLE IF NOT EXISTS workers (
     host         TEXT,                          -- remote address as seen by the server
     status       TEXT NOT NULL DEFAULT 'idle',  -- idle | busy
     current_task TEXT,                          -- task_id when busy, else NULL
+    code_version INTEGER,                        -- worker's running hive_version.CODE_VERSION
+    update_to    INTEGER,                        -- operator-requested target version (mode A); NULL = none
+    install_dir  TEXT,                           -- dir the worker runs from (C:/hive, D:/hive, ~/hive)
+    hostname     TEXT,                           -- worker box's own machine name (self-reported)
+    python_exe   TEXT,                           -- python interpreter running the worker
     first_seen   DATETIME NOT NULL DEFAULT (datetime('now')),
     last_seen    DATETIME NOT NULL DEFAULT (datetime('now'))
 );
@@ -206,6 +211,25 @@ def init_db(db_path: str = QUEUE_DB) -> None:
         # Migration v8 -> v9: per-task copilot usage capture.
         if 'usage_json' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN usage_json TEXT')
+        # Migration v9 -> v10: version-driven worker self-update. Each worker
+        # reports its running CODE_VERSION; the operator sets a target via
+        # `halctl update`. Both columns are column-presence-guarded so the
+        # migration is order-independent (a worker table created fresh by the
+        # updated _SCHEMA already has them; an older DB gets the ALTERs).
+        wcols = {r['name'] for r in cur.execute('PRAGMA table_info(workers)').fetchall()}
+        if 'code_version' not in wcols:
+            cur.execute('ALTER TABLE workers ADD COLUMN code_version INTEGER')
+        if 'update_to' not in wcols:
+            cur.execute('ALTER TABLE workers ADD COLUMN update_to INTEGER')
+        # Migration v10 -> v11: self-reported worker identity so the registry
+        # always knows WHERE a worker runs (install_dir), on which host, and with
+        # which python — prevents "pushed to the wrong copy" operator blips.
+        if 'install_dir' not in wcols:
+            cur.execute('ALTER TABLE workers ADD COLUMN install_dir TEXT')
+        if 'hostname' not in wcols:
+            cur.execute('ALTER TABLE workers ADD COLUMN hostname TEXT')
+        if 'python_exe' not in wcols:
+            cur.execute('ALTER TABLE workers ADD COLUMN python_exe TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -936,11 +960,21 @@ def upsert_worker(worker_id: str, lane: Optional[str] = None,
                   caps=None, status: str = 'idle',
                   current_task: Optional[str] = None,
                   host: Optional[str] = None,
+                  code_version: Optional[int] = None,
+                  install_dir: Optional[str] = None,
+                  hostname: Optional[str] = None,
+                  python_exe: Optional[str] = None,
                   db_path: str = QUEUE_DB) -> None:
     """Register/refresh a worker's liveness row. Called by the server on every
     /claim (idle heartbeat via the 25s long-poll) and /heartbeat (busy, 60s), so
-    an idle worker stays fresh without any extra client code. lane/caps/host are
-    preserved (COALESCE) when a later call omits them."""
+    an idle worker stays fresh without any extra client code. lane/caps/host,
+    code_version and the self-reported identity (install_dir/hostname/python_exe)
+    are preserved (COALESCE) when a later call omits them.
+
+    When a real ``code_version`` is supplied and it has reached (>=) the pending
+    ``update_to`` target, ``update_to`` is auto-cleared — this closes the loop
+    after a worker restarts into the requested version (mode A), so a satisfied
+    update command stops re-firing."""
     if isinstance(caps, (list, tuple, set)):
         caps = ' '.join(sorted(str(c) for c in caps))
     with cursor(db_path) as cur:
@@ -948,18 +982,54 @@ def upsert_worker(worker_id: str, lane: Optional[str] = None,
             """
             INSERT INTO workers
                 (worker_id, lane, caps, host, status, current_task,
+                 code_version, install_dir, hostname, python_exe,
                  first_seen, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
             ON CONFLICT(worker_id) DO UPDATE SET
                 lane         = COALESCE(excluded.lane, workers.lane),
                 caps         = COALESCE(excluded.caps, workers.caps),
                 host         = COALESCE(excluded.host, workers.host),
                 status       = excluded.status,
                 current_task = excluded.current_task,
+                code_version = COALESCE(excluded.code_version, workers.code_version),
+                install_dir  = COALESCE(excluded.install_dir, workers.install_dir),
+                hostname     = COALESCE(excluded.hostname, workers.hostname),
+                python_exe   = COALESCE(excluded.python_exe, workers.python_exe),
+                update_to    = CASE
+                    WHEN excluded.code_version IS NOT NULL
+                         AND workers.update_to IS NOT NULL
+                         AND excluded.code_version >= workers.update_to
+                    THEN NULL ELSE workers.update_to END,
                 last_seen    = datetime('now')
             """,
-            (worker_id, lane, caps, host, status, current_task),
+            (worker_id, lane, caps, host, status, current_task, code_version,
+             install_dir, hostname, python_exe),
         )
+
+
+def get_worker_update(worker_id: str, db_path: str = QUEUE_DB) -> Optional[int]:
+    """Return the pending self-update target version for a worker, or None."""
+    with cursor(db_path) as cur:
+        row = cur.execute(
+            'SELECT update_to FROM workers WHERE worker_id = ?', (worker_id,)
+        ).fetchone()
+    return row['update_to'] if row else None
+
+
+def set_worker_update(version: int, worker_id: Optional[str] = None,
+                      db_path: str = QUEUE_DB) -> int:
+    """Request a self-update: set ``update_to = version`` on one worker (by id)
+    or on ALL registered workers (``worker_id=None``). Returns rows affected.
+    The worker picks this up as the ``X-Hive-Update-To`` header on its next idle
+    /claim and self-updates (download -> verify -> compile-check -> swap ->
+    restart). Auto-cleared once the worker reports it has reached the target."""
+    with cursor(db_path) as cur:
+        if worker_id:
+            cur.execute('UPDATE workers SET update_to = ? WHERE worker_id = ?',
+                        (version, worker_id))
+        else:
+            cur.execute('UPDATE workers SET update_to = ?', (version,))
+        return cur.rowcount
 
 
 def list_workers(stale_after_s: int = WORKER_STALE_S,
@@ -969,6 +1039,7 @@ def list_workers(stale_after_s: int = WORKER_STALE_S,
     with cursor(db_path) as cur:
         rows = cur.execute(
             """SELECT worker_id, lane, caps, host, status, current_task,
+                      code_version, update_to, install_dir, hostname, python_exe,
                       first_seen, last_seen,
                       CAST((julianday('now') - julianday(last_seen)) * 86400
                            AS INTEGER) AS age_s

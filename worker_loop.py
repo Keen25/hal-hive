@@ -22,12 +22,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -36,8 +39,20 @@ import requests
 
 import hive_queue as q   # only used for LAB_GIT path + local git; DB via REST
 import hive_log
+try:
+    from hive_version import CODE_VERSION
+except Exception:        # pragma: no cover - hive_version is always co-deployed
+    CODE_VERSION = 0
 
 log = hive_log.get_logger('hive.worker')
+
+# Static self-reported identity — sent on every /claim so the registry always
+# knows WHERE each worker actually runs (the install dir), on which host, and
+# with which python. Prevents "pushed to the wrong copy" blips (e.g. a worker
+# running from D:\hive while an operator assumes C:\hive). Computed once.
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+HOSTNAME    = socket.gethostname()
+PYTHON_EXE  = sys.executable or ''
 
 # How much of the worker copilot log to ship back to HAL on /complete (U2 #16).
 # The full JSONL can be large; the tail is what matters for failure triage.
@@ -164,18 +179,50 @@ def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
 # ── Queue client (REST) ───────────────────────────────────────────────────────
 
 class QueueClient:
+    # Latest self-update signal from the server, refreshed on every /claim
+    # (present on the 204 long-poll return too). None until the first claim.
+    server_code_version: int | None = None
+    update_to: int | None = None
+
     def __init__(self, base_url: str, token: str):
         self.base = base_url.rstrip('/')
         self.h = {'Authorization': f'Bearer {token}'}
 
     def claim(self, worker_id: str, lane: str | None, caps: list[str] | None = None):
         r = requests.post(f'{self.base}/claim',
-                          json={'worker_id': worker_id, 'lane': lane, 'caps': caps},
+                          json={'worker_id': worker_id, 'lane': lane, 'caps': caps,
+                                'code_version': CODE_VERSION,
+                                'install_dir': INSTALL_DIR, 'hostname': HOSTNAME,
+                                'python_exe': PYTHON_EXE},
                           headers=self.h, timeout=40)
+        # Refresh the self-update signal from response headers (present on both
+        # 200 and the empty 204 long-poll return).
+        self.server_code_version = self._int_header(r, 'X-Hive-Code-Version')
+        self.update_to = self._int_header(r, 'X-Hive-Update-To')
         if r.status_code == 204:
             return None
         r.raise_for_status()
         return r.json()
+
+    @staticmethod
+    def _int_header(resp, name: str) -> int | None:
+        raw = resp.headers.get(name)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def get_version(self) -> dict:
+        r = requests.get(f'{self.base}/version', headers=self.h, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def download(self, name: str) -> bytes:
+        r = requests.get(f'{self.base}/download/{name}', headers=self.h, timeout=60)
+        r.raise_for_status()
+        return r.content
 
     def heartbeat(self, task_id: str, worker_id: str,
                   lease_token: str | None = None) -> bool:
@@ -501,13 +548,99 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
+# ── Version-driven self-update (worker-native; no copilot/LLM in the loop) ────
+
+UPDATE_EXIT_CODE = 42   # nonzero => WinSW onfailure / systemd Restart respawns us
+UPDATE_FILES = ('worker_loop.py', 'hive_caps.py', 'hive_queue.py',
+                'hive_log.py', 'hive_version.py')
+
+
+def _auto_update_enabled() -> bool:
+    return os.environ.get('HIVE_AUTO_UPDATE', '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _self_update(client: QueueClient, target: int, reason: str) -> None:
+    """Download -> verify (sha256) -> compile-check -> back up -> swap the worker
+    code, then exit nonzero so the service manager restarts us into it. Aborts
+    (returns) without touching disk on any integrity/compile failure, so a bad
+    push can never brick a worker on restart. Called ONLY when idle."""
+    hive_dir = os.path.dirname(os.path.abspath(__file__))
+    log.warning('self-update: v%s -> v%s (%s); fetching manifest',
+                CODE_VERSION, target, reason)
+    manifest = client.get_version()
+    files = manifest.get('files') or {}
+    server_ver = manifest.get('version')
+    if 'worker_loop.py' not in files:
+        log.error('self-update ABORT: manifest has no worker_loop.py'); return
+
+    staged: dict[str, bytes] = {}
+    for name, want in files.items():
+        if name not in UPDATE_FILES:
+            continue
+        data = client.download(name)
+        got = hashlib.sha256(data).hexdigest()
+        if got != want:
+            log.error('self-update ABORT: %s hash mismatch (want %s got %s)',
+                      name, want[:12], got[:12])
+            return
+        if name.endswith('.py'):
+            try:
+                compile(data, name, 'exec')
+            except SyntaxError as e:
+                log.error('self-update ABORT: %s does not compile: %s', name, e)
+                return
+        staged[name] = data
+
+    ts = time.strftime('%Y%m%d-%H%M%S')
+    for name, data in staged.items():
+        path = os.path.join(hive_dir, name)
+        if os.path.exists(path):
+            try:
+                shutil.copy2(path, f'{path}.bak-{ts}')
+            except OSError:
+                pass
+        with open(path, 'wb') as f:
+            f.write(data)
+    log.warning('self-update: swapped %d files -> v%s (backup .bak-%s); '
+                'exiting %d for service restart',
+                len(staged), server_ver, ts, UPDATE_EXIT_CODE)
+    logging_flush = getattr(hive_log, 'flush', None)
+    if callable(logging_flush):
+        logging_flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.exit(UPDATE_EXIT_CODE)
+
+
+def _maybe_self_update(client: QueueClient) -> None:
+    """Decide whether to self-update based on the last /claim's version signal.
+    mode A (command): update_to set and != our version -> update (even re-pin).
+    mode B (auto): HIVE_AUTO_UPDATE=1 and advertised version is newer -> update.
+    Exits the process on success; on failure logs and stays on the current code."""
+    cmd = client.update_to
+    srv = client.server_code_version
+    if cmd is not None and cmd != CODE_VERSION:
+        target, reason = cmd, 'commanded'
+    elif _auto_update_enabled() and srv is not None and srv > CODE_VERSION:
+        target, reason = srv, 'auto (version bump)'
+    else:
+        return
+    try:
+        _self_update(client, target, reason)
+    except SystemExit:
+        raise
+    except Exception as e:
+        log.error('self-update failed (staying on v%s): %s', CODE_VERSION, e)
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
          caps: list[str] | None = None):
     caps = caps or []
-    log.info('worker %s up: lane=%s caps=%s — polling %s',
-             worker_id, lane, sorted(caps), client.base)
+    log.info('worker %s up: lane=%s caps=%s code=v%s — polling %s',
+             worker_id, lane, sorted(caps), CODE_VERSION, client.base)
     while True:
         try:
             task = client.claim(worker_id, lane, caps)
@@ -517,6 +650,8 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
             continue
 
         if task is None:
+            # Idle: safe point to apply a pending self-update (never mid-task).
+            _maybe_self_update(client)
             continue  # long-poll already waited server-side
 
         tid = task['id']

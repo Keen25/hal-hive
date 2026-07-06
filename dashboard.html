@@ -367,12 +367,34 @@ function render(d){
       let dc='wdot'; if(!online){dc+=' off';} else if(!busy){dc+=' idle';}
       row.appendChild(el('span',dc));
       row.appendChild(el('span','mono',w.worker_id));
+      // code version badge (⚠ if it differs from the server's advertised version)
+      if(w.code_version!=null){
+        const stale = d.code_version!=null && w.code_version!==d.code_version;
+        const vb=el('span','mono', 'v'+w.code_version+(stale?'⚠':''));
+        vb.style.cssText='font-size:10px;padding:0 4px;border-radius:3px;'+
+          (stale?'background:#5a3;color:#fe9':'background:#234;color:#8cf');
+        if(w.update_to!=null) vb.title='update queued -> v'+w.update_to;
+        else if(stale) vb.title='newer code available (v'+d.code_version+')';
+        row.appendChild(vb);
+      }
       let detail;
       if(!online) detail='· offline · '+fmtAge(w.age_s);
       else if(busy) detail='· '+(w.current_task||'busy');
       else detail='· idle';
       row.appendChild(el('span','muted',detail));
-      if(w.lane) row.appendChild(el('span','wcaps',w.lane));
+      // Compact quirks inline: os value + build tools only. Full caps + host +
+      // install dir + python live in the hover tooltip (avoids a 4-line dump).
+      const caps=(w.caps||'').split(/\s+/).filter(Boolean);
+      const osv=(caps.find(t=>t.startsWith('os:'))||'').slice(3);
+      const builds=caps.filter(t=>t.startsWith('build:')).map(t=>t.slice(6));
+      const compact=[osv, builds.join(',')].filter(Boolean).join(' · ');
+      const wc=el('span','wcaps', compact || (w.lane||''));
+      const tip=[w.hostname&&('host: '+w.hostname), w.host&&('addr: '+w.host),
+                 w.install_dir&&('install: '+w.install_dir),
+                 w.python_exe&&('py: '+w.python_exe),
+                 caps.length&&('caps: '+caps.sort().join(' '))].filter(Boolean).join('\n');
+      if(tip) wc.title=tip;
+      row.appendChild(wc);
       const rb=el('button','btn','✕'); rb.title='Remove from registry';
       rb.style.cssText='font-size:10px;padding:1px 5px;margin-left:6px;opacity:.6';
       rb.onclick=()=>removeWorker(w.worker_id);

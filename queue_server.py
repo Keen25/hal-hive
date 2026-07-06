@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 import random
 import re
 import shutil
@@ -42,6 +43,7 @@ from flask import Flask, Response, jsonify, request
 import hive_queue as q
 import hive_log
 import bootstrap as bootstrap
+from hive_version import CODE_VERSION
 
 log = hive_log.get_logger('hive.server')
 
@@ -56,6 +58,7 @@ DOWNLOADABLE = {
     'hive_caps.py':   'text/x-python',
     'hive_queue.py':  'text/x-python',
     'hive_log.py':    'text/x-python',
+    'hive_version.py': 'text/x-python',
     'winsw.exe':      'application/octet-stream',
 }
 
@@ -211,6 +214,29 @@ def download(name):
         return Response(f.read(), mimetype=mime)
 
 
+def _code_manifest() -> dict:
+    """sha256 of every downloadable .py asset present on disk. Workers verify
+    each fetched file against this before swapping it in (integrity gate)."""
+    files = {}
+    for name in DOWNLOADABLE:
+        if not name.endswith('.py'):
+            continue
+        path = os.path.join(HIVE_DIR, name)
+        if os.path.isfile(path):
+            with open(path, 'rb') as f:
+                files[name] = hashlib.sha256(f.read()).hexdigest()
+    return files
+
+
+@app.get('/version')
+def version():
+    """Advertise the current worker code version + per-file integrity manifest.
+    Control-token gated (a worker fetches it with the same token it claims with).
+    The version number comes from hive_version.CODE_VERSION; bump that when you
+    change a downloadable asset and want the fleet to self-update."""
+    return jsonify(version=CODE_VERSION, files=_code_manifest())
+
+
 # ── Central secret distribution (control-token gated) ─────────────────────────
 # Workers need credentials for private feeds (e.g. the 1id Azure Artifacts NuGet
 # feeds) to build ARS. Rather than rot a static PAT into every worker profile
@@ -348,6 +374,10 @@ def claim():
     worker_id = body.get('worker_id')
     lane = body.get('lane')
     caps = body.get('caps')
+    code_version = body.get('code_version')
+    install_dir = body.get('install_dir')
+    hostname = body.get('hostname')
+    python_exe = body.get('python_exe')
     if not worker_id:
         return jsonify(error='worker_id required'), 400
 
@@ -355,7 +385,20 @@ def claim():
     # Register/refresh as idle up-front so an idle worker (which spends its life
     # long-polling here) shows on the dashboard even before it claims anything.
     q.upsert_worker(worker_id, lane=lane, caps=caps, status='idle',
-                    current_task=None, host=host)
+                    current_task=None, host=host, code_version=code_version,
+                    install_dir=install_dir, hostname=hostname,
+                    python_exe=python_exe)
+
+    # Version-driven self-update signal (rides every claim, incl. the empty 204
+    # long-poll return): advertise the fleet's current code version and, if the
+    # operator has requested this specific worker update, its target. The worker
+    # acts on these only when idle (this branch), never mid-task.
+    def _stamp(resp):
+        resp.headers['X-Hive-Code-Version'] = str(CODE_VERSION)
+        upd = q.get_worker_update(worker_id)
+        if upd is not None:
+            resp.headers['X-Hive-Update-To'] = str(upd)
+        return resp
 
     deadline = time.time() + CLAIM_LONGPOLL_S
     while True:
@@ -369,14 +412,16 @@ def claim():
             raise
         if task is not None:
             q.upsert_worker(worker_id, lane=lane, caps=caps, status='busy',
-                            current_task=task.id, host=host)
-            return jsonify(
+                            current_task=task.id, host=host,
+                            code_version=code_version, install_dir=install_dir,
+                            hostname=hostname, python_exe=python_exe)
+            return _stamp(jsonify(
                 id=task.id, branch=task.branch, base_ref=task.base_ref,
                 prompt=task.prompt, scope=task.scope, attempts=task.attempts,
                 model=task.model, lease_token=task.lease_token,
-            ), 200
+            )), 200
         if time.time() >= deadline:
-            return '', 204
+            return _stamp(Response('', status=204))
         time.sleep(CLAIM_POLL_STEP + random.uniform(0, 0.5))   # jitter vs herd
 
 
@@ -448,6 +493,25 @@ def worker_remove():
     return jsonify(removed=removed, worker_id=worker_id), 200
 
 
+@app.post('/worker/update')
+def worker_update():
+    """Request a version-driven self-update. Sets workers.update_to on one worker
+    (worker_id) or all (all=true); the worker self-updates on its next idle claim.
+    version defaults to the server's current CODE_VERSION. (mode A / halctl update)"""
+    b = request.get_json(force=True, silent=True) or {}
+    version = b.get('version', CODE_VERSION)
+    try:
+        version = int(version)
+    except (TypeError, ValueError):
+        return jsonify(error='version must be an integer'), 400
+    worker_id = b.get('worker_id')
+    if not worker_id and not b.get('all'):
+        return jsonify(error='worker_id or all=true required'), 400
+    n = q.set_worker_update(version, worker_id=None if b.get('all') else worker_id)
+    return jsonify(requested=n, version=version,
+                   worker_id=worker_id if not b.get('all') else 'ALL'), 200
+
+
 @app.post('/workers/prune')
 def workers_prune():
     b = request.get_json(silent=True) or {}
@@ -469,7 +533,9 @@ def requeue():
 
 @app.get('/status')
 def status():
-    return jsonify(q.status_snapshot()), 200
+    snap = q.status_snapshot()
+    snap['code_version'] = CODE_VERSION   # server's advertised worker code version
+    return jsonify(snap), 200
 
 
 @app.get('/metrics')

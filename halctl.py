@@ -127,6 +127,57 @@ def cmd_prune_workers(a):
         print('no stale workers')
 
 
+def cmd_update(a):
+    import hive_version
+    version = a.version if a.version is not None else hive_version.CODE_VERSION
+    if a.all:
+        n = q.set_worker_update(version, worker_id=None)
+        print(f'update -> v{version} requested for ALL workers ({n} row(s))')
+    else:
+        n = q.set_worker_update(version, worker_id=a.worker_id)
+        if n:
+            print(f'update -> v{version} requested for {a.worker_id}')
+        else:
+            print('no such worker', a.worker_id)
+
+
+def cmd_workers(a):
+    """Quirks view: each worker's host, install dir, os:/build: caps, and code
+    version at a glance — the fast way to spot a mis-placed or stale worker."""
+    import hive_version
+    workers = q.list_workers()
+    if not workers:
+        print('(no workers registered)')
+        return
+    srv = hive_version.CODE_VERSION
+    print(f'server code version: v{srv}')
+    print('─' * 78)
+    for w in workers:
+        online = w.get('online')
+        dot = '●' if online and w['status'] != 'stale' else ('○' if online else '✗')
+        cv = w.get('code_version')
+        ver = f'v{cv}' if cv is not None else 'v?'
+        stale = (cv is not None and cv != srv)
+        upd = w.get('update_to')
+        # Surface just the os:/build:/role: tags — the "quirks" that matter.
+        tags = [t for t in (w.get('caps') or '').split()
+                if t.split(':', 1)[0] in ('os', 'build', 'has', 'role', 'arch')]
+        print(f"{dot} {w['worker_id']:9s} {ver:5s}"
+              f"{'  ⚠update' if stale else '        '} "
+              f"{(w.get('hostname') or '?'):14s} {w.get('host') or '?'}")
+        print(f"    install: {w.get('install_dir') or '?'}")
+        if tags:
+            print(f"    caps:    {' '.join(sorted(tags))}")
+        meta = []
+        if upd is not None:
+            meta.append(f'update_to=v{upd}')
+        meta.append(f"status={w['status']}")
+        meta.append(f"age={w.get('age_s')}s")
+        if w.get('python_exe'):
+            meta.append(f"py={w['python_exe']}")
+        print(f"    · {'  '.join(meta)}")
+
+
 def cmd_requeue(a):
     ok = q.requeue_task(a.task_id, reset_attempts=not a.keep_attempts)
     if ok:
@@ -209,12 +260,30 @@ def main():
     pwrm.add_argument('worker_id')
     pwrm.set_defaults(fn=cmd_worker_rm)
 
+    pws = sub.add_parser('workers',
+                         help='quirks view: host, install dir, os/build caps, '
+                              'code version per worker')
+    pws.set_defaults(fn=cmd_workers)
+
     ppw = sub.add_parser('prune-workers',
                          help='remove all stale/offline workers from the registry')
     ppw.add_argument('--stale-after', type=int, default=q.WORKER_STALE_S,
                      dest='stale_after',
                      help=f'age threshold in seconds (default: {q.WORKER_STALE_S})')
     ppw.set_defaults(fn=cmd_prune_workers)
+
+    import hive_version
+    pu = sub.add_parser('update',
+                        help='ask worker(s) to self-update to the current code '
+                             f'version (v{hive_version.CODE_VERSION})')
+    gu = pu.add_mutually_exclusive_group(required=True)
+    gu.add_argument('--worker', dest='worker_id',
+                    help='one worker_id (lane) to update')
+    gu.add_argument('--all', action='store_true',
+                    help='update every registered worker')
+    pu.add_argument('--version', type=int,
+                    help='target CODE_VERSION (default: current server version)')
+    pu.set_defaults(fn=cmd_update)
 
     args = p.parse_args()
     args.fn(args)
