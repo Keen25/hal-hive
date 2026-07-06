@@ -984,6 +984,30 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
     return {'counts': counts, 'tasks': rows, 'workers': list_workers(db_path=db_path)}
 
 
+def get_task(task_id: str, db_path: str = QUEUE_DB) -> Optional[dict]:
+    """Return the full row for one task as a dict (including the full prompt and
+    all lifecycle timestamps), or None if unknown. Backs the dashboard's
+    per-task detail popup — /status intentionally omits these to stay light."""
+    with cursor(db_path) as cur:
+        row = cur.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if row is None:
+            return None
+        task = dict(row)
+        deps = [r['depends_on'] for r in cur.execute(
+            'SELECT depends_on FROM task_deps WHERE task_id=?', (task_id,)
+        ).fetchall()]
+    task['deps'] = deps
+    task['requires'] = sorted(parse_tags(task.get('requires')))
+    # Best-effort "last activity": most recent of the lifecycle timestamps.
+    task['last_activity'] = max(
+        (t for t in (task.get('created_at'), task.get('claimed_at'),
+                     task.get('started_at'), task.get('heartbeat_at'),
+                     task.get('done_at')) if t),
+        default=task.get('created_at'),
+    )
+    return task
+
+
 def get_log_tail(task_id: str, db_path: str = QUEUE_DB) -> Optional[str]:
     """Return the stored tail of the worker copilot log for a task, or None if
     the task is unknown or produced no log (U2 #16). This is what makes failure

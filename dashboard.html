@@ -68,6 +68,17 @@
   .b-dead,.b-cancelled{background:rgba(248,81,73,.15);color:var(--bad);}
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
   .muted { color:var(--muted); }
+  td.link .tid { cursor:pointer; color:var(--accent,#4ea1ff); text-decoration:underline dotted; }
+  td.link .tid:hover { text-decoration:underline; }
+  .td-grid { display:grid; grid-template-columns:auto 1fr; gap:2px 14px; margin-bottom:12px; }
+  .td-row { display:contents; }
+  .td-k { color:var(--muted); font-size:12px; padding:2px 0; white-space:nowrap; }
+  .td-v { font-size:13px; padding:2px 0; word-break:break-word; }
+  .td-h { margin:10px 0 4px; font-size:13px; }
+  .td-pre { max-height:40vh; overflow:auto; white-space:pre-wrap; word-break:break-word;
+    font-size:12px; margin:0; padding:8px; background:#0b0e14; border:1px solid var(--border);
+    border-radius:6px; }
+  .td-pre.err { color:#ff6b6b; }
   .worker { display:flex; align-items:center; gap:8px; padding:9px 14px;
             border-bottom:1px solid var(--border); }
   .worker:last-child{border-bottom:none;}
@@ -191,6 +202,14 @@
   </form>
   <pre id="log_body" style="max-height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:12px;margin:0;padding:8px;background:#0b0e14;border:1px solid var(--border);border-radius:6px">loading…</pre>
 </dialog>
+
+<dialog id="task_dlg" class="modal">
+  <form method="dialog" class="modal-head">
+    <h2>Task <span id="td_id" class="mono muted"></span></h2>
+    <button class="x" value="close" aria-label="Close" title="Close">&#10005;</button>
+  </form>
+  <div id="td_body" style="max-height:70vh;overflow:auto">loading…</div>
+</dialog>
 <script>
 const RO_TOKEN = "%RO_TOKEN%";
 // Canonical LAN origin the server advertises for a REMOTE worker to dial. Used
@@ -214,7 +233,7 @@ const STATUS_RANK = Object.fromEntries(ORDER.map((s,i)=>[s,i]));
 // Sort state for the task table. Default: newest-first by time (current -> older).
 const SORT = { key:'time', dir:-1 };   // dir: 1 asc, -1 desc
 // Pagination state for the task table.
-const PAGE = { size:25, index:0 };
+const PAGE = { size:15, index:0 };   // rows per page; Infinity = All
 
 // SQLite datetime('now') is a UTC string "YYYY-MM-DD HH:MM:SS" with no zone —
 // parse it explicitly as UTC (a bare `new Date(str)` treats it as local time).
@@ -304,7 +323,8 @@ function render(d){
   renderPager(totalTasks, start, pageTasks.length);
   pageTasks.forEach(t=>{
     const tr=document.createElement('tr');
-    tr.appendChild(cell(t.id,'mono'));
+    const idc=el('td','mono link'); const a=el('span','tid',t.id);
+    a.onclick=()=>openTask(t.id); idc.appendChild(a); tr.appendChild(idc);
     tr.appendChild(cell(t.title||'—','title'));
     const sc=document.createElement('td');
     sc.appendChild(el('span','badge b-'+t.status,t.status.replace('_',' ')));
@@ -390,8 +410,8 @@ function row7(msg){ const tr=document.createElement('tr');
   tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=10; return tr; }
 
 function gotoPage(delta){ PAGE.index += delta; if(LAST_DATA) render(LAST_DATA); }
-function setPageSize(v){ PAGE.size = parseInt(v,10)||25; PAGE.index = 0;
-  if(LAST_DATA) render(LAST_DATA); }
+function setPageSize(v){ PAGE.size = (v==='All') ? Infinity : (parseInt(v,10)||15);
+  PAGE.index = 0; if(LAST_DATA) render(LAST_DATA); }
 function renderPager(total, start, shown){
   const p = document.getElementById('pager'); if(!p) return; p.innerHTML='';
   const pageCount = Math.max(1, Math.ceil(total / PAGE.size));
@@ -407,8 +427,10 @@ function renderPager(total, start, shown){
   const sp = el('span','spacer'); p.appendChild(sp);
   p.appendChild(el('span',null,'rows'));
   const sel=document.createElement('select');
-  [10,25,50,100].forEach(n=>{ const o=document.createElement('option');
-    o.value=n; o.textContent=n; if(n===PAGE.size)o.selected=true; sel.appendChild(o); });
+  ['15','30','60','All'].forEach(v=>{ const o=document.createElement('option');
+    o.value=v; o.textContent=v;
+    const cursz = (PAGE.size===Infinity) ? 'All' : String(PAGE.size);
+    if(v===cursz)o.selected=true; sel.appendChild(o); });
   sel.onchange=()=>setPageSize(sel.value);
   p.appendChild(sel);
 }
@@ -443,6 +465,54 @@ async function viewLog(id){
     body.scrollTop=body.scrollHeight;
   }catch(e){ body.textContent='Error loading log: '+e; }
 }
+function tdRow(k,v,mono){ const r=el('div','td-row');
+  r.appendChild(el('div','td-k',k));
+  const val=el('div','td-v'+(mono?' mono':'')); val.textContent=(v===null||v===undefined||v==='')?'—':v;
+  r.appendChild(val); return r; }
+async function openTask(id){
+  const dlg=document.getElementById('task_dlg');
+  document.getElementById('td_id').textContent=id;
+  const body=document.getElementById('td_body');
+  body.textContent='loading…';
+  if(typeof dlg.showModal==='function') dlg.showModal();
+  try{
+    const r=await fetch('/task/'+encodeURIComponent(id),{headers:H});
+    if(r.status===404){ body.textContent='Task not found.'; return; }
+    if(!r.ok){ body.textContent='Failed to load task ('+r.status+').'; return; }
+    const t=await r.json();
+    body.innerHTML='';
+    const meta=el('div','td-grid');
+    meta.appendChild(tdRow('Status', (t.status||'—').replace('_',' ')));
+    meta.appendChild(tdRow('Worker', t.worker_id || t.worker || '—', true));
+    meta.appendChild(tdRow('Model', t.model||'—', true));
+    meta.appendChild(tdRow('Complexity', t.complexity));
+    meta.appendChild(tdRow('Priority', t.priority));
+    meta.appendChild(tdRow('Attempts', (t.attempts!=null?t.attempts:'—')+' / '+(t.max_attempts!=null?t.max_attempts:'—')));
+    meta.appendChild(tdRow('Requires', Array.isArray(t.requires)?t.requires.join(', '):(t.requires||'—'), true));
+    meta.appendChild(tdRow('Deps', Array.isArray(t.deps)&&t.deps.length?t.deps.join(', '):'—', true));
+    meta.appendChild(tdRow('Branch', t.branch||'—', true));
+    meta.appendChild(tdRow('Commit', t.commit_hash||'—', true));
+    meta.appendChild(tdRow('Published', fmtTs(t.created_at)));
+    meta.appendChild(tdRow('Claimed', fmtTs(t.claimed_at)));
+    meta.appendChild(tdRow('Started', fmtTs(t.started_at)));
+    meta.appendChild(tdRow('Heartbeat', fmtTs(t.heartbeat_at)));
+    meta.appendChild(tdRow('Done', fmtTs(t.done_at)));
+    meta.appendChild(tdRow('Last activity', fmtTs(t.last_activity)));
+    body.appendChild(meta);
+    body.appendChild(el('h3','td-h','Prompt'));
+    const pre=el('pre','td-pre'); pre.textContent=t.prompt||t.title||'(no prompt)';
+    body.appendChild(pre);
+    if(t.error){ body.appendChild(el('h3','td-h','Error'));
+      const ep=el('pre','td-pre err'); ep.textContent=t.error; body.appendChild(ep); }
+  }catch(e){ body.textContent='Error loading task: '+e; }
+}
+function fmtTs(v){ if(!v) return '—';
+  let d;
+  if(typeof v==='number'){ d=new Date(v*1000); }
+  else{ // SQLite 'YYYY-MM-DD HH:MM:SS' is UTC — normalise so it isn't read as local
+    const s=/^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(v) ? v.replace(' ','T')+'Z' : v;
+    d=new Date(s); }
+  return isNaN(d) ? String(v) : d.toLocaleString(); }
 setInterval(()=>document.getElementById('clock').textContent=new Date().toLocaleTimeString(),1000);
 initSortHeaders(); updateSortHeaders();
 poll(); setInterval(poll, 2000);

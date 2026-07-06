@@ -173,7 +173,8 @@ def _guard():
     # Read-only endpoints accept the low-privilege dashboard token as well.
     # /logs/<task> is read-only observability, matched by prefix (path param).
     if request.method == 'GET' and (request.path in READONLY_PATHS
-                                    or request.path.startswith('/logs/')):
+                                    or request.path.startswith('/logs/')
+                                    or request.path.startswith('/task/')):
         if _read_authorized():
             return None
         return jsonify(error='unauthorized'), 401
@@ -392,6 +393,17 @@ def logs(task_id):
     if tail is None:
         return jsonify(error=f'no log for task {task_id}'), 404
     return Response(tail, mimetype='text/plain; charset=utf-8')
+
+
+@app.get('/task/<task_id>')
+def task_detail(task_id):
+    """Full detail for one task (read-only), backing the dashboard's per-task
+    popup: full prompt, state, timestamps (created/claimed/started/done,
+    heartbeat), attempts, deps, worker, model, error. 404 if unknown."""
+    task = q.get_task(task_id)
+    if task is None:
+        return jsonify(error=f'no task {task_id}'), 404
+    return jsonify(task)
 
 
 def resolve_bind_addrs(override, default_lab_ip='192.168.100.1'):
