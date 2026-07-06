@@ -111,6 +111,22 @@ def cmd_cancel(a):
     print('cancelled' if q.cancel_task(a.task_id) else 'not cancellable', a.task_id)
 
 
+def cmd_worker_rm(a):
+    if q.remove_worker(a.worker_id):
+        print('removed', a.worker_id)
+    else:
+        print('no such worker', a.worker_id)
+
+
+def cmd_prune_workers(a):
+    removed = q.prune_workers(a.stale_after)
+    if removed:
+        for wid in removed:
+            print('removed', wid)
+    else:
+        print('no stale workers')
+
+
 def cmd_requeue(a):
     ok = q.requeue_task(a.task_id, reset_attempts=not a.keep_attempts)
     if ok:
@@ -186,6 +202,19 @@ def main():
 
     pi = sub.add_parser('init', help='initialise queue.db')
     pi.set_defaults(fn=cmd_init)
+
+    pw = sub.add_parser('worker', help='worker registry commands')
+    wsub = pw.add_subparsers(dest='worker_cmd', required=True)
+    pwrm = wsub.add_parser('rm', help='remove a worker from the registry')
+    pwrm.add_argument('worker_id')
+    pwrm.set_defaults(fn=cmd_worker_rm)
+
+    ppw = sub.add_parser('prune-workers',
+                         help='remove all stale/offline workers from the registry')
+    ppw.add_argument('--stale-after', type=int, default=q.WORKER_STALE_S,
+                     dest='stale_after',
+                     help=f'age threshold in seconds (default: {q.WORKER_STALE_S})')
+    ppw.set_defaults(fn=cmd_prune_workers)
 
     args = p.parse_args()
     args.fn(args)
