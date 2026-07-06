@@ -27,9 +27,12 @@ the whole control plane.
 from __future__ import annotations
 
 import os
+import json
 import random
 import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import hmac
@@ -206,6 +209,75 @@ def download(name):
         return jsonify(error='missing on server'), 404
     with open(path, 'rb') as f:
         return Response(f.read(), mimetype=mime)
+
+
+# ── Central secret distribution (control-token gated) ─────────────────────────
+# Workers need credentials for private feeds (e.g. the 1id Azure Artifacts NuGet
+# feeds) to build ARS. Rather than rot a static PAT into every worker profile
+# (fragile: per-user, WOW64-redirected, and the cached tokens EXPIRE), the server
+# mints a fresh Azure DevOps access token on demand from its own `az` login and
+# hands it to callers. GET-only: a worker can READ/consume the credential but can
+# never push or mutate it. Control-token gated (workers already carry HIVE_TOKEN)
+# so it is not exposed to the low-privilege read-only/dashboard token.
+_ADO_RESOURCE = '499b84ac-1321-427f-aa17-267ca6975798'  # Azure DevOps app id
+_SECRET_LOCK = threading.Lock()
+_SECRET_CACHE: dict = {}   # name -> (payload, expiry_epoch)
+_NUGET_FEEDS = [
+    {'name': 'OneIdentity',
+     'url': 'https://pkgs.dev.azure.com/1id/_packaging/OneIdentity%40Local/nuget/v3/index.json'},
+    {'name': 'Starling2FA',
+     'url': 'https://1id.pkgs.visualstudio.com/_packaging/2FA@Release/nuget/v3/index.json'},
+]
+
+
+def _mint_ado_token() -> dict:
+    """Mint a fresh Azure DevOps access token via the server's `az` login.
+
+    Cached in-process until 5 min before expiry so bursts of worker builds don't
+    each shell out to az. Raises RuntimeError on failure (surfaced as 502)."""
+    now = time.time()
+    with _SECRET_LOCK:
+        cached = _SECRET_CACHE.get('nuget')
+        if cached and (cached[1] - now) > 300:
+            return cached[0]
+        az = shutil.which('az') or '/usr/bin/az'
+        try:
+            out = subprocess.run(
+                [az, 'account', 'get-access-token', '--resource', _ADO_RESOURCE,
+                 '-o', 'json'],
+                capture_output=True, text=True, timeout=45)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f'az invocation failed: {e}')
+        if out.returncode != 0:
+            raise RuntimeError(f'az returned {out.returncode}: '
+                               f'{out.stderr.strip()[-300:]}')
+        tok = json.loads(out.stdout)
+        payload = {
+            'username': 'hive',            # any non-empty username works for ADO
+            'password': tok['accessToken'],
+            'feeds': _NUGET_FEEDS,
+            'expiresOn': tok.get('expiresOn'),
+            'tokenType': tok.get('tokenType', 'Bearer'),
+        }
+        exp = float(tok.get('expires_on') or (now + 2400))
+        _SECRET_CACHE['nuget'] = (payload, exp)
+        return payload
+
+
+@app.get('/secret/<name>')
+def secret(name):
+    """Serve a named build credential. Control-token gated (see _guard).
+
+    Currently only `nuget` is supported: returns a freshly minted Azure DevOps
+    access token plus the feed URLs it authenticates, for the worker to write
+    into a NuGet.Config `packageSourceCredentials` (or pass via RestoreConfigFile)."""
+    if name != 'nuget':
+        return jsonify(error='unknown secret'), 404
+    try:
+        return jsonify(_mint_ado_token())
+    except RuntimeError as e:
+        log.warning('secret/nuget mint failed: %s', e)
+        return jsonify(error='mint failed', detail=str(e)), 502
 
 
 @app.get('/bootstrap.ps1')
