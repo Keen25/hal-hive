@@ -961,6 +961,49 @@ def list_workers(stale_after_s: int = WORKER_STALE_S,
     return out
 
 
+def remove_worker(worker_id: str, db_path: str = QUEUE_DB) -> bool:
+    """Delete a single worker's registry row by worker_id.
+
+    Non-destructive: removing a row only clears the display/routing entry.
+    A still-live worker simply re-registers on its next heartbeat (upsert
+    recreates the row). Deleting a row does NOT touch any in-flight task;
+    orphaned tasks are recovered separately by the lease reaper.
+
+    Returns True if a row was removed, False if no such worker existed.
+    """
+    with cursor(db_path) as cur:
+        cur.execute('DELETE FROM workers WHERE worker_id = ?', (worker_id,))
+        return cur.rowcount > 0
+
+
+def prune_workers(stale_after_s: int = WORKER_STALE_S,
+                  db_path: str = QUEUE_DB) -> list:
+    """Delete all offline workers (last_seen age > stale_after_s).
+
+    Non-destructive: only stale rows are removed; fresh/online workers are
+    never touched even if their status is 'busy'. A pruned worker that is
+    still alive will re-register on its next heartbeat. In-flight tasks are
+    unaffected; the lease reaper handles orphaned tasks independently.
+
+    Returns a sorted list of the removed worker_ids.
+    """
+    with cursor(db_path) as cur:
+        rows = cur.execute(
+            """SELECT worker_id FROM workers
+               WHERE (julianday('now') - julianday(last_seen)) * 86400 > ?""",
+            (stale_after_s,),
+        ).fetchall()
+        ids = sorted(r['worker_id'] for r in rows)
+        if ids:
+            cur.execute(
+                "DELETE FROM workers WHERE worker_id IN ({})".format(
+                    ','.join('?' * len(ids))
+                ),
+                ids,
+            )
+    return ids
+
+
 def status_snapshot(db_path: str = QUEUE_DB) -> dict:
     with cursor(db_path) as cur:
         counts = {

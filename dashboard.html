@@ -154,7 +154,7 @@
       </div>
     </div>
     <div>
-      <h2>Workers</h2>
+      <h2>Workers <button type="button" class="btn muted" id="prune_btn" style="font-size:11px;margin-left:8px">Prune offline</button></h2>
       <div class="panel" id="workers"><div class="empty">—</div></div>
       <h2 style="margin-top:22px">Transports</h2>
       <div class="panel" id="transports"><div class="empty">—</div></div>
@@ -361,6 +361,10 @@ function render(d){
       else detail='· idle';
       row.appendChild(el('span','muted',detail));
       if(w.lane) row.appendChild(el('span','wcaps',w.lane));
+      const rb=el('button','btn','✕'); rb.title='Remove from registry';
+      rb.style.cssText='font-size:10px;padding:1px 5px;margin-left:6px;opacity:.6';
+      rb.onclick=()=>removeWorker(w.worker_id);
+      row.appendChild(rb);
       wp.appendChild(row);
     });
   } else {
@@ -450,6 +454,42 @@ async function cancel(id){
   }
   poll();
 }
+async function removeWorker(worker_id){
+  if(!ctlToken()){
+    const t = prompt('Remove worker is a control action. Paste the control token (HIVE_TOKEN):');
+    if(!t) return;
+    sessionStorage.setItem('hive_ctl', t.trim());
+  }
+  if(!confirm('Remove worker '+worker_id+' from the registry?')) return;
+  const r = await fetch('/worker/remove',{method:'POST',headers:ctlHeaders(),
+    body:JSON.stringify({worker_id:worker_id})});
+  if(r.status===401){
+    sessionStorage.removeItem('hive_ctl');
+    alert('Control token rejected — cleared. Try again to re-enter it.');
+    return;
+  }
+  poll();
+}
+async function pruneWorkers(){
+  if(!ctlToken()){
+    const t = prompt('Prune workers is a control action. Paste the control token (HIVE_TOKEN):');
+    if(!t) return;
+    sessionStorage.setItem('hive_ctl', t.trim());
+  }
+  if(!confirm('Remove all offline/stale workers from the registry?')) return;
+  const r = await fetch('/workers/prune',{method:'POST',headers:ctlHeaders(),
+    body:JSON.stringify({})});
+  if(r.status===401){
+    sessionStorage.removeItem('hive_ctl');
+    alert('Control token rejected — cleared. Try again to re-enter it.');
+    return;
+  }
+  poll();
+}
+document.addEventListener('DOMContentLoaded',()=>{
+  const pb=document.getElementById('prune_btn');
+  if(pb) pb.onclick=()=>pruneWorkers();
+});
 async function viewLog(id){
   const dlg=document.getElementById('log_dlg');
   document.getElementById('log_tid').textContent=id;

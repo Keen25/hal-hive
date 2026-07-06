@@ -432,6 +432,24 @@ def cancel():
     return jsonify(cancelled=q.cancel_task(b['task_id'])), 200
 
 
+@app.post('/worker/remove')
+def worker_remove():
+    b = request.get_json(silent=True) or {}
+    worker_id = b.get('worker_id')
+    if not worker_id:
+        return jsonify(error='worker_id required'), 400
+    removed = q.remove_worker(worker_id)
+    return jsonify(removed=removed, worker_id=worker_id), 200
+
+
+@app.post('/workers/prune')
+def workers_prune():
+    b = request.get_json(silent=True) or {}
+    stale_after_s = b.get('stale_after_s', q.WORKER_STALE_S)
+    removed = q.prune_workers(stale_after_s)
+    return jsonify(removed=removed, count=len(removed)), 200
+
+
 @app.post('/requeue')
 def requeue():
     """Re-enqueue a parked task (needs_attention|dead|cancelled) -> pending. (U1)"""
