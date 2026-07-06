@@ -49,6 +49,12 @@
   th.sortable .arw { opacity:.4; font-size:9px; margin-left:3px; }
   th.sortable.active { color:var(--fg); }
   th.sortable.active .arw { opacity:1; }
+  .pager { display:flex; align-items:center; gap:10px; padding:8px 10px;
+    border-top:1px solid var(--bd); font-size:12px; color:var(--muted); }
+  .pager .spacer { flex:1; }
+  .pager select { background:var(--bg); color:var(--fg); border:1px solid var(--bd);
+    border-radius:4px; padding:2px 4px; font:inherit; }
+  .pager button[disabled] { opacity:.35; cursor:default; }
   tr:last-child td { border-bottom:none; }
   tr:hover td { background:rgba(88,166,255,.06); }
   .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:11px;
@@ -132,7 +138,9 @@
           <th class="sortable" data-sort="time">Time<span class="arw"></span></th>
           <th></th></tr></thead>
         <tbody id="taskbody"><tr><td class="empty" colspan="10">loading…</td></tr></tbody>
-      </table></div>
+      </table>
+      <div class="pager" id="pager"></div>
+      </div>
     </div>
     <div>
       <h2>Workers</h2>
@@ -203,8 +211,10 @@ function ctlToken(){ return sessionStorage.getItem('hive_ctl') || ''; }
 function ctlHeaders(){ return {'Authorization':'Bearer '+ctlToken(),'Content-Type':'application/json'}; }
 const ORDER = ['running','claimed','pending','done','verifying','needs_attention','merged','cancelled','dead'];
 const STATUS_RANK = Object.fromEntries(ORDER.map((s,i)=>[s,i]));
-// Sort state for the task table. key=null -> server's natural order.
-const SORT = { key:null, dir:1 };   // dir: 1 asc, -1 desc
+// Sort state for the task table. Default: newest-first by time (current -> older).
+const SORT = { key:'time', dir:-1 };   // dir: 1 asc, -1 desc
+// Pagination state for the task table.
+const PAGE = { size:25, index:0 };
 
 // SQLite datetime('now') is a UTC string "YYYY-MM-DD HH:MM:SS" with no zone —
 // parse it explicitly as UTC (a bare `new Date(str)` treats it as local time).
@@ -242,6 +252,7 @@ function initSortHeaders(){
       const k = th.dataset.sort;
       if(SORT.key===k) SORT.dir *= -1;         // same column -> toggle direction
       else { SORT.key=k; SORT.dir = (k==='time') ? -1 : 1; }  // time defaults newest-first
+      PAGE.index = 0;                          // re-sorting jumps back to first page
       updateSortHeaders();
       if(LAST_DATA) render(LAST_DATA);         // re-render immediately, no wait for poll
     });
@@ -281,8 +292,17 @@ function render(d){
     cards.appendChild(c);} });
   // tasks
   const tb = document.getElementById('taskbody'); tb.innerHTML='';
-  if(!tasks.length){ tb.appendChild(row7('no tasks')); }
-  sortTasks(tasks).forEach(t=>{
+  if(!tasks.length){ tb.appendChild(row7('no tasks')); renderPager(0,0,0); }
+  else {
+  const sorted = sortTasks(tasks);
+  const totalTasks = sorted.length;
+  const pageCount = Math.max(1, Math.ceil(totalTasks / PAGE.size));
+  if(PAGE.index >= pageCount) PAGE.index = pageCount - 1;   // clamp if list shrank
+  if(PAGE.index < 0) PAGE.index = 0;
+  const start = PAGE.index * PAGE.size;
+  const pageTasks = sorted.slice(start, start + PAGE.size);
+  renderPager(totalTasks, start, pageTasks.length);
+  pageTasks.forEach(t=>{
     const tr=document.createElement('tr');
     tr.appendChild(cell(t.id,'mono'));
     tr.appendChild(cell(t.title||'—','title'));
@@ -303,6 +323,7 @@ function render(d){
     tr.appendChild(ac);
     tb.appendChild(tr);
   });
+  }
   // workers — prefer the real server-side registry (liveness heartbeats);
   // fall back to deriving from task ownership for older servers.
   const wp=document.getElementById('workers'); wp.innerHTML='';
@@ -367,6 +388,30 @@ function timeCell(t){
 }
 function row7(msg){ const tr=document.createElement('tr');
   tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=10; return tr; }
+
+function gotoPage(delta){ PAGE.index += delta; if(LAST_DATA) render(LAST_DATA); }
+function setPageSize(v){ PAGE.size = parseInt(v,10)||25; PAGE.index = 0;
+  if(LAST_DATA) render(LAST_DATA); }
+function renderPager(total, start, shown){
+  const p = document.getElementById('pager'); if(!p) return; p.innerHTML='';
+  const pageCount = Math.max(1, Math.ceil(total / PAGE.size));
+  const cur = total ? PAGE.index + 1 : 0;
+  const prev = el('button','btn','‹ Prev'); prev.disabled = PAGE.index<=0;
+  prev.onclick = ()=>gotoPage(-1);
+  const next = el('button','btn','Next ›'); next.disabled = PAGE.index>=pageCount-1;
+  next.onclick = ()=>gotoPage(1);
+  const info = el('span',null, total
+    ? `Page ${cur} / ${pageCount} · ${start+1}\u2013${start+shown} of ${total}`
+    : 'no tasks');
+  p.appendChild(prev); p.appendChild(next); p.appendChild(info);
+  const sp = el('span','spacer'); p.appendChild(sp);
+  p.appendChild(el('span',null,'rows'));
+  const sel=document.createElement('select');
+  [10,25,50,100].forEach(n=>{ const o=document.createElement('option');
+    o.value=n; o.textContent=n; if(n===PAGE.size)o.selected=true; sel.appendChild(o); });
+  sel.onchange=()=>setPageSize(sel.value);
+  p.appendChild(sel);
+}
 async function cancel(id){
   if(!ctlToken()){
     const t = prompt('Cancel is a control action. Paste the control token (HIVE_TOKEN):');
