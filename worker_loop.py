@@ -211,6 +211,126 @@ def _git_auth_args() -> list:
     return []
 
 
+def _provision_build_secrets(task: dict, base_url: str, token: str) -> None:
+    """Just-in-time NuGet credential provisioning (replaces the external Windows
+    scheduled-task hack `hive-nuget-cred` + `refresh-nuget-cred.ps1` on ar1).
+
+    When a task will restore private .NET packages, fetch a FRESH Azure DevOps
+    token from the queue server's control-token-gated `/secret/nuget` endpoint and
+    write a NuGet.Config (packageSourceCredentials only) into the NuGet user-config
+    path(s) that headless MSBuild — running as THIS worker's OS identity — reads
+    ambiently. A fresh token every task means no timer and no expiry drift.
+
+    Best-effort and NON-FATAL: any failure (not a build task, network, non-200,
+    bad JSON, unwritable path) is logged and swallowed — the task may not even
+    need packages, or the restore cache may already be warm. The token is written
+    ONLY into the config file(s); it is never logged.
+    """
+    # Signal that the run will restore .NET packages. If absent, do nothing and
+    # make no network call — non-dotnet / non-build tasks are wholly unaffected.
+    requires = task.get('requires') or []
+    if 'build:dotnet' not in requires:
+        return
+
+    url = f'{base_url.rstrip("/")}/secret/nuget'
+    try:
+        r = requests.get(url, headers={'Authorization': 'Bearer ' + token},
+                         timeout=15)
+        r.raise_for_status()
+        secret = r.json()
+    except Exception as e:
+        log.warning('nuget secret fetch failed (%s); continuing without creds', e)
+        return
+
+    username = secret.get('username')
+    password = secret.get('password')
+    feeds = secret.get('feeds') or []
+    if not username or not password or not feeds:
+        log.warning('nuget secret payload incomplete; continuing without creds')
+        return
+
+    # packageSourceCredentials only — this merges with the repo's own
+    # <packageSources> at restore time (source key must match the feed name the
+    # repo's NuGet.Config uses). ClearTextPassword because the token is short-TTL
+    # and machine-encrypted password entries are not portable across identities.
+    from xml.sax.saxutils import escape
+
+    def _cred_block(feed: dict) -> str:
+        # NuGet source keys with spaces/@ are stored XML-encoded (e.g. a space ->
+        # "_x0020_"); the feed names here ("OneIdentity", "Starling2FA") are plain
+        # identifiers, so use them verbatim. escape() guards value text regardless.
+        key = feed.get('name', '')
+        return (f'    <{key}>\n'
+                f'      <add key="Username" value="{escape(username)}" />\n'
+                f'      <add key="ClearTextPassword" value="{escape(password)}" />\n'
+                f'    </{key}>')
+
+    creds = '\n'.join(_cred_block(f) for f in feeds if f.get('name'))
+    xml = ('<?xml version="1.0" encoding="utf-8"?>\n'
+           '<configuration>\n'
+           '  <packageSourceCredentials>\n'
+           f'{creds}\n'
+           '  </packageSourceCredentials>\n'
+           '</configuration>\n')
+
+    targets = _nuget_config_targets()
+    written = []
+    for path in targets:
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(xml)
+            written.append(path)
+        except OSError as e:
+            log.warning('could not write NuGet.Config to %s: %s', path, e)
+
+    if written:
+        # Log paths + expiry for auditability; NEVER the token itself.
+        log.info('provisioned NuGet creds (%d feed(s), expires %s) -> %s',
+                 len(feeds), secret.get('expiresOn', '?'), '; '.join(written))
+
+
+def _nuget_config_targets() -> list[str]:
+    """NuGet user-config path(s) for the current OS + identity so headless
+    MSBuild picks the creds up ambiently.
+
+    Windows: the ar1 worker runs as LocalSystem and the ARS build uses the 32-bit
+    MSBuild whose %APPDATA% is WOW64-redirected. When running under the SYSTEM
+    profile we can't be sure which view (System32 vs SysWOW64) MSBuild resolves,
+    so write BOTH systemprofile locations (harmless over-write beats a missed
+    path). When not SYSTEM, write the normal %APPDATA%\\NuGet\\NuGet.Config.
+
+    POSIX: ~/.nuget/NuGet/NuGet.Config (honouring $NUGET_CONFIG if it points at a
+    dir). Keeps the helper cross-platform and a no-op-safe on hal."""
+    if os.name == 'nt':
+        appdata = os.environ.get('APPDATA', '')
+        # "Am I SYSTEM?": the LocalSystem profile's APPDATA lives under
+        # ...\systemprofile\... — a robust, identity-based check that doesn't rely
+        # on USERNAME spoofing. If unset (service with no profile) treat as SYSTEM.
+        is_system = ('systemprofile' in appdata.lower()) or not appdata
+        if is_system:
+            windir = os.environ.get('WINDIR', r'C:\Windows')
+            paths = [
+                os.path.join(windir, 'System32', 'config', 'systemprofile',
+                             'AppData', 'Roaming', 'NuGet', 'NuGet.Config'),
+                os.path.join(windir, 'SysWOW64', 'config', 'systemprofile',
+                             'AppData', 'Roaming', 'NuGet', 'NuGet.Config'),
+            ]
+            # Also write the resolved APPDATA path when present, in case the
+            # service DID load a systemprofile env that differs from the above.
+            if appdata:
+                paths.append(os.path.join(appdata, 'NuGet', 'NuGet.Config'))
+            return paths
+        return [os.path.join(appdata, 'NuGet', 'NuGet.Config')]
+
+    # POSIX. $NUGET_CONFIG, when set, names a directory NuGet searches.
+    cfg_dir = os.environ.get('NUGET_CONFIG')
+    if cfg_dir and os.path.isdir(cfg_dir):
+        return [os.path.join(cfg_dir, 'NuGet.Config')]
+    home = os.path.expanduser('~')
+    return [os.path.join(home, '.nuget', 'NuGet', 'NuGet.Config')]
+
+
 def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
     """
     Clone lab.git, branch, run copilot headless, commit, push. Returns dict with
@@ -265,6 +385,19 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         g('checkout', '-b', branch)
         g('config', 'user.email', 'hal@lab')
         g('config', 'user.name', f'HAL worker {worker_id}')
+
+        # Just-in-time build-credential provisioning (replaces the ar1 scheduled
+        # task). Do it after clone/branch prep and BEFORE copilot/build starts so
+        # a headless MSBuild restore finds fresh feed creds. Best-effort: wrap in
+        # try/except so a secret-fetch failure can NEVER break a task. Sources the
+        # queue base_url + token from the same env the worker already uses.
+        try:
+            _secret_base = os.environ.get('HIVE_QUEUE_URL', 'http://127.0.0.1:5001')
+            _secret_tok = (os.environ.get('HIVE_TOKEN')
+                           or os.environ.get('HIVE_GIT_TOKEN') or '').strip()
+            _provision_build_secrets(task, _secret_base, _secret_tok)
+        except Exception as e:
+            log.warning('build-secret provisioning error (ignored): %s', e)
 
         # NB: bind the file handle to `logf`, NOT `log` — `log` is the module
         # logger (defined at import) and a `with ... as log` would shadow it for
