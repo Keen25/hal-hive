@@ -107,6 +107,30 @@ def _load_ro_token() -> str:
 
 RO_TOKEN = _load_ro_token()
 
+
+def join_host():
+    """Canonical address a REMOTE worker should dial to reach this queue.
+
+    Never loopback: the join one-liner runs on another box, where 127.0.0.1 /
+    localhost mean "that box itself". Prefer HIVE_ADVERTISE, else the first
+    non-loopback bind address, else the lab IP (HIVE_LAB_IP)."""
+    adv = os.environ.get('HIVE_ADVERTISE')
+    if adv and adv.strip():
+        return adv.strip()
+    for a in resolve_bind_addrs(os.environ.get('HIVE_BIND')):
+        if a not in ('127.0.0.1', '0.0.0.0', '::', '::1', 'localhost'):
+            return a
+    return os.environ.get('HIVE_LAB_IP', '192.168.100.1').strip()
+
+
+def join_origin():
+    """scheme://host:port a fresh worker should bootstrap from (see join_host)."""
+    scheme = 'https' if (os.environ.get('HIVE_TLS_CERT')
+                         and os.environ.get('HIVE_TLS_KEY')) else 'http'
+    port = os.environ.get('HIVE_PORT', '5001').strip()
+    return f'{scheme}://{join_host()}:{port}'
+
+
 # GET endpoints a read-only token may reach (the control token also works).
 # /logs/<task> is matched by prefix in _guard (it carries a path parameter).
 READONLY_PATHS = frozenset({'/status', '/metrics'})
@@ -235,6 +259,13 @@ def dashboard():
         return Response(f'dashboard unavailable: {exc}', status=500,
                         mimetype='text/plain')
     html = html.replace('%RO_TOKEN%', RO_TOKEN)
+    html = html.replace('%JOIN_ORIGIN%', join_origin())
+    # Operator chose to display the control token on the Add-a-worker panel for
+    # easy copy (homelab, host-only LAN trust). It is shown masked with a reveal
+    # toggle; the join one-liner still only carries it once the operator clicks
+    # "Use this token"/"Set token". NOTE: this DOES place the control token in
+    # the page source — acceptable only because /dashboard is host-only LAN.
+    html = html.replace('%CTL_TOKEN%', TOKEN)
     return Response(html, mimetype='text/html')
 
 
