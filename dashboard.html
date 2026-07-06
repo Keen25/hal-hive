@@ -131,6 +131,7 @@
   <span class="meta" id="clock"></span>
   <span class="spacer"></span>
   <span class="meta">queue :5001 · git-http :8418</span>
+  <span class="meta" id="usage_total" title="Total premium requests across all listed tasks"></span>
   <span class="meta" id="lastupd">—</span>
 </header>
 <div class="wrap">
@@ -146,9 +147,10 @@
           <th>Worker</th><th>Model</th>
           <th class="sortable" data-sort="priority">Prio<span class="arw"></span></th>
           <th>Requires</th><th>Branch</th>
+          <th title="Premium requests consumed by this task">PR</th>
           <th class="sortable" data-sort="time">Time<span class="arw"></span></th>
           <th></th></tr></thead>
-        <tbody id="taskbody"><tr><td class="empty" colspan="10">loading…</td></tr></tbody>
+        <tbody id="taskbody"><tr><td class="empty" colspan="11">loading…</td></tr></tbody>
       </table>
       <div class="pager" id="pager"></div>
       </div>
@@ -301,6 +303,13 @@ async function poll(){
 function render(d){
   LAST_DATA = d;
   const counts = d.counts||{}, tasks = d.tasks||[];
+  // header usage counter
+  const ut = d.usage_totals||{};
+  const utEl = document.getElementById('usage_total');
+  if(utEl){
+    const pr = ut.premiumRequests;
+    utEl.textContent = (pr!=null && pr>0) ? ('Σ premium: '+pr.toFixed(2)) : '';
+  }
   // cards
   const cards = document.getElementById('cards'); cards.innerHTML='';
   const total = tasks.length;
@@ -335,6 +344,9 @@ function render(d){
     tr.appendChild(cell((t.requires&&t.requires.length)?
       (Array.isArray(t.requires)?t.requires.join(' '):t.requires):'—','muted'));
     tr.appendChild(cell(t.branch||'—','mono muted'));
+    // PR (premium requests) cell
+    const pr = t.usage && t.usage.premiumRequests != null ? t.usage.premiumRequests.toFixed(2) : '—';
+    tr.appendChild(cell(pr, 'muted'));
     tr.appendChild(timeCell(t));
     const ac=document.createElement('td');
     const lb=el('button','btn','log'); lb.onclick=()=>viewLog(t.id); ac.appendChild(lb);
@@ -411,7 +423,7 @@ function timeCell(t){
   return td;
 }
 function row7(msg){ const tr=document.createElement('tr');
-  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=10; return tr; }
+  tr.appendChild(el('td','empty',msg)); tr.firstChild.colSpan=11; return tr; }
 
 function gotoPage(delta){ PAGE.index += delta; if(LAST_DATA) render(LAST_DATA); }
 function setPageSize(v){ PAGE.size = (v==='All') ? Infinity : (parseInt(v,10)||15);
@@ -544,6 +556,24 @@ async function openTask(id){
     body.appendChild(pre);
     if(t.error){ body.appendChild(el('h3','td-h','Error'));
       const ep=el('pre','td-pre err'); ep.textContent=t.error; body.appendChild(ep); }
+    // Usage section
+    body.appendChild(el('h3','td-h','Usage'));
+    const u = t.usage;
+    const uGrid = el('div','td-grid');
+    if(u && u.premiumRequests!=null){
+      uGrid.appendChild(tdRow('Premium requests', u.premiumRequests.toFixed(2)));
+      const apiMs = u.totalApiDurationMs;
+      uGrid.appendChild(tdRow('API duration', apiMs!=null ? (apiMs/1000).toFixed(1)+'s' : null));
+      const sessMs = u.sessionDurationMs;
+      uGrid.appendChild(tdRow('Session duration', sessMs!=null ? (sessMs/1000).toFixed(1)+'s' : null));
+      const la = u.linesAdded, lr = u.linesRemoved;
+      uGrid.appendChild(tdRow('Lines changed',
+        (la!=null||lr!=null) ? ('+' + (la||0) + ' / -' + (lr||0)) : null));
+    } else {
+      const noUsage = el('div','td-v muted'); noUsage.textContent = 'no usage recorded';
+      uGrid.appendChild(noUsage);
+    }
+    body.appendChild(uGrid);
   }catch(e){ body.textContent='Error loading task: '+e; }
 }
 function fmtTs(v){ if(!v) return '—';

@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -60,6 +61,33 @@ def _read_log_tail(path: str | None, max_bytes: int = LOG_TAIL_BYTES) -> str | N
         return text
     except OSError as e:
         return f'[worker: could not read log tail: {e}]'
+
+
+def _parse_usage_from_log(path: str | None) -> dict | None:
+    """Scan the copilot JSONL log for the LAST line whose parsed JSON has
+    type == "result" and return its ``usage`` dict, or None on any failure.
+
+    The ``{"type":"result"}`` line is NOT always the final physical line —
+    trailing ``session.background_tasks_changed`` ephemeral events may follow
+    it — so we scan every line and keep the last match."""
+    if not path or not os.path.exists(path):
+        return None
+    last_usage = None
+    try:
+        with open(path, encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if obj.get('type') == 'result' and 'usage' in obj:
+                        last_usage = obj['usage']
+                except Exception:
+                    pass
+    except OSError:
+        pass
+    return last_usage
 
 HEARTBEAT_INTERVAL_S = 60
 POLL_BACKOFF_S       = 3         # sleep when /claim returns empty (204)
@@ -448,6 +476,14 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
             result['verified'] = vok
             log.info('worker verify %s for %s: %s',
                      'passed' if vok else 'FAILED', tid, vsummary)
+        # Extract copilot billing usage from the JSONL log (best-effort; never
+        # breaks the task).
+        try:
+            usage = _parse_usage_from_log(log_path)
+            if usage is not None:
+                result['usage_json'] = json.dumps(usage)
+        except Exception:
+            pass
         return result
     except subprocess.TimeoutExpired:
         return {'exit_code': 124, 'error': 'copilot timed out', 'log_path': log_path}
@@ -509,7 +545,7 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
             commit_hash=result.get('commit_hash'), log_path=result.get('log_path'),
             log_tail=log_tail, verified=result.get('verified'),
             verified_base=result.get('verified_base'), error=result.get('error'),
-            lease_token=ltok,
+            lease_token=ltok, usage_json=result.get('usage_json'),
         )
         dt = time.time() - t0
         log.info('worker %s: %s -> %s (%.1fs) %s', worker_id, tid, status, dt,

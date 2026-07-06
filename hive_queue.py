@@ -137,7 +137,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     log_tail      TEXT,                        -- last KBs of the worker copilot log (U2 #16)
     verified      INTEGER,                      -- worker-side verify (Sc1 #10): NULL=not run, 0=failed, 1=passed
     verified_base TEXT,                         -- base_ref sha the worker verified against (drift check)
-    error         TEXT
+    error         TEXT,
+    usage_json    TEXT                          -- JSON blob of copilot usage (premiumRequests, durations, codeChanges)
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -193,6 +194,9 @@ def init_db(db_path: str = QUEUE_DB) -> None:
         # mutate the current claim's state.
         if 'lease_token' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN lease_token TEXT')
+        # Migration v8 -> v9: per-task copilot usage capture.
+        if 'usage_json' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN usage_json TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -461,6 +465,7 @@ def complete_task(
     error: Optional[str] = None,
     db_path: str = QUEUE_DB,
     lease_token: Optional[str] = None,
+    usage_json: Optional[str] = None,
 ) -> str:
     """
     Record the outcome of a run. Success -> 'done' (merge loop takes it from here).
@@ -492,10 +497,12 @@ def complete_task(
                        exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
                        log_tail=?, verified=?, verified_base=?,
                        error=NULL,
+                       usage_json=COALESCE(?, usage_json),
                        lease_expires=NULL, heartbeat_at=NULL
                    WHERE id=? AND {guard}""",
                 (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
                  (None if verified is None else int(bool(verified))), verified_base,
+                 usage_json,
                  task_id, worker_id, lease_token, lease_token),
             )
             if cur.rowcount == 0:
@@ -1005,6 +1012,7 @@ def prune_workers(stale_after_s: int = WORKER_STALE_S,
 
 
 def status_snapshot(db_path: str = QUEUE_DB) -> dict:
+    import json as _json
     with cursor(db_path) as cur:
         counts = {
             r['status']: r['n']
@@ -1015,17 +1023,47 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         rows = [dict(r) for r in cur.execute(
             """SELECT id, status, worker_id, worker, requires, priority,
                       complexity, model, branch, commit_hash, error, prompt,
-                      created_at, done_at
+                      created_at, done_at, usage_json
                FROM tasks ORDER BY
                  CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
                              WHEN 'pending' THEN 2 ELSE 3 END,
                  priority ASC, created_at ASC"""
         ).fetchall()]
+    total_pr = 0.0
+    tasks_with_usage = 0
     for row in rows:
         # Replace the (potentially huge) prompt with a short human title so the
         # dashboard shows intent, not the full payload, and stays lightweight.
         row['title'] = _task_title(row.pop('prompt', ''))
-    return {'counts': counts, 'tasks': rows, 'workers': list_workers(db_path=db_path)}
+        raw_usage = row.pop('usage_json', None)
+        usage = None
+        if raw_usage:
+            try:
+                full = _json.loads(raw_usage)
+                cc = full.get('codeChanges') or {}
+                usage = {
+                    'premiumRequests':    full.get('premiumRequests'),
+                    'totalApiDurationMs': full.get('totalApiDurationMs'),
+                    'sessionDurationMs':  full.get('sessionDurationMs'),
+                    'linesAdded':         cc.get('linesAdded'),
+                    'linesRemoved':       cc.get('linesRemoved'),
+                }
+                pr = full.get('premiumRequests')
+                if pr is not None:
+                    total_pr += pr
+                    tasks_with_usage += 1
+            except Exception:
+                pass
+        row['usage'] = usage
+    return {
+        'counts': counts,
+        'tasks': rows,
+        'workers': list_workers(db_path=db_path),
+        'usage_totals': {
+            'premiumRequests': total_pr,
+            'tasks_with_usage': tasks_with_usage,
+        },
+    }
 
 
 def get_task(task_id: str, db_path: str = QUEUE_DB) -> Optional[dict]:
@@ -1042,6 +1080,13 @@ def get_task(task_id: str, db_path: str = QUEUE_DB) -> Optional[dict]:
         ).fetchall()]
     task['deps'] = deps
     task['requires'] = sorted(parse_tags(task.get('requires')))
+    # Parse usage_json into a usable dict (or None when absent/malformed).
+    import json as _json
+    raw_usage = task.get('usage_json')
+    try:
+        task['usage'] = _json.loads(raw_usage) if raw_usage else None
+    except Exception:
+        task['usage'] = None
     # Best-effort "last activity": most recent of the lifecycle timestamps.
     task['last_activity'] = max(
         (t for t in (task.get('created_at'), task.get('claimed_at'),

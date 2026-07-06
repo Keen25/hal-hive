@@ -394,6 +394,11 @@ def heartbeat():
 @app.post('/complete')
 def complete():
     b = request.get_json(force=True, silent=True) or {}
+    # Accept usage as either a pre-serialised JSON string or an inline object.
+    raw_usage = b.get('usage_json') or b.get('usage')
+    if isinstance(raw_usage, dict):
+        import json as _json
+        raw_usage = _json.dumps(raw_usage)
     status = q.complete_task(
         b['task_id'], b['worker_id'], int(b.get('exit_code', 1)),
         commit_hash=b.get('commit_hash'), turns=b.get('turns'),
@@ -401,6 +406,7 @@ def complete():
         log_tail=b.get('log_tail'), verified=b.get('verified'),
         verified_base=b.get('verified_base'), error=b.get('error'),
         lease_token=b.get('lease_token'),
+        usage_json=raw_usage,
     )
     return jsonify(status=status), 200
 
