@@ -135,18 +135,40 @@ function Test-Py($exe) {{
   return $null
 }}
 $py = $null
-foreach ($c in @("C:\\Program Files\\Python312\\python.exe",
-                 "$env:LOCALAPPDATA\\Programs\\Python\\Python312\\python.exe",
-                 "py","python")) {{
+$pyPaths = @("C:\\Program Files\\Python312\\python.exe",
+             "$env:LOCALAPPDATA\\Programs\\Python\\Python312\\python.exe",
+             "py","python")
+foreach ($c in $pyPaths) {{
   $v = Test-Py $c; if ($v) {{ $py = $c; Write-Host "python $v -> $c"; break }}
 }}
 if (-not $py) {{
-  Write-Host "installing Python 3.12 (all users)..."
+  $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
   $ins = "$env:TEMP\\py312.exe"
+  # All-users install needs elevation; fall back to a per-user install (no admin,
+  # lands under %LOCALAPPDATA%) when the shell is not elevated so a fresh WORKGROUP
+  # box still bootstraps.
+  if ($admin) {{
+    Write-Host "installing Python 3.12 (all users)..."
+    $pyArgs = @('/quiet','InstallAllUsers=1','PrependPath=1','Include_pip=1','TargetDir=C:\\Program Files\\Python312')
+  }} else {{
+    Write-Host "installing Python 3.12 (current user — shell not elevated)..."
+    $pyArgs = @('/quiet','InstallAllUsers=0','PrependPath=1','Include_pip=1')
+  }}
   Invoke-WebRequest '{pyurl}' -OutFile $ins -UseBasicParsing
-  Start-Process $ins -ArgumentList '/quiet','InstallAllUsers=1','PrependPath=1','Include_pip=1','TargetDir=C:\\Program Files\\Python312' -Wait
-  $py = "C:\\Program Files\\Python312\\python.exe"
-  if (-not (Test-Py $py)) {{ throw "Python install failed" }}
+  $p = Start-Process $ins -ArgumentList $pyArgs -Wait -PassThru
+  $rc = $p.ExitCode
+  Write-Host "python installer exit code: $rc"
+  # Re-probe every candidate path (per-user install lands under LOCALAPPDATA, not
+  # the fixed all-users TargetDir), refreshing PATH so a freshly-added py/python resolves.
+  $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+  foreach ($c in $pyPaths) {{ $v = Test-Py $c; if ($v) {{ $py = $c; Write-Host "python $v -> $c"; break }} }}
+  if (-not $py -and (Get-Command winget -ErrorAction SilentlyContinue)) {{
+    Write-Host "direct installer did not yield python (rc=$rc); trying winget..."
+    winget install --id Python.Python.3.12 --silent --accept-source-agreements --accept-package-agreements --scope $(if ($admin) {{'machine'}} else {{'user'}}) 2>$null | Out-Null
+    $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
+    foreach ($c in $pyPaths) {{ $v = Test-Py $c; if ($v) {{ $py = $c; Write-Host "python $v -> $c"; break }} }}
+  }}
+  if (-not $py) {{ throw "Python install failed (installer rc=$rc). Install Python 3.10+ manually and re-run, or check the installer log at $env:TEMP\\Python*.log" }}
 }}
 & $py -m pip install --quiet --disable-pip-version-check requests | Out-Null
 

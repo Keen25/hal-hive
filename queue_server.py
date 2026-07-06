@@ -27,9 +27,12 @@ the whole control plane.
 from __future__ import annotations
 
 import os
+import json
 import random
 import re
+import shutil
 import sqlite3
+import subprocess
 import threading
 import time
 import hmac
@@ -107,6 +110,30 @@ def _load_ro_token() -> str:
 
 RO_TOKEN = _load_ro_token()
 
+
+def join_host():
+    """Canonical address a REMOTE worker should dial to reach this queue.
+
+    Never loopback: the join one-liner runs on another box, where 127.0.0.1 /
+    localhost mean "that box itself". Prefer HIVE_ADVERTISE, else the first
+    non-loopback bind address, else the lab IP (HIVE_LAB_IP)."""
+    adv = os.environ.get('HIVE_ADVERTISE')
+    if adv and adv.strip():
+        return adv.strip()
+    for a in resolve_bind_addrs(os.environ.get('HIVE_BIND')):
+        if a not in ('127.0.0.1', '0.0.0.0', '::', '::1', 'localhost'):
+            return a
+    return os.environ.get('HIVE_LAB_IP', '192.168.100.1').strip()
+
+
+def join_origin():
+    """scheme://host:port a fresh worker should bootstrap from (see join_host)."""
+    scheme = 'https' if (os.environ.get('HIVE_TLS_CERT')
+                         and os.environ.get('HIVE_TLS_KEY')) else 'http'
+    port = os.environ.get('HIVE_PORT', '5001').strip()
+    return f'{scheme}://{join_host()}:{port}'
+
+
 # GET endpoints a read-only token may reach (the control token also works).
 # /logs/<task> is matched by prefix in _guard (it carries a path parameter).
 READONLY_PATHS = frozenset({'/status', '/metrics'})
@@ -149,7 +176,8 @@ def _guard():
     # Read-only endpoints accept the low-privilege dashboard token as well.
     # /logs/<task> is read-only observability, matched by prefix (path param).
     if request.method == 'GET' and (request.path in READONLY_PATHS
-                                    or request.path.startswith('/logs/')):
+                                    or request.path.startswith('/logs/')
+                                    or request.path.startswith('/task/')):
         if _read_authorized():
             return None
         return jsonify(error='unauthorized'), 401
@@ -181,6 +209,75 @@ def download(name):
         return jsonify(error='missing on server'), 404
     with open(path, 'rb') as f:
         return Response(f.read(), mimetype=mime)
+
+
+# ── Central secret distribution (control-token gated) ─────────────────────────
+# Workers need credentials for private feeds (e.g. the 1id Azure Artifacts NuGet
+# feeds) to build ARS. Rather than rot a static PAT into every worker profile
+# (fragile: per-user, WOW64-redirected, and the cached tokens EXPIRE), the server
+# mints a fresh Azure DevOps access token on demand from its own `az` login and
+# hands it to callers. GET-only: a worker can READ/consume the credential but can
+# never push or mutate it. Control-token gated (workers already carry HIVE_TOKEN)
+# so it is not exposed to the low-privilege read-only/dashboard token.
+_ADO_RESOURCE = '499b84ac-1321-427f-aa17-267ca6975798'  # Azure DevOps app id
+_SECRET_LOCK = threading.Lock()
+_SECRET_CACHE: dict = {}   # name -> (payload, expiry_epoch)
+_NUGET_FEEDS = [
+    {'name': 'OneIdentity',
+     'url': 'https://pkgs.dev.azure.com/1id/_packaging/OneIdentity%40Local/nuget/v3/index.json'},
+    {'name': 'Starling2FA',
+     'url': 'https://1id.pkgs.visualstudio.com/_packaging/2FA@Release/nuget/v3/index.json'},
+]
+
+
+def _mint_ado_token() -> dict:
+    """Mint a fresh Azure DevOps access token via the server's `az` login.
+
+    Cached in-process until 5 min before expiry so bursts of worker builds don't
+    each shell out to az. Raises RuntimeError on failure (surfaced as 502)."""
+    now = time.time()
+    with _SECRET_LOCK:
+        cached = _SECRET_CACHE.get('nuget')
+        if cached and (cached[1] - now) > 300:
+            return cached[0]
+        az = shutil.which('az') or '/usr/bin/az'
+        try:
+            out = subprocess.run(
+                [az, 'account', 'get-access-token', '--resource', _ADO_RESOURCE,
+                 '-o', 'json'],
+                capture_output=True, text=True, timeout=45)
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f'az invocation failed: {e}')
+        if out.returncode != 0:
+            raise RuntimeError(f'az returned {out.returncode}: '
+                               f'{out.stderr.strip()[-300:]}')
+        tok = json.loads(out.stdout)
+        payload = {
+            'username': 'hive',            # any non-empty username works for ADO
+            'password': tok['accessToken'],
+            'feeds': _NUGET_FEEDS,
+            'expiresOn': tok.get('expiresOn'),
+            'tokenType': tok.get('tokenType', 'Bearer'),
+        }
+        exp = float(tok.get('expires_on') or (now + 2400))
+        _SECRET_CACHE['nuget'] = (payload, exp)
+        return payload
+
+
+@app.get('/secret/<name>')
+def secret(name):
+    """Serve a named build credential. Control-token gated (see _guard).
+
+    Currently only `nuget` is supported: returns a freshly minted Azure DevOps
+    access token plus the feed URLs it authenticates, for the worker to write
+    into a NuGet.Config `packageSourceCredentials` (or pass via RestoreConfigFile)."""
+    if name != 'nuget':
+        return jsonify(error='unknown secret'), 404
+    try:
+        return jsonify(_mint_ado_token())
+    except RuntimeError as e:
+        log.warning('secret/nuget mint failed: %s', e)
+        return jsonify(error='mint failed', detail=str(e)), 502
 
 
 @app.get('/bootstrap.ps1')
@@ -235,6 +332,13 @@ def dashboard():
         return Response(f'dashboard unavailable: {exc}', status=500,
                         mimetype='text/plain')
     html = html.replace('%RO_TOKEN%', RO_TOKEN)
+    html = html.replace('%JOIN_ORIGIN%', join_origin())
+    # Operator chose to display the control token on the Add-a-worker panel for
+    # easy copy (homelab, host-only LAN trust). It is shown masked with a reveal
+    # toggle; the join one-liner still only carries it once the operator clicks
+    # "Use this token"/"Set token". NOTE: this DOES place the control token in
+    # the page source — acceptable only because /dashboard is host-only LAN.
+    html = html.replace('%CTL_TOKEN%', TOKEN)
     return Response(html, mimetype='text/html')
 
 
@@ -290,6 +394,11 @@ def heartbeat():
 @app.post('/complete')
 def complete():
     b = request.get_json(force=True, silent=True) or {}
+    # Accept usage as either a pre-serialised JSON string or an inline object.
+    raw_usage = b.get('usage_json') or b.get('usage')
+    if isinstance(raw_usage, dict):
+        import json as _json
+        raw_usage = _json.dumps(raw_usage)
     status = q.complete_task(
         b['task_id'], b['worker_id'], int(b.get('exit_code', 1)),
         commit_hash=b.get('commit_hash'), turns=b.get('turns'),
@@ -297,6 +406,7 @@ def complete():
         log_tail=b.get('log_tail'), verified=b.get('verified'),
         verified_base=b.get('verified_base'), error=b.get('error'),
         lease_token=b.get('lease_token'),
+        usage_json=raw_usage,
     )
     return jsonify(status=status), 200
 
@@ -326,6 +436,24 @@ def add():
 def cancel():
     b = request.get_json(force=True, silent=True) or {}
     return jsonify(cancelled=q.cancel_task(b['task_id'])), 200
+
+
+@app.post('/worker/remove')
+def worker_remove():
+    b = request.get_json(silent=True) or {}
+    worker_id = b.get('worker_id')
+    if not worker_id:
+        return jsonify(error='worker_id required'), 400
+    removed = q.remove_worker(worker_id)
+    return jsonify(removed=removed, worker_id=worker_id), 200
+
+
+@app.post('/workers/prune')
+def workers_prune():
+    b = request.get_json(silent=True) or {}
+    stale_after_s = b.get('stale_after_s', q.WORKER_STALE_S)
+    removed = q.prune_workers(stale_after_s)
+    return jsonify(removed=removed, count=len(removed)), 200
 
 
 @app.post('/requeue')
@@ -361,6 +489,17 @@ def logs(task_id):
     if tail is None:
         return jsonify(error=f'no log for task {task_id}'), 404
     return Response(tail, mimetype='text/plain; charset=utf-8')
+
+
+@app.get('/task/<task_id>')
+def task_detail(task_id):
+    """Full detail for one task (read-only), backing the dashboard's per-task
+    popup: full prompt, state, timestamps (created/claimed/started/done,
+    heartbeat), attempts, deps, worker, model, error. 404 if unknown."""
+    task = q.get_task(task_id)
+    if task is None:
+        return jsonify(error=f'no task {task_id}'), 404
+    return jsonify(task)
 
 
 def resolve_bind_addrs(override, default_lab_ip='192.168.100.1'):
