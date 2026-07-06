@@ -63,7 +63,7 @@ def _read_log_tail(path: str | None, max_bytes: int = LOG_TAIL_BYTES) -> str | N
 
 HEARTBEAT_INTERVAL_S = 60
 POLL_BACKOFF_S       = 3         # sleep when /claim returns empty (204)
-COPILOT_TIMEOUT_S    = 840
+COPILOT_TIMEOUT_S    = int(os.environ.get('COPILOT_TIMEOUT_S', '840'))
 
 # S3 (#6): keep every per-task artifact (clone, log, prompt) under one directory
 # the operator can lock down with an ACL, instead of the account-wide system
