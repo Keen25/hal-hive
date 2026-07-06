@@ -491,6 +491,7 @@ def complete_task(
                    SET status='done', done_at=datetime('now'),
                        exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
                        log_tail=?, verified=?, verified_base=?,
+                       error=NULL,
                        lease_expires=NULL, heartbeat_at=NULL
                    WHERE id=? AND {guard}""",
                 (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
