@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HAL hive smart-HTTP git server.
+"""HAL swarm smart-HTTP git server.
 
 Serves ~/hive/lab.git (and any bare repo under GIT_PROJECT_ROOT) over Git's
 smart-HTTP protocol by invoking the stock ``git-http-backend`` CGI. This exists
@@ -71,7 +71,7 @@ TOKEN_FILE = os.path.expanduser("~/.hive/worker.token")
 
 
 def _resolve_token() -> str:
-    """Shared hive token — same precedence as queue_server so both agree."""
+    """Shared swarm token — same precedence as queue_server so both agree."""
     for key in ("HIVE_GIT_TOKEN", "HIVE_TOKEN"):
         val = os.environ.get(key)
         if val and val.strip():
@@ -109,7 +109,7 @@ class GitHTTPHandler(BaseHTTPRequestHandler):
     def _require_auth(self) -> bool:
         if self._authorized():
             return True
-        body = b"401 unauthorized: hive git transport requires the shared token\n"
+        body = b"401 unauthorized: swarm git transport requires the shared token\n"
         self.send_response(401)
         self.send_header("WWW-Authenticate", 'Basic realm="hal-hive-git"')
         self.send_header("Content-Type", "text/plain")
