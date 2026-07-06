@@ -47,7 +47,11 @@ REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
+
+# Max length of the human-readable task summary shown on the dashboard/CLI in
+# place of the full prompt. Kept short so it fits one table cell / status line.
+SUMMARY_MAX = 128
 WORKER_STALE_S = 120                  # a worker not seen within this is "offline"
 
 # Statuses considered "in flight" (hold a lease) for the reaper.
@@ -112,6 +116,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     branch        TEXT NOT NULL UNIQUE,
     base_ref      TEXT NOT NULL DEFAULT 'master',
     prompt        TEXT NOT NULL,
+    summary       TEXT,                        -- <=128-char human label shown instead of the full prompt
     worker        TEXT,                        -- exact lane pin ('ar1'|'hal'|...), NULL = any
     requires      TEXT,                        -- capability tags a worker MUST have (space-sep), NULL = none
     scope         TEXT,                        -- optional build/test scope for verify gate
@@ -194,6 +199,10 @@ def init_db(db_path: str = QUEUE_DB) -> None:
         # mutate the current claim's state.
         if 'lease_token' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN lease_token TEXT')
+        # Migration v8 -> v9: short human-readable task summary (<=128 chars)
+        # shown on the dashboard/CLI instead of the full (often huge) prompt.
+        if 'summary' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN summary TEXT')
         # Migration v8 -> v9: per-task copilot usage capture.
         if 'usage_json' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN usage_json TEXT')
@@ -277,6 +286,7 @@ def add_task(
     model: Optional[str] = None,
     deps: Optional[list[str]] = None,
     max_attempts: int = 3,
+    summary: Optional[str] = None,
     db_path: str = QUEUE_DB,
 ) -> None:
     """Insert a task (+ its dependency edges) into the queue.
@@ -288,18 +298,26 @@ def add_task(
     `complexity` (1..3) selects the model the worker runs copilot with; `model`
     is normally derived from it by the caller. If `model` is not given but
     `complexity` is, the model is filled in here from the shared mapping.
+
+    `summary` is a short (<=128 char) human label shown on the dashboard/CLI in
+    place of the full prompt. When omitted it is auto-derived from the prompt so
+    the field is always populated.
     """
     if model is None and complexity is not None:
         from hive_caps import model_for_complexity
         model = model_for_complexity(complexity)
     branch = branch or f'feature/{task_id}'
+    if summary:
+        summary = ' '.join(summary.split())[:SUMMARY_MAX]
+    else:
+        summary = _task_title(prompt, SUMMARY_MAX)
     with cursor(db_path) as cur:
         cur.execute(
             """INSERT INTO tasks
-                 (id, branch, base_ref, prompt, worker, requires, scope,
+                 (id, branch, base_ref, prompt, summary, worker, requires, scope,
                   priority, complexity, model, max_attempts)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (task_id, branch, base_ref, prompt, worker, canon_tags(requires),
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (task_id, branch, base_ref, prompt, summary, worker, canon_tags(requires),
              scope, priority, complexity, model, max_attempts),
         )
         for dep in (deps or []):
@@ -1022,7 +1040,7 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         }
         rows = [dict(r) for r in cur.execute(
             """SELECT id, status, worker_id, worker, requires, priority,
-                      complexity, model, branch, commit_hash, error, prompt,
+                      complexity, model, branch, commit_hash, error, prompt, summary,
                       created_at, done_at, usage_json
                FROM tasks ORDER BY
                  CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
@@ -1032,9 +1050,11 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
     total_pr = 0.0
     tasks_with_usage = 0
     for row in rows:
-        # Replace the (potentially huge) prompt with a short human title so the
-        # dashboard shows intent, not the full payload, and stays lightweight.
-        row['title'] = _task_title(row.pop('prompt', ''))
+        # Prefer the explicit human summary; fall back to deriving one from the
+        # prompt for older rows that predate the summary column. Either way, drop
+        # the (potentially huge) prompt so the dashboard stays lightweight.
+        row['title'] = row.pop('summary', None) or _task_title(row.get('prompt', ''))
+        row.pop('prompt', None)
         raw_usage = row.pop('usage_json', None)
         usage = None
         if raw_usage:

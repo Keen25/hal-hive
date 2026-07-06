@@ -45,7 +45,7 @@ def cmd_add(a):
     q.add_task(tid, a.prompt, branch=a.branch, base_ref=a.base_ref,
                worker=a.worker, requires=a.require, scope=a.scope,
                priority=a.priority, complexity=complexity, model=model,
-               deps=a.dep, max_attempts=a.max_attempts)
+               deps=a.dep, max_attempts=a.max_attempts, summary=a.summary)
     bits = [f'+ {tid}', f'prio={a.priority}',
             f'cx={complexity}/{model}{auto_note}',
             f'branch={a.branch or f"feature/{tid}"}']
@@ -56,6 +56,9 @@ def cmd_add(a):
     if a.dep:
         bits.append(f'deps={",".join(a.dep)}')
     print('  '.join(bits))
+    eff_summary = ' '.join(a.summary.split())[:q.SUMMARY_MAX] if a.summary \
+        else q._task_title(a.prompt, q.SUMMARY_MAX)
+    print(f'  ↳ {eff_summary}')
 
 
 def cmd_classify(a):
@@ -91,6 +94,8 @@ def cmd_status(a):
                 f"{t['status']:15s} p{t['priority']} "
                 f"{t['worker_id'] or '':10s} {t['branch']}")
         print(line)
+        if t.get('title'):
+            print(f"      ↳ {t['title']}")
         constraints = []
         if t.get('worker'):
             constraints.append(f"pin={t['worker']}")
@@ -156,6 +161,10 @@ def main():
                     help='capability a worker MUST have to claim this (repeatable), '
                          'e.g. --require os:windows --require msbuild')
     pa.add_argument('--scope', help='build/test scope for the verify gate')
+    pa.add_argument('--summary',
+                    help='short (<=128 char) human label shown on the dashboard/CLI '
+                         'instead of the full prompt (auto-derived from the prompt '
+                         'when omitted)')
     pa.add_argument('--priority', type=int, default=5)
     pa.add_argument('--complexity', default='auto',
                     choices=['1', '2', '3', 'auto'],
