@@ -289,7 +289,14 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
                 return {'exit_code': 1,
                         'error': f'git commit failed: {ci.stderr.strip()}',
                         'log_path': log_path}
-        else:
+        # "No staged changes" does NOT mean "nothing happened": in autopilot mode
+        # copilot has git access and may commit the work itself (always, when the
+        # prompt asks it to, and sometimes on its own). That leaves a clean index
+        # but a branch legitimately ahead of base. Only treat the run as empty
+        # when the branch did not advance beyond the base it was cut from —
+        # otherwise we'd drop copilot's own commit(s) and report a false failure.
+        head = g('rev-parse', 'HEAD').stdout.strip()
+        if not head or head == base_sha:
             return {'exit_code': 1, 'error': 'no changes produced', 'log_path': log_path}
 
         push = g('push', 'origin', branch)
