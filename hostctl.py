@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""hostctl — stand up & manage a HAL hive CONTROL-PLANE host on any OS.
+"""hostctl — stand up & manage a HAL swarm CONTROL-PLANE host on any OS.
 
 The queue logic is pure, OS-agnostic Python; what used to pin the hive to Linux
 was (a) the git-http-backend path and (b) the systemd-only service assets. This
@@ -229,7 +229,7 @@ def _systemd_unit(kind: str, py: str, ctl: str, ro: str, cfg: dict) -> str:
             "worker": "local worker (lane hal)"}[kind]
     return (
         "[Unit]\n"
-        f"Description=HAL Hive — {desc}\n"
+        f"Description=HAL Swarm — {desc}\n"
         "After=network-online.target\nWants=network-online.target\n\n"
         "[Service]\nType=simple\n"
         f"WorkingDirectory={HERE}\n"
@@ -354,8 +354,8 @@ def _winsw_xml(kind, py, ctl, ro, cfg) -> str:
     return (
         "<service>\n"
         f"  <id>{sid}</id>\n"
-        f"  <name>HAL Hive — {desc}</name>\n"
-        f"  <description>HAL hive control-plane component ({kind}).</description>\n"
+        f"  <name>HAL Swarm — {desc}</name>\n"
+        f"  <description>HAL swarm control-plane component ({kind}).</description>\n"
         f"  <executable>{_xml(exe)}</executable>\n"
         f"  <arguments>{args}</arguments>\n"
         f"  <workingdirectory>{_xml(str(HERE))}</workingdirectory>\n"
@@ -468,7 +468,7 @@ def cmd_status(cfg, dry):
 def cmd_print_join(cfg, dry):
     ip = local_ip()
     base = f"http://{ip}:{cfg['queue_port']}"
-    print("Hive host is up. Dashboard:", base + "/")
+    print("Swarm host is up. Dashboard:", base + "/")
     print("Add a worker from another box (fill in <lane>/<caps>):")
     print(f"  Linux/macOS: curl -fsSL '{base}/bootstrap.sh?lane=<lane>&caps=<caps>' | sh")
     print(f"  Windows PS : powershell -NoProfile -ExecutionPolicy Bypass "
@@ -491,7 +491,7 @@ def cmd_doctor(cfg, dry):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Stand up / manage a HAL hive control-plane host.")
+    ap = argparse.ArgumentParser(description="Stand up / manage a HAL swarm control-plane host.")
     ap.add_argument("command",
                     choices=["install", "start", "stop", "restart", "status",
                              "uninstall", "print-join", "doctor"])

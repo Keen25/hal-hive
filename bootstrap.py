@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""HAL hive — self-service worker bootstrap generator.
+"""HAL swarm — self-service worker bootstrap generator.
 
 Produces a platform-appropriate setup script that a *fresh* worker box runs
 once to join the hive. The operator copies a one-liner off the dashboard, runs
@@ -126,7 +126,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $QUEUE = '{q}'; $GIT = '{g}'; $TOKEN = '{token}'; $GHTOK = '{ght}'
 $LANE = '{lane}'; $WID = '{wid}'; $DIR = 'C:\\hive'
-Write-Host "== HAL hive worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
+Write-Host "== HAL swarm worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
 New-Item -ItemType Directory -Force $DIR | Out-Null
 {ca_setup_ps}
 function Test-Py($exe) {{
@@ -203,7 +203,7 @@ $rb = New-Object 'System.Byte[]' 24
 $PW = ([Convert]::ToBase64String($rb) -replace '[+/=]','x') + 'aA9!'
 $u = 'svc-hive'; $p = ConvertTo-SecureString $PW -AsPlainText -Force
 if (Get-LocalUser $u -EA SilentlyContinue) {{ Set-LocalUser $u -Password $p -PasswordNeverExpires $true }}
-else {{ New-LocalUser $u -Password $p -FullName 'HAL Hive Service' -PasswordNeverExpires | Out-Null }}
+else {{ New-LocalUser $u -Password $p -FullName 'HAL Swarm Service' -PasswordNeverExpires | Out-Null }}
 # S3 (#6): svc-hive runs as a STANDARD USER, never a local admin. A queued
 # prompt is arbitrary code (copilot runs with broad tool access), so the service
 # account must not be able to own the box. Undo Administrators from any earlier
@@ -303,7 +303,7 @@ def _unix(lane, caps, wid, token, cfg) -> str:
 set -eu
 QUEUE='{q}'; GIT='{g}'; TOKEN='{token}'; GHTOK='{ght}'
 LANE='{lane}'; WID='{wid}'; DIR="$HOME/.hive-worker"
-echo "== HAL hive worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
+echo "== HAL swarm worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
 mkdir -p "$DIR"
 {ca_write_sh}
 # 1. python3 + requests

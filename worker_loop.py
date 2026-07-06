@@ -226,7 +226,7 @@ class Heartbeat:
 # ── The run ───────────────────────────────────────────────────────────────────
 
 def _git_auth_args() -> list:
-    """Inject the shared hive token as an HTTP header for smart-HTTP git ops.
+    """Inject the shared swarm token as an HTTP header for smart-HTTP git ops.
 
     The lab.git transport (git_http_server.py) now requires token auth. We pass
     the token per-invocation via `-c http.extraheader=...` rather than embedding

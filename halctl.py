@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-halctl — HAL control-plane CLI for the live hive (Phase 9.1)
+halctl — HAL control-plane CLI for the live swarm (Phase 9.1)
 
 Talks to queue.db directly (HAL-local; HAL is the single writer/clock source).
 This is what you use from HAL's interactive session while workers run in the

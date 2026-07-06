@@ -1,4 +1,4 @@
-# HAL Hive — live task queue
+# HAL Swarm — live task queue
 
 Pull-persistent SQLite task queue that dispatches Copilot CLI coding tasks to
 distributed workers (mini-HALs) and merges results into `lab.git`. HAL's session
@@ -20,7 +20,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `halctl.py` | control CLI: `add` / `status` / `cancel` / `prio` / `classify` |
 | `hive_caps.py` | capability vocabulary — `probe_caps()` (worker) + `classify_prompt()` (intake) |
 | `classifier_rules.d/` | external classifier rule packs (product-specific `requires` rules; ships `activeroles.json`) |
-| `gen-lab-ca.sh` | mint the lab CA + hive server cert (TLS, issue #8) |
+| `gen-lab-ca.sh` | mint the lab CA + swarm server cert (TLS, issue #8) |
 | `trust-lab-ca.ps1` | trust the lab CA on a Windows worker (ar1) |
 | `dispatch_dag.py` | legacy synchronous DAG dispatcher (kept, not the live path) |
 | `winrm_run.py` / `winrm_push.py` | ar1 (Windows) WinRM helpers |
