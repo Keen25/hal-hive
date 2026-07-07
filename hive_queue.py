@@ -47,7 +47,7 @@ REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Max length of the human-readable task summary shown on the dashboard/CLI in
 # place of the full prompt. Kept short so it fits one table cell / status line.
@@ -143,7 +143,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     verified      INTEGER,                      -- worker-side verify (Sc1 #10): NULL=not run, 0=failed, 1=passed
     verified_base TEXT,                         -- base_ref sha the worker verified against (drift check)
     error         TEXT,
-    usage_json    TEXT                          -- JSON blob of copilot usage (premiumRequests, durations, codeChanges)
+    usage_json    TEXT,                         -- JSON blob of copilot usage (premiumRequests, durations, codeChanges)
+    kind          TEXT NOT NULL DEFAULT 'work', -- 'work' (normal) | 'review' (peer-review task)
+    review_max    INTEGER NOT NULL DEFAULT 0,   -- author: max review rounds (0 = review disabled)
+    review_round  INTEGER NOT NULL DEFAULT 0,   -- author: how many review rounds have COMPLETED
+    review_of     TEXT,                         -- review task -> the author task id it reviews
+    review_exclude_worker TEXT                  -- review task -> worker_id that must NOT claim it (the author's worker)
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -230,6 +235,22 @@ def init_db(db_path: str = QUEUE_DB) -> None:
             cur.execute('ALTER TABLE workers ADD COLUMN hostname TEXT')
         if 'python_exe' not in wcols:
             cur.execute('ALTER TABLE workers ADD COLUMN python_exe TEXT')
+        # Migration v11 -> v12: opt-in automated peer-review loop. An author task
+        # with review_max>0 enters 'awaiting_review' on success and a separate
+        # 'review' task (claimed by a DIFFERENT worker via review_exclude_worker
+        # anti-affinity) emits a verdict that either promotes the author to 'done'
+        # or bounces it back to 'pending' with the findings appended. Defaults keep
+        # existing tasks untouched (kind='work', review_max=0 = review disabled).
+        if 'kind' not in cols:
+            cur.execute("ALTER TABLE tasks ADD COLUMN kind TEXT NOT NULL DEFAULT 'work'")
+        if 'review_max' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN review_max INTEGER NOT NULL DEFAULT 0')
+        if 'review_round' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN review_round INTEGER NOT NULL DEFAULT 0')
+        if 'review_of' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN review_of TEXT')
+        if 'review_exclude_worker' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN review_exclude_worker TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -311,6 +332,10 @@ def add_task(
     deps: Optional[list[str]] = None,
     max_attempts: int = 3,
     summary: Optional[str] = None,
+    review_max: int = 0,
+    kind: str = 'work',
+    review_of: Optional[str] = None,
+    review_exclude_worker: Optional[str] = None,
     db_path: str = QUEUE_DB,
 ) -> None:
     """Insert a task (+ its dependency edges) into the queue.
@@ -326,6 +351,12 @@ def add_task(
     `summary` is a short (<=128 char) human label shown on the dashboard/CLI in
     place of the full prompt. When omitted it is auto-derived from the prompt so
     the field is always populated.
+
+    `review_max` (>0) opts the task into the automated peer-review loop: on
+    success it enters 'awaiting_review' and a separate `kind='review'` task is
+    spawned for a different worker. `kind`/`review_of`/`review_exclude_worker`
+    are set by spawn_review when it creates the review task; callers queueing
+    normal work leave them at their defaults.
     """
     if model is None and complexity is not None:
         from hive_caps import model_for_complexity
@@ -339,10 +370,12 @@ def add_task(
         cur.execute(
             """INSERT INTO tasks
                  (id, branch, base_ref, prompt, summary, worker, requires, scope,
-                  priority, complexity, model, max_attempts)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  priority, complexity, model, max_attempts,
+                  review_max, kind, review_of, review_exclude_worker)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, branch, base_ref, prompt, summary, worker, canon_tags(requires),
-             scope, priority, complexity, model, max_attempts),
+             scope, priority, complexity, model, max_attempts,
+             review_max, kind, review_of, review_exclude_worker),
         )
         for dep in (deps or []):
             cur.execute(
@@ -363,6 +396,8 @@ class ClaimedTask:
     attempts: int
     model: Optional[str] = None
     lease_token: Optional[str] = None
+    kind: str = 'work'
+    review_of: Optional[str] = None
 
 
 def claim_next(worker_id: str, worker_lane: Optional[str] = None,
@@ -401,11 +436,14 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
         rows = conn.execute(
             """
             SELECT t.id, t.branch, t.base_ref, t.prompt, t.scope, t.attempts,
-                   t.requires, t.model
+                   t.requires, t.model, t.kind, t.review_of
             FROM tasks t
             WHERE t.status = 'pending'
               AND (t.not_before IS NULL OR t.not_before <= datetime('now'))
               AND (t.worker IS NULL OR t.worker = :lane)
+              AND (t.kind != 'review'
+                   OR t.review_exclude_worker IS NULL
+                   OR t.review_exclude_worker != :wid)
               AND NOT EXISTS (
                     SELECT 1 FROM task_deps d
                     JOIN tasks dep ON dep.id = d.depends_on
@@ -419,7 +457,7 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
             -- priority, oldest-created wins (a retried task keeps its slot).
             ORDER BY t.priority ASC, t.created_at ASC
             """,
-            {'lane': worker_lane},
+            {'lane': worker_lane, 'wid': worker_id},
         ).fetchall()
 
         # Pick the first candidate whose capability requirements this worker meets.
@@ -450,6 +488,7 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
             prompt=chosen['prompt'], scope=chosen['scope'],
             attempts=chosen['attempts'] + 1, model=chosen['model'],
             lease_token=lease_token,
+            kind=chosen['kind'], review_of=chosen['review_of'],
         )
     except Exception:
         conn.execute('ROLLBACK;')
@@ -527,10 +566,64 @@ def complete_task(
     guard = "worker_id=? AND status IN ('claimed','running') AND (? IS NULL OR lease_token=?)"
     with cursor(db_path) as cur:
         row = cur.execute(
-            'SELECT attempts, max_attempts FROM tasks WHERE id=?', (task_id,)
+            'SELECT attempts, max_attempts, kind, review_max, review_round '
+            'FROM tasks WHERE id=?', (task_id,)
         ).fetchone()
         if row is None:
             raise KeyError(f'unknown task {task_id}')
+
+        # A 'review' task never merges: the worker posts its verdict to the
+        # /review endpoint (which closes it server-side to 'reviewed'). If a
+        # /complete ever lands for one, close it to the terminal 'reviewed'
+        # state — never 'done', so merge_once (status='done' only) ignores it.
+        if success and row['kind'] == 'review':
+            cur.execute(
+                f"""UPDATE tasks
+                   SET status='reviewed', done_at=datetime('now'),
+                       exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
+                       log_tail=?, error=NULL,
+                       usage_json=COALESCE(?, usage_json),
+                       lease_expires=NULL, heartbeat_at=NULL
+                   WHERE id=? AND {guard}""",
+                (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
+                 usage_json, task_id, worker_id, lease_token, lease_token),
+            )
+            if cur.rowcount == 0:
+                log.warning('ignored stale/late review-complete for %s by %s',
+                            task_id, worker_id)
+                return 'stale'
+            return 'reviewed'
+
+        # A review-enabled author task does NOT go straight to 'done' on success:
+        # it enters 'awaiting_review' (invisible to merge_once) and spawns a
+        # review task for a different worker. Only once approved does it flip to
+        # 'done' (see apply_review_verdict). review_max=0 keeps existing behavior.
+        if success and row['kind'] == 'work' \
+                and row['review_max'] > 0 and row['review_round'] < row['review_max']:
+            cur.execute(
+                f"""UPDATE tasks
+                   SET status='awaiting_review', done_at=datetime('now'),
+                       exit_code=?, commit_hash=?, turns=?, cost_pr=?, log_path=?,
+                       log_tail=?, verified=?, verified_base=?,
+                       error=NULL,
+                       usage_json=COALESCE(?, usage_json),
+                       lease_expires=NULL, heartbeat_at=NULL
+                   WHERE id=? AND {guard}""",
+                (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
+                 (None if verified is None else int(bool(verified))), verified_base,
+                 usage_json,
+                 task_id, worker_id, lease_token, lease_token),
+            )
+            if cur.rowcount == 0:
+                log.warning('ignored stale/late success for %s by %s', task_id, worker_id)
+                return 'stale'
+            # Spawn the review task AFTER the author row is committed by the
+            # `cursor` context manager exit, so the reviewer never reads a
+            # half-written author row. We do it just below, outside the txn.
+            _pending_review_author = task_id
+            cur.connection.commit()
+            spawn_review(_pending_review_author, db_path=db_path)
+            return 'awaiting_review'
 
         if success:
             cur.execute(
@@ -583,6 +676,155 @@ def complete_task(
              task_id, worker_id, lease_token, lease_token),
         )
         return 'pending' if cur.rowcount else 'stale'
+
+
+# ── Peer-review loop (opt-in; slots at the done→merge_once boundary) ───────────
+
+_REVIEW_PROMPT_TEMPLATE = """\
+You are a CODE REVIEWER for the HAL hive. Review the work on branch {branch} produced for the task below. Do NOT push or merge anything.
+Steps: clone lab.git (the worker already put you in a lab.git clone as CWD, or clone http://127.0.0.1:8418/lab.git with the auth header the worker injects), `git checkout {branch}`, and `git diff {base_ref}...{branch}` to see the change. Assess it strictly against the ORIGINAL requirements. Run any fast tests you can. Judge: does it fully and correctly satisfy the task, with no bugs/regressions?
+ORIGINAL TASK REQUIREMENTS:
+---
+{author_prompt}
+---
+OUTPUT CONTRACT (mandatory): write a file named HIVE_REVIEW_VERDICT.json in your current working directory with EXACTLY this shape:
+  {{"verdict": "APPROVE" | "REQUEST_CHANGES", "findings": "<concise, specific, actionable review notes; empty string if APPROVE>"}}
+APPROVE only if the work is correct and complete. If anything is missing, wrong, or risky, use REQUEST_CHANGES and list precisely what must change. Do not merge, do not edit the branch.
+"""
+
+
+def spawn_review(author_id: str, db_path: str = QUEUE_DB) -> str:
+    """Create a `kind='review'` task for the author task `author_id`.
+
+    Reads the author row (prompt/branch/base_ref/worker_id/review_round), builds
+    a review-task id `<author>-rev<n>`, composes the review prompt embedding the
+    ORIGINAL requirements, and inserts it via add_task with anti-affinity
+    (review_exclude_worker = the author's worker) so the author's own worker can
+    never claim it. The review task carries NO build requires and NO lane pin —
+    reviewing reads a diff and needs no build toolchain, so any idle worker
+    except the author may take it. Returns the review-task id.
+    """
+    with cursor(db_path) as cur:
+        row = cur.execute(
+            """SELECT prompt, branch, base_ref, worker_id, review_round,
+                      priority, complexity, model
+               FROM tasks WHERE id=?""",
+            (author_id,),
+        ).fetchone()
+    if row is None:
+        raise KeyError(f'unknown author task {author_id}')
+
+    review_id = f'{author_id}-rev{row["review_round"] + 1}'
+    review_prompt = _REVIEW_PROMPT_TEMPLATE.format(
+        branch=row['branch'], base_ref=row['base_ref'],
+        author_prompt=row['prompt'],
+    )
+    # Reviewing is a reasoning task: keep it at least sonnet (complexity 2) so a
+    # cheap-model author task still gets a capable reviewer.
+    complexity = row['complexity']
+    model = row['model']
+    if complexity is None or complexity < 2:
+        complexity = 2
+        try:
+            from hive_caps import model_for_complexity
+            model = model_for_complexity(complexity)
+        except Exception:
+            model = model or None
+
+    add_task(
+        review_id, review_prompt,
+        base_ref=row['base_ref'],
+        priority=row['priority'],
+        complexity=complexity, model=model,
+        kind='review',
+        review_of=author_id,
+        review_exclude_worker=row['worker_id'],
+        db_path=db_path,
+    )
+    log.info('spawned review %s for author %s (excludes worker %s)',
+             review_id, author_id, row['worker_id'])
+    return review_id
+
+
+def apply_review_verdict(author_id: str, verdict: str, findings: str,
+                         review_task_id: str, db_path: str = QUEUE_DB) -> str:
+    """Apply a reviewer's verdict to an author task in 'awaiting_review'.
+
+    Fail-safe: any verdict string that is not EXACTLY 'APPROVE' is treated as
+    'REQUEST_CHANGES' — a malformed/garbled verdict never auto-approves.
+
+    Returns one of: 'stale' (author missing or not awaiting_review),
+    'approved', 'rework' (bounced to pending for another round), or
+    'exhausted' (round cap reached -> needs_attention).
+    """
+    findings = findings or ''
+    approve = (verdict == 'APPROVE')
+    with cursor(db_path) as cur:
+        row = cur.execute(
+            'SELECT status, review_round, review_max FROM tasks WHERE id=?',
+            (author_id,),
+        ).fetchone()
+        # Guard: only act on an author actually awaiting review. Protects against
+        # duplicate/late verdict posts.
+        if row is None or row['status'] != 'awaiting_review':
+            log.warning('stale review verdict for %s (status=%s)',
+                        author_id, row['status'] if row else 'missing')
+            return 'stale'
+
+        new_round = row['review_round'] + 1
+        # Close the review task to the terminal 'reviewed' state (never 'done',
+        # so merge_once ignores it). Idempotent if already closed.
+        cur.execute(
+            """UPDATE tasks SET status='reviewed', done_at=datetime('now'),
+                   lease_expires=NULL, heartbeat_at=NULL
+               WHERE id=?""",
+            (review_task_id,),
+        )
+
+        if approve:
+            cur.execute(
+                """UPDATE tasks
+                   SET status='done', review_round=?, done_at=datetime('now'),
+                       worker_id=NULL, lease_expires=NULL, heartbeat_at=NULL,
+                       error=NULL
+                   WHERE id=?""",
+                (new_round, author_id),
+            )
+            log.info('review APPROVED %s (round %d) -> done', author_id, new_round)
+            return 'approved'
+
+        # REQUEST_CHANGES
+        if new_round < row['review_max']:
+            feedback = (f'\n\n## Review feedback (round {new_round})\n'
+                        f'Address the following on the SAME branch, then it will '
+                        f'be re-reviewed:\n{findings}\n')
+            cur.execute(
+                """UPDATE tasks
+                   SET status='pending', review_round=?,
+                       prompt = prompt || ?,
+                       worker_id=NULL, lease_expires=NULL, heartbeat_at=NULL,
+                       not_before=NULL
+                   WHERE id=?""",
+                (new_round, feedback, author_id),
+            )
+            log.info('review REQUEST_CHANGES %s (round %d/%d) -> pending rework',
+                     author_id, new_round, row['review_max'])
+            return 'rework'
+
+        # Round cap reached: park for a human with the findings in `error`.
+        cur.execute(
+            """UPDATE tasks
+               SET status='needs_attention', review_round=?,
+                   worker_id=NULL, lease_expires=NULL, heartbeat_at=NULL,
+                   error=?
+               WHERE id=?""",
+            (new_round,
+             f'review round cap ({row["review_max"]}) reached; last findings:\n{findings}',
+             author_id),
+        )
+        log.warning('review REQUEST_CHANGES %s at cap (%d) -> needs_attention',
+                    author_id, row['review_max'])
+        return 'exhausted'
 
 
 # ── Reaper (fixes C3) ─────────────────────────────────────────────────────────
@@ -1112,7 +1354,7 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         rows = [dict(r) for r in cur.execute(
             """SELECT id, status, worker_id, worker, requires, priority,
                       complexity, model, branch, commit_hash, error, prompt, summary,
-                      created_at, done_at, usage_json
+                      created_at, done_at, usage_json, kind, review_of, review_round
                FROM tasks ORDER BY
                  CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
                              WHEN 'pending' THEN 2 ELSE 3 END,

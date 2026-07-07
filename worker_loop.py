@@ -238,6 +238,18 @@ class QueueClient:
         r.raise_for_status()
         return r.json().get('status')
 
+    def post_review(self, author_id: str, verdict: str, findings: str,
+                    review_task_id: str) -> str:
+        """POST a reviewer verdict to the author task. The server closes the
+        review task (to 'reviewed') itself, so the worker never calls /complete
+        for a review task."""
+        r = requests.post(f'{self.base}/task/{author_id}/review',
+                          json={'verdict': verdict, 'findings': findings,
+                                'review_task_id': review_task_id},
+                          headers=self.h, timeout=30)
+        r.raise_for_status()
+        return r.json().get('result')
+
 
 # ── Heartbeat thread ──────────────────────────────────────────────────────────
 
@@ -404,6 +416,102 @@ def _nuget_config_targets() -> list[str]:
         return [os.path.join(cfg_dir, 'NuGet.Config')]
     home = os.path.expanduser('~')
     return [os.path.join(home, '.nuget', 'NuGet', 'NuGet.Config')]
+
+
+def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
+    """Run a peer-review task: clone lab.git, checkout the AUTHOR branch, run
+    copilot with the review prompt (read-only intent — the prompt forbids
+    push/edit), then parse HIVE_REVIEW_VERDICT.json from the workspace.
+
+    Returns {'verdict', 'findings', 'exit_code', 'log_path'}. If the verdict file
+    is missing/unparseable, fails safe to REQUEST_CHANGES (never auto-approves).
+    Does NOT commit or push — reviewing only reads the diff.
+    """
+    branch, base_ref, tid = task['branch'], task['base_ref'], task['id']
+    run_dir = tempfile.mkdtemp(prefix=f'{tid}-', dir=WORK_DIR)
+    log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl', dir=WORK_DIR)
+    os.close(log_fd)
+    prompt_fd, prompt_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.prompt', dir=WORK_DIR)
+    with os.fdopen(prompt_fd, 'w', encoding='utf-8') as pf:
+        pf.write(task['prompt'])
+
+    auth = _git_auth_args()
+
+    def g(*a, cwd=run_dir):
+        return subprocess.run(['git', *auth, *a], cwd=cwd, capture_output=True, text=True)
+
+    fail_safe = {'verdict': 'REQUEST_CHANGES',
+                 'findings': 'reviewer produced no parseable verdict; failing safe (no auto-approve)',
+                 'log_path': log_path}
+    try:
+        clone_filter = os.environ.get('HIVE_CLONE_FILTER', 'blob:none').strip()
+        clone_args = ['clone']
+        if clone_filter:
+            clone_args.append(f'--filter={clone_filter}')
+        clone_args += [lab_git, run_dir]
+        cl = subprocess.run(['git', *auth, *clone_args], capture_output=True, text=True)
+        if cl.returncode != 0:
+            fail_safe['findings'] = f'review clone failed: {cl.stderr.strip()}'
+            fail_safe['exit_code'] = 1
+            return fail_safe
+
+        # Check out the author branch so copilot reviews the actual change.
+        co = g('checkout', branch)
+        if co.returncode != 0:
+            # Fall back to fetching the branch explicitly (blobless clone may not
+            # have it as a local ref yet).
+            g('fetch', 'origin', branch)
+            co = g('checkout', branch)
+        if co.returncode != 0:
+            fail_safe['findings'] = f'could not checkout review branch {branch}: {co.stderr.strip()}'
+            fail_safe['exit_code'] = 1
+            return fail_safe
+
+        with open(log_path, 'w') as logf:
+            proc = subprocess.run(
+                _copilot_argv(f'@{prompt_path}', model=task.get('model')),
+                cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT,
+                timeout=COPILOT_TIMEOUT_S, text=True,
+            )
+
+        verdict, findings = _read_review_verdict(run_dir)
+        return {'verdict': verdict, 'findings': findings,
+                'exit_code': proc.returncode, 'log_path': log_path}
+    except subprocess.TimeoutExpired:
+        fail_safe['findings'] = 'reviewer timed out; failing safe (no auto-approve)'
+        fail_safe['exit_code'] = 124
+        return fail_safe
+    except Exception as e:
+        fail_safe['findings'] = f'reviewer error: {e}; failing safe (no auto-approve)'
+        fail_safe['exit_code'] = 1
+        return fail_safe
+    finally:
+        try:
+            os.remove(prompt_path)
+        except OSError:
+            pass
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _read_review_verdict(run_dir: str) -> tuple[str, str]:
+    """Read HIVE_REVIEW_VERDICT.json from the reviewer workspace. Returns
+    (verdict, findings). Fails safe to REQUEST_CHANGES on any problem so a
+    missing/garbled verdict can never auto-approve a branch."""
+    path = os.path.join(run_dir, 'HIVE_REVIEW_VERDICT.json')
+    safe = ('REQUEST_CHANGES',
+            'reviewer produced no parseable verdict; failing safe (no auto-approve)')
+    if not os.path.exists(path):
+        return safe
+    try:
+        with open(path, encoding='utf-8') as f:
+            obj = json.load(f)
+        verdict = obj.get('verdict')
+        findings = obj.get('findings', '') or ''
+        if verdict not in ('APPROVE', 'REQUEST_CHANGES'):
+            return safe
+        return verdict, findings
+    except Exception:
+        return safe
 
 
 def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
@@ -656,8 +764,38 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
 
         tid = task['id']
         ltok = task.get('lease_token')
-        log.info('worker %s claimed %s (attempt %s)', worker_id, tid, task['attempts'])
+        kind = task.get('kind', 'work')
+        log.info('worker %s claimed %s (kind=%s attempt %s)',
+                 worker_id, tid, kind, task['attempts'])
         t0 = time.time()
+
+        if kind == 'review':
+            with Heartbeat(client, tid, worker_id, ltok) as hb:
+                result = run_review_task(task, worker_id, lab_git)
+                if hb.abandon.is_set():
+                    log.warning('worker %s: %s abandoned (reaped); not reporting',
+                                worker_id, tid)
+                    continue
+            # Ship nothing through /complete: the /review endpoint closes the
+            # review task server-side. Clean up the worker-local log.
+            log_path = result.get('log_path')
+            if log_path and os.path.exists(log_path):
+                try:
+                    os.remove(log_path)
+                except OSError:
+                    pass
+            try:
+                res = client.post_review(task.get('review_of'), result['verdict'],
+                                         result.get('findings', ''), tid)
+            except Exception as e:
+                log.warning('worker %s: failed to post review verdict for %s: %s',
+                            worker_id, tid, e)
+                res = 'post-failed'
+            dt = time.time() - t0
+            log.info('worker %s: review %s -> verdict=%s result=%s (%.1fs)',
+                     worker_id, tid, result['verdict'], res, dt)
+            continue
+
         with Heartbeat(client, tid, worker_id, ltok) as hb:
             result = run_task(task, worker_id, lab_git)
             if hb.abandon.is_set():
