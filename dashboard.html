@@ -63,10 +63,15 @@
   .b-claimed{background:rgba(88,166,255,.10);color:var(--accent);}
   .b-pending{background:rgba(139,148,158,.15);color:var(--pend);}
   .b-done,.b-verifying{background:rgba(210,153,34,.15);color:var(--warn);}
+  .b-awaiting_review{background:rgba(163,113,247,.22);color:#d2a8ff;}
+  .b-reviewed{background:rgba(63,185,80,.10);color:var(--merge);}
   .b-merged{background:rgba(63,185,80,.15);color:var(--merge);}
   .b-needs_attention{background:rgba(210,153,34,.20);color:var(--warn);}
   .b-dead,.b-cancelled{background:rgba(248,81,73,.15);color:var(--bad);}
   .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .rtag { display:inline-block; margin-left:6px; padding:0 6px; border-radius:8px;
+          font-size:10px; font-weight:600; background:rgba(163,113,247,.18);
+          color:#d2a8ff; vertical-align:middle; }
   .muted { color:var(--muted); }
   td.link .tid { cursor:pointer; color:var(--accent,#4ea1ff); text-decoration:underline dotted; }
   td.link .tid:hover { text-decoration:underline; }
@@ -147,7 +152,7 @@
           <th>Worker</th><th>Model</th>
           <th class="sortable" data-sort="priority">Prio<span class="arw"></span></th>
           <th>Requires</th><th>Branch</th>
-          <th title="Premium requests consumed by this task">PR</th>
+          <th title="Total Copilot API time for this task">API</th>
           <th class="sortable" data-sort="time">Time<span class="arw"></span></th>
           <th></th></tr></thead>
         <tbody id="taskbody"><tr><td class="empty" colspan="11">loading…</td></tr></tbody>
@@ -230,7 +235,7 @@ const H = { 'Authorization': 'Bearer ' + RO_TOKEN };
 // it once; it lives only in this browser tab's sessionStorage.
 function ctlToken(){ return sessionStorage.getItem('hive_ctl') || ''; }
 function ctlHeaders(){ return {'Authorization':'Bearer '+ctlToken(),'Content-Type':'application/json'}; }
-const ORDER = ['running','claimed','pending','done','verifying','needs_attention','merged','cancelled','dead'];
+const ORDER = ['running','claimed','pending','done','verifying','awaiting_review','needs_attention','reviewed','merged','cancelled','dead'];
 const STATUS_RANK = Object.fromEntries(ORDER.map((s,i)=>[s,i]));
 // Sort state for the task table. Default: newest-first by time (current -> older).
 const SORT = { key:'time', dir:-1 };   // dir: 1 asc, -1 desc
@@ -307,8 +312,12 @@ function render(d){
   const ut = d.usage_totals||{};
   const utEl = document.getElementById('usage_total');
   if(utEl){
-    const pr = ut.premiumRequests;
-    utEl.textContent = (pr!=null && pr>0) ? ('Σ premium: '+pr.toFixed(2)) : '';
+    const apiMs = ut.totalApiDurationMs;
+    const la = ut.linesAdded, lr = ut.linesRemoved;
+    const parts = [];
+    if(apiMs!=null && apiMs>0) parts.push('Σ API '+(apiMs/1000).toFixed(0)+'s');
+    if((la||0)+(lr||0)>0) parts.push('Σ lines +'+(la||0)+'/-'+(lr||0));
+    utEl.textContent = parts.join('  ·  ');
   }
   // cards
   const cards = document.getElementById('cards'); cards.innerHTML='';
@@ -337,6 +346,10 @@ function render(d){
     tr.appendChild(cell(t.title||'—','title'));
     const sc=document.createElement('td');
     sc.appendChild(el('span','badge b-'+t.status,t.status.replace('_',' ')));
+    // Peer-review linkage: a review task shows what it reviews; an author task
+    // awaiting review shows its spawned review task id.
+    if(t.review_of){ sc.appendChild(el('span','rtag','review of '+t.review_of)); }
+    else if(t.status==='awaiting_review'){ sc.appendChild(el('span','rtag','rev '+t.id+'-rev'+((t.review_round||0)+1))); }
     if(t.error){ const e=el('div','err',t.error); sc.appendChild(e);} tr.appendChild(sc);
     tr.appendChild(cell(t.worker_id || t.worker || '—', 'muted'));
     tr.appendChild(cell(modelLabel(t), 'muted'));
@@ -344,9 +357,9 @@ function render(d){
     tr.appendChild(cell((t.requires&&t.requires.length)?
       (Array.isArray(t.requires)?t.requires.join(' '):t.requires):'—','muted'));
     tr.appendChild(cell(t.branch||'—','mono muted'));
-    // PR (premium requests) cell
-    const pr = t.usage && t.usage.premiumRequests != null ? t.usage.premiumRequests.toFixed(2) : '—';
-    tr.appendChild(cell(pr, 'muted'));
+    // API-time cell (reliable per-task metric; premiumRequests is a CLI constant)
+    const apiMs = t.usage && t.usage.totalApiDurationMs != null ? t.usage.totalApiDurationMs : null;
+    tr.appendChild(cell(apiMs != null ? (apiMs/1000).toFixed(1)+'s' : '—', 'muted'));
     tr.appendChild(timeCell(t));
     const ac=document.createElement('td');
     const lb=el('button','btn','log'); lb.onclick=()=>viewLog(t.id); ac.appendChild(lb);
@@ -367,12 +380,34 @@ function render(d){
       let dc='wdot'; if(!online){dc+=' off';} else if(!busy){dc+=' idle';}
       row.appendChild(el('span',dc));
       row.appendChild(el('span','mono',w.worker_id));
+      // code version badge (⚠ if it differs from the server's advertised version)
+      if(w.code_version!=null){
+        const stale = d.code_version!=null && w.code_version!==d.code_version;
+        const vb=el('span','mono', 'v'+w.code_version+(stale?'⚠':''));
+        vb.style.cssText='font-size:10px;padding:0 4px;border-radius:3px;'+
+          (stale?'background:#5a3;color:#fe9':'background:#234;color:#8cf');
+        if(w.update_to!=null) vb.title='update queued -> v'+w.update_to;
+        else if(stale) vb.title='newer code available (v'+d.code_version+')';
+        row.appendChild(vb);
+      }
       let detail;
       if(!online) detail='· offline · '+fmtAge(w.age_s);
       else if(busy) detail='· '+(w.current_task||'busy');
       else detail='· idle';
       row.appendChild(el('span','muted',detail));
-      if(w.lane) row.appendChild(el('span','wcaps',w.lane));
+      // Compact quirks inline: os value + build tools only. Full caps + host +
+      // install dir + python live in the hover tooltip (avoids a 4-line dump).
+      const caps=(w.caps||'').split(/\s+/).filter(Boolean);
+      const osv=(caps.find(t=>t.startsWith('os:'))||'').slice(3);
+      const builds=caps.filter(t=>t.startsWith('build:')).map(t=>t.slice(6));
+      const compact=[osv, builds.join(',')].filter(Boolean).join(' · ');
+      const wc=el('span','wcaps', compact || (w.lane||''));
+      const tip=[w.hostname&&('host: '+w.hostname), w.host&&('addr: '+w.host),
+                 w.install_dir&&('install: '+w.install_dir),
+                 w.python_exe&&('py: '+w.python_exe),
+                 caps.length&&('caps: '+caps.sort().join(' '))].filter(Boolean).join('\n');
+      if(tip) wc.title=tip;
+      row.appendChild(wc);
       const rb=el('button','btn','✕'); rb.title='Remove from registry';
       rb.style.cssText='font-size:10px;padding:1px 5px;margin-left:6px;opacity:.6';
       rb.onclick=()=>removeWorker(w.worker_id);
@@ -543,6 +578,9 @@ async function openTask(id){
     meta.appendChild(tdRow('Requires', Array.isArray(t.requires)?t.requires.join(', '):(t.requires||'—'), true));
     meta.appendChild(tdRow('Deps', Array.isArray(t.deps)&&t.deps.length?t.deps.join(', '):'—', true));
     meta.appendChild(tdRow('Branch', t.branch||'—', true));
+    if(t.kind && t.kind!=='work'){ meta.appendChild(tdRow('Kind', t.kind, true)); }
+    if(t.review_of){ meta.appendChild(tdRow('Review of', t.review_of, true)); }
+    if(t.review_max){ meta.appendChild(tdRow('Review', 'round '+(t.review_round||0)+' / '+t.review_max)); }
     meta.appendChild(tdRow('Commit', t.commit_hash||'—', true));
     meta.appendChild(tdRow('Published', fmtTs(t.created_at)));
     meta.appendChild(tdRow('Claimed', fmtTs(t.claimed_at)));
@@ -560,8 +598,9 @@ async function openTask(id){
     body.appendChild(el('h3','td-h','Usage'));
     const u = t.usage;
     const uGrid = el('div','td-grid');
-    if(u && u.premiumRequests!=null){
-      uGrid.appendChild(tdRow('Premium requests', u.premiumRequests.toFixed(2)));
+    const hasUsage = u && (u.totalApiDurationMs!=null || u.sessionDurationMs!=null ||
+                           u.linesAdded!=null || u.linesRemoved!=null);
+    if(hasUsage){
       const apiMs = u.totalApiDurationMs;
       uGrid.appendChild(tdRow('API duration', apiMs!=null ? (apiMs/1000).toFixed(1)+'s' : null));
       const sessMs = u.sessionDurationMs;

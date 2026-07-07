@@ -22,12 +22,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -36,8 +39,20 @@ import requests
 
 import hive_queue as q   # only used for LAB_GIT path + local git; DB via REST
 import hive_log
+try:
+    from hive_version import CODE_VERSION
+except Exception:        # pragma: no cover - hive_version is always co-deployed
+    CODE_VERSION = 0
 
 log = hive_log.get_logger('hive.worker')
+
+# Static self-reported identity — sent on every /claim so the registry always
+# knows WHERE each worker actually runs (the install dir), on which host, and
+# with which python. Prevents "pushed to the wrong copy" blips (e.g. a worker
+# running from D:\hive while an operator assumes C:\hive). Computed once.
+INSTALL_DIR = os.path.dirname(os.path.abspath(__file__))
+HOSTNAME    = socket.gethostname()
+PYTHON_EXE  = sys.executable or ''
 
 # How much of the worker copilot log to ship back to HAL on /complete (U2 #16).
 # The full JSONL can be large; the tail is what matters for failure triage.
@@ -164,18 +179,50 @@ def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
 # ── Queue client (REST) ───────────────────────────────────────────────────────
 
 class QueueClient:
+    # Latest self-update signal from the server, refreshed on every /claim
+    # (present on the 204 long-poll return too). None until the first claim.
+    server_code_version: int | None = None
+    update_to: int | None = None
+
     def __init__(self, base_url: str, token: str):
         self.base = base_url.rstrip('/')
         self.h = {'Authorization': f'Bearer {token}'}
 
     def claim(self, worker_id: str, lane: str | None, caps: list[str] | None = None):
         r = requests.post(f'{self.base}/claim',
-                          json={'worker_id': worker_id, 'lane': lane, 'caps': caps},
+                          json={'worker_id': worker_id, 'lane': lane, 'caps': caps,
+                                'code_version': CODE_VERSION,
+                                'install_dir': INSTALL_DIR, 'hostname': HOSTNAME,
+                                'python_exe': PYTHON_EXE},
                           headers=self.h, timeout=40)
+        # Refresh the self-update signal from response headers (present on both
+        # 200 and the empty 204 long-poll return).
+        self.server_code_version = self._int_header(r, 'X-Hive-Code-Version')
+        self.update_to = self._int_header(r, 'X-Hive-Update-To')
         if r.status_code == 204:
             return None
         r.raise_for_status()
         return r.json()
+
+    @staticmethod
+    def _int_header(resp, name: str) -> int | None:
+        raw = resp.headers.get(name)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def get_version(self) -> dict:
+        r = requests.get(f'{self.base}/version', headers=self.h, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def download(self, name: str) -> bytes:
+        r = requests.get(f'{self.base}/download/{name}', headers=self.h, timeout=60)
+        r.raise_for_status()
+        return r.content
 
     def heartbeat(self, task_id: str, worker_id: str,
                   lease_token: str | None = None) -> bool:
@@ -190,6 +237,21 @@ class QueueClient:
         r = requests.post(f'{self.base}/complete', json=kw, headers=self.h, timeout=30)
         r.raise_for_status()
         return r.json().get('status')
+
+    def post_review(self, author_id: str, verdict: str, findings: str,
+                    review_task_id: str, usage_json: str | None = None) -> str:
+        """POST a reviewer verdict to the author task. The server closes the
+        review task (to 'reviewed') itself, so the worker never calls /complete
+        for a review task. `usage_json` (best-effort) is stored on the review
+        task so reviewing workers appear in the usage rollup."""
+        body = {'verdict': verdict, 'findings': findings,
+                'review_task_id': review_task_id}
+        if usage_json is not None:
+            body['usage_json'] = usage_json
+        r = requests.post(f'{self.base}/task/{author_id}/review',
+                          json=body, headers=self.h, timeout=30)
+        r.raise_for_status()
+        return r.json().get('result')
 
 
 # ── Heartbeat thread ──────────────────────────────────────────────────────────
@@ -359,6 +421,116 @@ def _nuget_config_targets() -> list[str]:
     return [os.path.join(home, '.nuget', 'NuGet', 'NuGet.Config')]
 
 
+def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
+    """Run a peer-review task: clone lab.git, checkout the AUTHOR branch, run
+    copilot with the review prompt (read-only intent — the prompt forbids
+    push/edit), then parse HIVE_REVIEW_VERDICT.json from the workspace.
+
+    Returns {'verdict', 'findings', 'exit_code', 'log_path'}. If the verdict file
+    is missing/unparseable, fails safe to REQUEST_CHANGES (never auto-approves).
+    Does NOT commit or push — reviewing only reads the diff.
+    """
+    # A review task's OWN branch (feature/<review_id>) never exists in lab.git —
+    # the reviewer must check out the AUTHOR's branch under review, delivered as
+    # `review_branch` in the claim payload. Fall back to task['branch'] only if a
+    # server predating that field is in play.
+    branch = task.get('review_branch') or task['branch']
+    base_ref, tid = task['base_ref'], task['id']
+    run_dir = tempfile.mkdtemp(prefix=f'{tid}-', dir=WORK_DIR)
+    log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl', dir=WORK_DIR)
+    os.close(log_fd)
+    prompt_fd, prompt_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.prompt', dir=WORK_DIR)
+    with os.fdopen(prompt_fd, 'w', encoding='utf-8') as pf:
+        pf.write(task['prompt'])
+
+    auth = _git_auth_args()
+
+    def g(*a, cwd=run_dir):
+        return subprocess.run(['git', *auth, *a], cwd=cwd, capture_output=True, text=True)
+
+    fail_safe = {'verdict': 'REQUEST_CHANGES',
+                 'findings': 'reviewer produced no parseable verdict; failing safe (no auto-approve)',
+                 'log_path': log_path}
+    try:
+        clone_filter = os.environ.get('HIVE_CLONE_FILTER', 'blob:none').strip()
+        clone_args = ['clone']
+        if clone_filter:
+            clone_args.append(f'--filter={clone_filter}')
+        clone_args += [lab_git, run_dir]
+        cl = subprocess.run(['git', *auth, *clone_args], capture_output=True, text=True)
+        if cl.returncode != 0:
+            fail_safe['findings'] = f'review clone failed: {cl.stderr.strip()}'
+            fail_safe['exit_code'] = 1
+            return fail_safe
+
+        # Check out the author branch so copilot reviews the actual change.
+        co = g('checkout', branch)
+        if co.returncode != 0:
+            # Fall back to fetching the branch explicitly (blobless clone may not
+            # have it as a local ref yet).
+            g('fetch', 'origin', branch)
+            co = g('checkout', branch)
+        if co.returncode != 0:
+            fail_safe['findings'] = f'could not checkout review branch {branch}: {co.stderr.strip()}'
+            fail_safe['exit_code'] = 1
+            return fail_safe
+
+        with open(log_path, 'w') as logf:
+            proc = subprocess.run(
+                _copilot_argv(f'@{prompt_path}', model=task.get('model')),
+                cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT,
+                timeout=COPILOT_TIMEOUT_S, text=True,
+            )
+
+        verdict, findings = _read_review_verdict(run_dir)
+        out = {'verdict': verdict, 'findings': findings,
+               'exit_code': proc.returncode, 'log_path': log_path}
+        # Capture copilot billing usage for the review pass too, so reviewing
+        # workers show up in the usage rollup (not just authors).
+        try:
+            usage = _parse_usage_from_log(log_path)
+            if usage is not None:
+                out['usage_json'] = json.dumps(usage)
+        except Exception:
+            pass
+        return out
+    except subprocess.TimeoutExpired:
+        fail_safe['findings'] = 'reviewer timed out; failing safe (no auto-approve)'
+        fail_safe['exit_code'] = 124
+        return fail_safe
+    except Exception as e:
+        fail_safe['findings'] = f'reviewer error: {e}; failing safe (no auto-approve)'
+        fail_safe['exit_code'] = 1
+        return fail_safe
+    finally:
+        try:
+            os.remove(prompt_path)
+        except OSError:
+            pass
+        shutil.rmtree(run_dir, ignore_errors=True)
+
+
+def _read_review_verdict(run_dir: str) -> tuple[str, str]:
+    """Read HIVE_REVIEW_VERDICT.json from the reviewer workspace. Returns
+    (verdict, findings). Fails safe to REQUEST_CHANGES on any problem so a
+    missing/garbled verdict can never auto-approve a branch."""
+    path = os.path.join(run_dir, 'HIVE_REVIEW_VERDICT.json')
+    safe = ('REQUEST_CHANGES',
+            'reviewer produced no parseable verdict; failing safe (no auto-approve)')
+    if not os.path.exists(path):
+        return safe
+    try:
+        with open(path, encoding='utf-8') as f:
+            obj = json.load(f)
+        verdict = obj.get('verdict')
+        findings = obj.get('findings', '') or ''
+        if verdict not in ('APPROVE', 'REQUEST_CHANGES'):
+            return safe
+        return verdict, findings
+    except Exception:
+        return safe
+
+
 def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
     """
     Clone lab.git, branch, run copilot headless, commit, push. Returns dict with
@@ -501,13 +673,99 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
+# ── Version-driven self-update (worker-native; no copilot/LLM in the loop) ────
+
+UPDATE_EXIT_CODE = 42   # nonzero => WinSW onfailure / systemd Restart respawns us
+UPDATE_FILES = ('worker_loop.py', 'hive_caps.py', 'hive_queue.py',
+                'hive_log.py', 'hive_version.py')
+
+
+def _auto_update_enabled() -> bool:
+    return os.environ.get('HIVE_AUTO_UPDATE', '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _self_update(client: QueueClient, target: int, reason: str) -> None:
+    """Download -> verify (sha256) -> compile-check -> back up -> swap the worker
+    code, then exit nonzero so the service manager restarts us into it. Aborts
+    (returns) without touching disk on any integrity/compile failure, so a bad
+    push can never brick a worker on restart. Called ONLY when idle."""
+    hive_dir = os.path.dirname(os.path.abspath(__file__))
+    log.warning('self-update: v%s -> v%s (%s); fetching manifest',
+                CODE_VERSION, target, reason)
+    manifest = client.get_version()
+    files = manifest.get('files') or {}
+    server_ver = manifest.get('version')
+    if 'worker_loop.py' not in files:
+        log.error('self-update ABORT: manifest has no worker_loop.py'); return
+
+    staged: dict[str, bytes] = {}
+    for name, want in files.items():
+        if name not in UPDATE_FILES:
+            continue
+        data = client.download(name)
+        got = hashlib.sha256(data).hexdigest()
+        if got != want:
+            log.error('self-update ABORT: %s hash mismatch (want %s got %s)',
+                      name, want[:12], got[:12])
+            return
+        if name.endswith('.py'):
+            try:
+                compile(data, name, 'exec')
+            except SyntaxError as e:
+                log.error('self-update ABORT: %s does not compile: %s', name, e)
+                return
+        staged[name] = data
+
+    ts = time.strftime('%Y%m%d-%H%M%S')
+    for name, data in staged.items():
+        path = os.path.join(hive_dir, name)
+        if os.path.exists(path):
+            try:
+                shutil.copy2(path, f'{path}.bak-{ts}')
+            except OSError:
+                pass
+        with open(path, 'wb') as f:
+            f.write(data)
+    log.warning('self-update: swapped %d files -> v%s (backup .bak-%s); '
+                'exiting %d for service restart',
+                len(staged), server_ver, ts, UPDATE_EXIT_CODE)
+    logging_flush = getattr(hive_log, 'flush', None)
+    if callable(logging_flush):
+        logging_flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.exit(UPDATE_EXIT_CODE)
+
+
+def _maybe_self_update(client: QueueClient) -> None:
+    """Decide whether to self-update based on the last /claim's version signal.
+    mode A (command): update_to set and != our version -> update (even re-pin).
+    mode B (auto): HIVE_AUTO_UPDATE=1 and advertised version is newer -> update.
+    Exits the process on success; on failure logs and stays on the current code."""
+    cmd = client.update_to
+    srv = client.server_code_version
+    if cmd is not None and cmd != CODE_VERSION:
+        target, reason = cmd, 'commanded'
+    elif _auto_update_enabled() and srv is not None and srv > CODE_VERSION:
+        target, reason = srv, 'auto (version bump)'
+    else:
+        return
+    try:
+        _self_update(client, target, reason)
+    except SystemExit:
+        raise
+    except Exception as e:
+        log.error('self-update failed (staying on v%s): %s', CODE_VERSION, e)
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
          caps: list[str] | None = None):
     caps = caps or []
-    log.info('worker %s up: lane=%s caps=%s — polling %s',
-             worker_id, lane, sorted(caps), client.base)
+    log.info('worker %s up: lane=%s caps=%s code=v%s — polling %s',
+             worker_id, lane, sorted(caps), CODE_VERSION, client.base)
     while True:
         try:
             task = client.claim(worker_id, lane, caps)
@@ -517,12 +775,45 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
             continue
 
         if task is None:
+            # Idle: safe point to apply a pending self-update (never mid-task).
+            _maybe_self_update(client)
             continue  # long-poll already waited server-side
 
         tid = task['id']
         ltok = task.get('lease_token')
-        log.info('worker %s claimed %s (attempt %s)', worker_id, tid, task['attempts'])
+        kind = task.get('kind', 'work')
+        log.info('worker %s claimed %s (kind=%s attempt %s)',
+                 worker_id, tid, kind, task['attempts'])
         t0 = time.time()
+
+        if kind == 'review':
+            with Heartbeat(client, tid, worker_id, ltok) as hb:
+                result = run_review_task(task, worker_id, lab_git)
+                if hb.abandon.is_set():
+                    log.warning('worker %s: %s abandoned (reaped); not reporting',
+                                worker_id, tid)
+                    continue
+            # Ship nothing through /complete: the /review endpoint closes the
+            # review task server-side. Clean up the worker-local log.
+            log_path = result.get('log_path')
+            if log_path and os.path.exists(log_path):
+                try:
+                    os.remove(log_path)
+                except OSError:
+                    pass
+            try:
+                res = client.post_review(task.get('review_of'), result['verdict'],
+                                         result.get('findings', ''), tid,
+                                         usage_json=result.get('usage_json'))
+            except Exception as e:
+                log.warning('worker %s: failed to post review verdict for %s: %s',
+                            worker_id, tid, e)
+                res = 'post-failed'
+            dt = time.time() - t0
+            log.info('worker %s: review %s -> verdict=%s result=%s (%.1fs)',
+                     worker_id, tid, result['verdict'], res, dt)
+            continue
+
         with Heartbeat(client, tid, worker_id, ltok) as hb:
             result = run_task(task, worker_id, lab_git)
             if hb.abandon.is_set():
