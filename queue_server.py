@@ -419,6 +419,7 @@ def claim():
                 id=task.id, branch=task.branch, base_ref=task.base_ref,
                 prompt=task.prompt, scope=task.scope, attempts=task.attempts,
                 model=task.model, lease_token=task.lease_token,
+                kind=task.kind, review_of=task.review_of,
             )), 200
         if time.time() >= deadline:
             return _stamp(Response('', status=204))
@@ -468,6 +469,7 @@ def add():
             complexity=(int(b['complexity']) if b.get('complexity') is not None else None),
             model=b.get('model'),
             deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
+            review_max=int(b.get('review_max', 0)),
         )
     except KeyError as exc:
         return jsonify(error=f'missing required field: {exc.args[0]}'), 400
@@ -475,6 +477,26 @@ def add():
         # Duplicate task id (PK) or branch (UNIQUE) — a conflict, not a 500. (U4)
         return jsonify(error=f'task already exists (id or branch conflict): {exc}'), 409
     return jsonify(id=b['id']), 201
+
+
+@app.post('/task/<author_id>/review')
+def review_verdict(author_id):
+    """Apply a reviewer's verdict to an author task awaiting review.
+
+    Control-token gated (NOT in READONLY_PATHS, so the _guard before_request
+    already forces the control token — no auth change needed). The worker running
+    a `kind='review'` task POSTs its parsed HIVE_REVIEW_VERDICT.json here instead
+    of going through /complete; apply_review_verdict promotes the author to 'done'
+    (APPROVE), bounces it to 'pending' with the findings appended (REQUEST_CHANGES
+    under the round cap), or parks it as 'needs_attention' (at the cap)."""
+    b = request.get_json(silent=True) or {}
+    verdict = b.get('verdict')
+    review_task_id = b.get('review_task_id')
+    if not verdict or not review_task_id:
+        return jsonify(error='verdict and review_task_id required'), 400
+    result = q.apply_review_verdict(author_id, verdict, b.get('findings', ''),
+                                    review_task_id)
+    return jsonify(result=result, author=author_id), 200
 
 
 @app.post('/cancel')

@@ -26,7 +26,8 @@ import hive_queue as q
 
 _ICON = {
     'running': '▶', 'claimed': '◔', 'pending': '·', 'done': '✓',
-    'verifying': '⟳', 'merged': '●', 'needs_attention': '⚠', 'failed': '✗',
+    'verifying': '⟳', 'awaiting_review': '⧗', 'reviewed': '⊚',
+    'merged': '●', 'needs_attention': '⚠', 'failed': '✗',
     'dead': '☠', 'cancelled': '⊘',
 }
 
@@ -45,7 +46,8 @@ def cmd_add(a):
     q.add_task(tid, a.prompt, branch=a.branch, base_ref=a.base_ref,
                worker=a.worker, requires=a.require, scope=a.scope,
                priority=a.priority, complexity=complexity, model=model,
-               deps=a.dep, max_attempts=a.max_attempts, summary=a.summary)
+               deps=a.dep, max_attempts=a.max_attempts, summary=a.summary,
+               review_max=a.review)
     bits = [f'+ {tid}', f'prio={a.priority}',
             f'cx={complexity}/{model}{auto_note}',
             f'branch={a.branch or f"feature/{tid}"}']
@@ -55,6 +57,8 @@ def cmd_add(a):
         bits.append(f'requires={",".join(a.require)}')
     if a.dep:
         bits.append(f'deps={",".join(a.dep)}')
+    if a.review:
+        bits.append(f'review={a.review}')
     print('  '.join(bits))
     eff_summary = ' '.join(a.summary.split())[:q.SUMMARY_MAX] if a.summary \
         else q._task_title(a.prompt, q.SUMMARY_MAX)
@@ -83,7 +87,8 @@ def cmd_classify(a):
 def cmd_status(a):
     snap = q.status_snapshot()
     counts = snap['counts']
-    order = ['running', 'claimed', 'pending', 'done', 'verifying', 'merged',
+    order = ['running', 'claimed', 'pending', 'done', 'verifying',
+             'awaiting_review', 'reviewed', 'merged',
              'needs_attention', 'dead', 'cancelled']
     summary = '  '.join(f'{_ICON.get(s,"?")} {s}:{counts[s]}'
                         for s in order if s in counts)
@@ -224,6 +229,9 @@ def main():
                          '(default: auto)')
     pa.add_argument('--dep', action='append', help='dependency task id (repeatable)')
     pa.add_argument('--max-attempts', type=int, default=3)
+    pa.add_argument('--review', type=int, default=0, metavar='N',
+                    help='spawn N rounds of automated peer review before merge '
+                         '(0 = disabled, default)')
     pa.set_defaults(fn=cmd_add)
 
     ps = sub.add_parser('status', help='fleet snapshot')
