@@ -398,6 +398,7 @@ class ClaimedTask:
     lease_token: Optional[str] = None
     kind: str = 'work'
     review_of: Optional[str] = None
+    review_branch: Optional[str] = None
 
 
 def claim_next(worker_id: str, worker_lane: Optional[str] = None,
@@ -436,7 +437,8 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
         rows = conn.execute(
             """
             SELECT t.id, t.branch, t.base_ref, t.prompt, t.scope, t.attempts,
-                   t.requires, t.model, t.kind, t.review_of
+                   t.requires, t.model, t.kind, t.review_of,
+                   (SELECT a.branch FROM tasks a WHERE a.id = t.review_of) AS review_branch
             FROM tasks t
             WHERE t.status = 'pending'
               AND (t.not_before IS NULL OR t.not_before <= datetime('now'))
@@ -489,6 +491,7 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
             attempts=chosen['attempts'] + 1, model=chosen['model'],
             lease_token=lease_token,
             kind=chosen['kind'], review_of=chosen['review_of'],
+            review_branch=chosen['review_branch'],
         )
     except Exception:
         conn.execute('ROLLBACK;')

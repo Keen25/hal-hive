@@ -17,4 +17,4 @@ Self-update is worker-native daemon code (no copilot/LLM in the loop), so it is
 NOT subject to the agent safety model that blocks in-band task-driven upgrades.
 """
 
-CODE_VERSION = 3
+CODE_VERSION = 4

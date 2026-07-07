@@ -427,7 +427,12 @@ def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
     is missing/unparseable, fails safe to REQUEST_CHANGES (never auto-approves).
     Does NOT commit or push — reviewing only reads the diff.
     """
-    branch, base_ref, tid = task['branch'], task['base_ref'], task['id']
+    # A review task's OWN branch (feature/<review_id>) never exists in lab.git —
+    # the reviewer must check out the AUTHOR's branch under review, delivered as
+    # `review_branch` in the claim payload. Fall back to task['branch'] only if a
+    # server predating that field is in play.
+    branch = task.get('review_branch') or task['branch']
+    base_ref, tid = task['base_ref'], task['id']
     run_dir = tempfile.mkdtemp(prefix=f'{tid}-', dir=WORK_DIR)
     log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl', dir=WORK_DIR)
     os.close(log_fd)

@@ -420,6 +420,7 @@ def claim():
                 prompt=task.prompt, scope=task.scope, attempts=task.attempts,
                 model=task.model, lease_token=task.lease_token,
                 kind=task.kind, review_of=task.review_of,
+                review_branch=task.review_branch,
             )), 200
         if time.time() >= deadline:
             return _stamp(Response('', status=204))
