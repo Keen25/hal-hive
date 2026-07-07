@@ -17,7 +17,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `hive_queue.py` | queue core — schema, atomic `claim` (dep-gate + lease + capability match), reaper, merge-loop |
 | `queue_server.py` | REST control plane (bearer-token auth), reaper + merge-loop threads |
 | `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps; **version-driven self-update** |
-| `halctl.py` | control CLI: `add` / `status` / `workers` / `update` / `cancel` / `prio` / `classify` |
+| `halctl.py` | control CLI: `add` (`--review N`) / `status` / `workers` / `update` / `cancel` / `requeue` / `prio` / `classify` |
 | `hive_caps.py` | capability vocabulary — `probe_caps()` (worker) + `classify_prompt()` (intake) |
 | `hive_version.py` | single source of truth for the worker code version (`CODE_VERSION`); bump to release a fleet self-update |
 | `classifier_rules.d/` | external classifier rule packs (product-specific `requires` rules; ships `activeroles.json`) |
@@ -29,6 +29,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `systemd/` | `--user` units: queue-server, `worker@`, git-daemon |
 | `briefs/` | per-task spec inputs |
 | `skills/` | Copilot CLI skills (`hive-queue-ops`, `hive-task-intake`) — backup of `~/.agents/skills/`; the live copies are what the agent loads |
+| `tests/` | state-machine + Flask smoke tests for the queue core and peer-review loop |
 
 ## Run (systemd `--user`)
 
@@ -97,6 +98,50 @@ blips, e.g. a worker on `D:\hive` while an operator assumes `C:\hive`):
 
 `halctl workers` prints these per worker; the dashboard shows a compact
 `os · build-tools` line with the full identity on hover.
+
+## Automated peer-review loop (opt-in, `--review N`)
+
+Add `--review N` to a task and its diff is reviewed by a **different** worker
+before it merges. `N` is the max number of review rounds. No human in the loop.
+
+```bash
+python3 halctl.py add "<prompt>" --review 1     # one review round, then merge/park
+```
+
+State machine:
+
+```
+author succeeds ─(review_max>0)→ awaiting_review   (invisible to the merge loop)
+     └ spawn_review → kind='review' task, pinned AWAY from the author's worker
+          reviewer checks out the AUTHOR branch, POSTs a verdict:
+            APPROVE          → author done → merges
+            REQUEST_CHANGES  → author pending, findings appended → loops to cap
+          at cap             → needs_attention (findings in error)
+```
+
+- **Fail-safe** — any verdict that is not exactly `APPROVE` is treated as
+  REQUEST_CHANGES; a garbled/timed-out reviewer never auto-approves. Review tasks
+  always close to `reviewed`, never `done`.
+- **Anti-affinity** — `review_exclude_worker` keeps the author's own worker from
+  claiming its review; the author's branch is threaded to the reviewer via the
+  claim payload (`review_branch`, since `tasks.branch` is UNIQUE).
+- **Graceful degrade** — on a single-worker fleet (no other online worker) the
+  review is skipped and the author goes straight to `done`. If the only reviewer
+  goes offline after a review is spawned, the reaper (`reap_stalled_reviews`)
+  degrades the unclaimable review and promotes the author.
+- **Cancel/requeue are review-aware** — cancelling an author cascades to its live
+  review; cancelling a review releases the author to `needs_attention`;
+  requeueing an author resets `review_round`.
+
+Feature doc: gist `Keen25/33551ae5e45c698e33e9382422532141`.
+
+## Usage metrics
+
+The dashboard rollup surfaces **reliable** per-task Copilot signals — total API
+time and lines changed (`codeChanges`). `premiumRequests` is intentionally **not**
+shown: it is a hard constant (15) in Copilot CLI 1.0.68, not real billing. Review
+passes capture usage too, so reviewing workers appear in the rollup, not just
+authors.
 
 ## Classifier rule packs (intake `requires`, F3 #22)
 

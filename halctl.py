@@ -189,7 +189,7 @@ def cmd_requeue(a):
         note = '' if a.keep_attempts else ' (attempts reset)'
         print(f'requeued -> pending{note}', a.task_id)
     else:
-        print('not requeueable (must be needs_attention|dead|cancelled)', a.task_id)
+        print('not requeueable (must be needs_attention|dead|cancelled|awaiting_review)', a.task_id)
 
 
 def cmd_prio(a):
