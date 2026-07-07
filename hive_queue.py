@@ -46,6 +46,7 @@ HEARTBEAT_RENEW   = '+15 minutes'    # §4 pulse renews the lease
 REAPER_INTERVAL_S = 30               # §4 reaper cadence
 MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
+REVIEW_STALL_MIN  = 15               # unclaimable review older than this -> degrade
 
 SCHEMA_VERSION = 12
 
@@ -601,8 +602,29 @@ def complete_task(
         # it enters 'awaiting_review' (invisible to merge_once) and spawns a
         # review task for a different worker. Only once approved does it flip to
         # 'done' (see apply_review_verdict). review_max=0 keeps existing behavior.
-        if success and row['kind'] == 'work' \
-                and row['review_max'] > 0 and row['review_round'] < row['review_max']:
+        #
+        # Single-worker degrade: the review task is pinned away from the author's
+        # own worker (anti-affinity), so if no OTHER live worker exists it could
+        # never be claimed and the author would hang in 'awaiting_review' forever.
+        # Detect that here and skip review (fall through to 'done') so a
+        # single-worker fleet still makes progress.
+        review_wanted = (row['kind'] == 'work'
+                         and row['review_max'] > 0
+                         and row['review_round'] < row['review_max'])
+        reviewer_available = False
+        if success and review_wanted:
+            reviewer_available = cur.execute(
+                """SELECT COUNT(*) FROM workers
+                   WHERE worker_id != ?
+                     AND CAST((julianday('now') - julianday(last_seen)) * 86400
+                              AS INTEGER) <= ?""",
+                (worker_id, WORKER_STALE_S),
+            ).fetchone()[0] > 0
+            if not reviewer_available:
+                log.warning('review skipped for %s: no eligible reviewer other '
+                            'than author worker %s (single-worker fleet) -> done',
+                            task_id, worker_id)
+        if success and review_wanted and reviewer_available:
             cur.execute(
                 f"""UPDATE tasks
                    SET status='awaiting_review', done_at=datetime('now'),
@@ -750,7 +772,8 @@ def spawn_review(author_id: str, db_path: str = QUEUE_DB) -> str:
 
 
 def apply_review_verdict(author_id: str, verdict: str, findings: str,
-                         review_task_id: str, db_path: str = QUEUE_DB) -> str:
+                         review_task_id: str, usage_json: Optional[str] = None,
+                         db_path: str = QUEUE_DB) -> str:
     """Apply a reviewer's verdict to an author task in 'awaiting_review'.
 
     Fail-safe: any verdict string that is not EXACTLY 'APPROVE' is treated as
@@ -776,12 +799,14 @@ def apply_review_verdict(author_id: str, verdict: str, findings: str,
 
         new_round = row['review_round'] + 1
         # Close the review task to the terminal 'reviewed' state (never 'done',
-        # so merge_once ignores it). Idempotent if already closed.
+        # so merge_once ignores it). Idempotent if already closed. Store the
+        # reviewer's copilot usage so reviewing workers appear in the rollup.
         cur.execute(
             """UPDATE tasks SET status='reviewed', done_at=datetime('now'),
+                   usage_json=COALESCE(?, usage_json),
                    lease_expires=NULL, heartbeat_at=NULL
                WHERE id=?""",
-            (review_task_id,),
+            (usage_json, review_task_id),
         )
 
         if approve:
@@ -850,6 +875,57 @@ def reap_once(db_path: str = QUEUE_DB) -> int:
         return cur.rowcount
 
 
+def reap_stalled_reviews(db_path: str = QUEUE_DB) -> int:
+    """Degrade peer-review tasks that can never be claimed.
+
+    A review task is pinned away from its author's worker (anti-affinity). If the
+    only other capable worker goes offline after the review was spawned, the
+    review sits 'pending' forever and its author hangs in 'awaiting_review'. For
+    each such review that is older than REVIEW_STALL_MIN AND has NO eligible
+    (online, non-excluded) worker, skip the review: cancel it and promote its
+    author (if still awaiting_review) straight to 'done' so the fleet keeps
+    moving. Reviews that merely wait for a busy-but-live reviewer are left alone.
+    """
+    degraded = 0
+    with cursor(db_path) as cur:
+        stalled = cur.execute(
+            """SELECT id, review_of, review_exclude_worker
+               FROM tasks
+               WHERE kind='review' AND status='pending'
+                 AND created_at < datetime('now', ?)""",
+            (f'-{REVIEW_STALL_MIN} minutes',),
+        ).fetchall()
+        for rev in stalled:
+            eligible = cur.execute(
+                """SELECT COUNT(*) FROM workers
+                   WHERE (? IS NULL OR worker_id != ?)
+                     AND CAST((julianday('now') - julianday(last_seen)) * 86400
+                              AS INTEGER) <= ?""",
+                (rev['review_exclude_worker'], rev['review_exclude_worker'],
+                 WORKER_STALE_S),
+            ).fetchone()[0]
+            if eligible > 0:
+                continue  # a live reviewer exists; just busy — leave it
+            cur.execute(
+                """UPDATE tasks SET status='cancelled', done_at=datetime('now'),
+                       error='review skipped: no eligible reviewer within '
+                             || ? || ' min (reviewer offline)'
+                   WHERE id=? AND status='pending'""",
+                (REVIEW_STALL_MIN, rev['id']),
+            )
+            cur.execute(
+                """UPDATE tasks SET status='done', done_at=datetime('now'),
+                       worker_id=NULL, lease_expires=NULL, heartbeat_at=NULL
+                   WHERE id=? AND status='awaiting_review'""",
+                (rev['review_of'],),
+            )
+            if cur.rowcount:
+                degraded += 1
+                log.warning('review %s unclaimable (no live reviewer) -> author '
+                            '%s promoted to done', rev['id'], rev['review_of'])
+        return degraded
+
+
 def reaper_loop(stop: threading.Event, db_path: str = QUEUE_DB) -> None:
     while not stop.is_set():
         try:
@@ -857,6 +933,9 @@ def reaper_loop(stop: threading.Event, db_path: str = QUEUE_DB) -> None:
             if n:
                 hive_log.incr('reaped', n)
                 log.info('reaper requeued/dead-lettered %d orphaned task(s)', n)
+            r = reap_stalled_reviews(db_path)
+            if r:
+                log.info('reaper degraded %d unclaimable review(s)', r)
         except Exception as e:  # never let the reaper die
             log.error('reaper error: %s', e)
         stop.wait(REAPER_INTERVAL_S)
@@ -1363,7 +1442,9 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
                              WHEN 'pending' THEN 2 ELSE 3 END,
                  priority ASC, created_at ASC"""
         ).fetchall()]
-    total_pr = 0.0
+    total_api_ms = 0
+    total_lines_added = 0
+    total_lines_removed = 0
     tasks_with_usage = 0
     for row in rows:
         # Prefer the explicit human summary; fall back to deriving one from the
@@ -1377,17 +1458,21 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
             try:
                 full = _json.loads(raw_usage)
                 cc = full.get('codeChanges') or {}
+                # premiumRequests is a constant placeholder in the Copilot CLI
+                # (always 15 regardless of work), so it is intentionally NOT
+                # surfaced. The reliable signals are API/session time + lines.
                 usage = {
-                    'premiumRequests':    full.get('premiumRequests'),
                     'totalApiDurationMs': full.get('totalApiDurationMs'),
                     'sessionDurationMs':  full.get('sessionDurationMs'),
                     'linesAdded':         cc.get('linesAdded'),
                     'linesRemoved':       cc.get('linesRemoved'),
                 }
-                pr = full.get('premiumRequests')
-                if pr is not None:
-                    total_pr += pr
-                    tasks_with_usage += 1
+                api_ms = full.get('totalApiDurationMs')
+                if api_ms is not None:
+                    total_api_ms += api_ms
+                total_lines_added += cc.get('linesAdded') or 0
+                total_lines_removed += cc.get('linesRemoved') or 0
+                tasks_with_usage += 1
             except Exception:
                 pass
         row['usage'] = usage
@@ -1396,7 +1481,9 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         'tasks': rows,
         'workers': list_workers(db_path=db_path),
         'usage_totals': {
-            'premiumRequests': total_pr,
+            'totalApiDurationMs': total_api_ms,
+            'linesAdded': total_lines_added,
+            'linesRemoved': total_lines_removed,
             'tasks_with_usage': tasks_with_usage,
         },
     }
@@ -1447,15 +1534,46 @@ def get_log_tail(task_id: str, db_path: str = QUEUE_DB) -> Optional[str]:
 
 
 def cancel_task(task_id: str, db_path: str = QUEUE_DB) -> bool:
-    """Cancel a task in any pre-merge state."""
+    """Cancel a task in any pre-merge state.
+
+    Peer-review aware:
+      * Cancelling an author also cancels any live review task spawned for it
+        (a review of a cancelled author is meaningless).
+      * Cancelling a review task releases its author from 'awaiting_review' to
+        'needs_attention' so it doesn't hang waiting for a verdict that will
+        never come (a human then decides: requeue or cancel).
+    """
     with cursor(db_path) as cur:
+        row = cur.execute(
+            'SELECT kind, review_of FROM tasks WHERE id=?', (task_id,)
+        ).fetchone()
         cur.execute(
             """UPDATE tasks SET status='cancelled', worker_id=NULL, lease_token=NULL,
                    lease_expires=NULL, heartbeat_at=NULL
                WHERE id=? AND status NOT IN ('merged','cancelled','dead')""",
             (task_id,),
         )
-        return cur.rowcount > 0
+        changed = cur.rowcount > 0
+        if changed and row is not None:
+            if row['kind'] == 'work':
+                cur.execute(
+                    """UPDATE tasks SET status='cancelled', worker_id=NULL,
+                           lease_token=NULL, lease_expires=NULL, heartbeat_at=NULL
+                       WHERE review_of=? AND kind='review'
+                         AND status NOT IN ('merged','cancelled','dead','reviewed')""",
+                    (task_id,),
+                )
+            elif row['kind'] == 'review' and row['review_of']:
+                cur.execute(
+                    """UPDATE tasks
+                       SET status='needs_attention', worker_id=NULL,
+                           lease_expires=NULL, heartbeat_at=NULL,
+                           error=COALESCE(error,'') || ' [review '|| ? ||
+                                 ' cancelled; author released for triage]'
+                       WHERE id=? AND status='awaiting_review'""",
+                    (task_id, row['review_of']),
+                )
+        return changed
 
 
 def reprioritize(task_id: str, priority: int, db_path: str = QUEUE_DB) -> bool:
@@ -1472,18 +1590,39 @@ def requeue_task(task_id: str, reset_attempts: bool = True,
     attempt counter so a fresh run gets its full max_attempts budget (U1).
 
     Returns False if the task doesn't exist or isn't in a re-queueable state
-    (e.g. already pending/running/merged)."""
+    (e.g. already pending/running/merged).
+
+    Peer-review aware: an author parked in 'awaiting_review' (or 'needs_attention'
+    after the review cap) can be requeued; doing so cancels any live review task
+    spawned for it and resets review_round to 0 so the re-run gets a fresh review
+    cycle rather than being skipped as already-at-cap."""
     attempts_sql = ', attempts=0' if reset_attempts else ''
     with cursor(db_path) as cur:
+        row = cur.execute(
+            'SELECT kind FROM tasks WHERE id=?', (task_id,)
+        ).fetchone()
+        # Authors get review_round reset so a re-run is re-reviewed from scratch
+        # instead of being skipped as already-at-cap; review tasks don't.
+        extra = ', review_round=0' if (row and row['kind'] == 'work') else ''
         cur.execute(
             f"""UPDATE tasks
                 SET status='pending', error=NULL, worker_id=NULL,
                     lease_expires=NULL, heartbeat_at=NULL, not_before=NULL
-                    {attempts_sql}
-                WHERE id=? AND status IN ('needs_attention','dead','cancelled')""",
+                    {extra}{attempts_sql}
+                WHERE id=? AND status IN
+                    ('needs_attention','dead','cancelled','awaiting_review')""",
             (task_id,),
         )
-        return cur.rowcount > 0
+        changed = cur.rowcount > 0
+        if changed and row and row['kind'] == 'work':
+            cur.execute(
+                """UPDATE tasks SET status='cancelled', worker_id=NULL,
+                       lease_token=NULL, lease_expires=NULL, heartbeat_at=NULL
+                   WHERE review_of=? AND kind='review'
+                     AND status NOT IN ('merged','cancelled','dead','reviewed')""",
+                (task_id,),
+            )
+        return changed
 
 
 if __name__ == '__main__':

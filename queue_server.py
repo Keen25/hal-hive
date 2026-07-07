@@ -495,8 +495,12 @@ def review_verdict(author_id):
     review_task_id = b.get('review_task_id')
     if not verdict or not review_task_id:
         return jsonify(error='verdict and review_task_id required'), 400
+    raw_usage = b.get('usage_json') or b.get('usage')
+    if isinstance(raw_usage, dict):
+        import json as _json
+        raw_usage = _json.dumps(raw_usage)
     result = q.apply_review_verdict(author_id, verdict, b.get('findings', ''),
-                                    review_task_id)
+                                    review_task_id, usage_json=raw_usage)
     return jsonify(result=result, author=author_id), 200
 
 

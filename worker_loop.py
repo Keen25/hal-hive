@@ -239,14 +239,17 @@ class QueueClient:
         return r.json().get('status')
 
     def post_review(self, author_id: str, verdict: str, findings: str,
-                    review_task_id: str) -> str:
+                    review_task_id: str, usage_json: str | None = None) -> str:
         """POST a reviewer verdict to the author task. The server closes the
         review task (to 'reviewed') itself, so the worker never calls /complete
-        for a review task."""
+        for a review task. `usage_json` (best-effort) is stored on the review
+        task so reviewing workers appear in the usage rollup."""
+        body = {'verdict': verdict, 'findings': findings,
+                'review_task_id': review_task_id}
+        if usage_json is not None:
+            body['usage_json'] = usage_json
         r = requests.post(f'{self.base}/task/{author_id}/review',
-                          json={'verdict': verdict, 'findings': findings,
-                                'review_task_id': review_task_id},
-                          headers=self.h, timeout=30)
+                          json=body, headers=self.h, timeout=30)
         r.raise_for_status()
         return r.json().get('result')
 
@@ -480,8 +483,17 @@ def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
             )
 
         verdict, findings = _read_review_verdict(run_dir)
-        return {'verdict': verdict, 'findings': findings,
-                'exit_code': proc.returncode, 'log_path': log_path}
+        out = {'verdict': verdict, 'findings': findings,
+               'exit_code': proc.returncode, 'log_path': log_path}
+        # Capture copilot billing usage for the review pass too, so reviewing
+        # workers show up in the usage rollup (not just authors).
+        try:
+            usage = _parse_usage_from_log(log_path)
+            if usage is not None:
+                out['usage_json'] = json.dumps(usage)
+        except Exception:
+            pass
+        return out
     except subprocess.TimeoutExpired:
         fail_safe['findings'] = 'reviewer timed out; failing safe (no auto-approve)'
         fail_safe['exit_code'] = 124
@@ -791,7 +803,8 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
                     pass
             try:
                 res = client.post_review(task.get('review_of'), result['verdict'],
-                                         result.get('findings', ''), tid)
+                                         result.get('findings', ''), tid,
+                                         usage_json=result.get('usage_json'))
             except Exception as e:
                 log.warning('worker %s: failed to post review verdict for %s: %s',
                             worker_id, tid, e)

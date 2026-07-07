@@ -152,7 +152,7 @@
           <th>Worker</th><th>Model</th>
           <th class="sortable" data-sort="priority">Prio<span class="arw"></span></th>
           <th>Requires</th><th>Branch</th>
-          <th title="Premium requests consumed by this task">PR</th>
+          <th title="Total Copilot API time for this task">API</th>
           <th class="sortable" data-sort="time">Time<span class="arw"></span></th>
           <th></th></tr></thead>
         <tbody id="taskbody"><tr><td class="empty" colspan="11">loading…</td></tr></tbody>
@@ -312,8 +312,12 @@ function render(d){
   const ut = d.usage_totals||{};
   const utEl = document.getElementById('usage_total');
   if(utEl){
-    const pr = ut.premiumRequests;
-    utEl.textContent = (pr!=null && pr>0) ? ('Σ premium: '+pr.toFixed(2)) : '';
+    const apiMs = ut.totalApiDurationMs;
+    const la = ut.linesAdded, lr = ut.linesRemoved;
+    const parts = [];
+    if(apiMs!=null && apiMs>0) parts.push('Σ API '+(apiMs/1000).toFixed(0)+'s');
+    if((la||0)+(lr||0)>0) parts.push('Σ lines +'+(la||0)+'/-'+(lr||0));
+    utEl.textContent = parts.join('  ·  ');
   }
   // cards
   const cards = document.getElementById('cards'); cards.innerHTML='';
@@ -353,9 +357,9 @@ function render(d){
     tr.appendChild(cell((t.requires&&t.requires.length)?
       (Array.isArray(t.requires)?t.requires.join(' '):t.requires):'—','muted'));
     tr.appendChild(cell(t.branch||'—','mono muted'));
-    // PR (premium requests) cell
-    const pr = t.usage && t.usage.premiumRequests != null ? t.usage.premiumRequests.toFixed(2) : '—';
-    tr.appendChild(cell(pr, 'muted'));
+    // API-time cell (reliable per-task metric; premiumRequests is a CLI constant)
+    const apiMs = t.usage && t.usage.totalApiDurationMs != null ? t.usage.totalApiDurationMs : null;
+    tr.appendChild(cell(apiMs != null ? (apiMs/1000).toFixed(1)+'s' : '—', 'muted'));
     tr.appendChild(timeCell(t));
     const ac=document.createElement('td');
     const lb=el('button','btn','log'); lb.onclick=()=>viewLog(t.id); ac.appendChild(lb);
@@ -594,8 +598,9 @@ async function openTask(id){
     body.appendChild(el('h3','td-h','Usage'));
     const u = t.usage;
     const uGrid = el('div','td-grid');
-    if(u && u.premiumRequests!=null){
-      uGrid.appendChild(tdRow('Premium requests', u.premiumRequests.toFixed(2)));
+    const hasUsage = u && (u.totalApiDurationMs!=null || u.sessionDurationMs!=null ||
+                           u.linesAdded!=null || u.linesRemoved!=null);
+    if(hasUsage){
       const apiMs = u.totalApiDurationMs;
       uGrid.appendChild(tdRow('API duration', apiMs!=null ? (apiMs/1000).toFixed(1)+'s' : null));
       const sessMs = u.sessionDurationMs;
