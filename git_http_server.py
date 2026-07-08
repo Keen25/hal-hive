@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -83,6 +84,18 @@ def _resolve_token() -> str:
 
 
 AUTH_TOKEN = _resolve_token()
+
+
+class _HardenedGitHTTPServer(ThreadingHTTPServer):
+    # The stock ThreadingHTTPServer inherits socketserver's request_queue_size=5,
+    # which becomes the listen() backlog. Multiple workers cloning the ~447MB
+    # mirror concurrently (or all reconnecting after a control-plane restart)
+    # burst past a 5-deep accept queue, so their SYNs are dropped and the clone
+    # fails with "Failed to connect to <host>:8418 ... Could not connect to
+    # server". A larger backlog (matching the queue server) absorbs the burst.
+    request_queue_size = 128
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 class GitHTTPHandler(BaseHTTPRequestHandler):
@@ -422,12 +435,15 @@ def main():
             "TLS OFF — set HIVE_TLS_CERT/HIVE_TLS_KEY to encrypt (issue #8)\n"
         )
     servers = []
-    for addr in addrs:
+
+    def _try_bind(addr):
+        """Bind+serve one address. Returns True on success, False if the address
+        isn't assigned yet (Errno 99 / EADDRNOTAVAIL)."""
         try:
-            httpd = ThreadingHTTPServer((addr, PORT), GitHTTPHandler)
+            httpd = _HardenedGitHTTPServer((addr, PORT), GitHTTPHandler)
         except OSError as exc:
             sys.stderr.write("skip bind %s:%d (%s)\n" % (addr, PORT, exc))
-            continue
+            return False
         if ctx:
             httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         servers.append(httpd)
@@ -436,9 +452,37 @@ def main():
             "hal-git-http serving %s on %s://%s:%d (backend=%s, token-auth ON)\n"
             % (PROJECT_ROOT, scheme, addr, PORT, GIT_HTTP_BACKEND)
         )
-    if not servers:
+        return True
+
+    pending = [a for a in addrs if not _try_bind(a)]
+    if not servers and not pending:
         sys.stderr.write("FATAL: could not bind any of %r:%d\n" % (addrs, PORT))
         sys.exit(1)
+
+    # Self-heal for the recurring "loopback-only" bug: the lab NIC (virbr1,
+    # 192.168.100.1) is often not yet assigned when this unit starts, so its bind
+    # is skipped with Errno 99 and the process otherwise serves loopback-only
+    # forever (Restart=on-failure never fires because nothing failed). Retry any
+    # skipped address in the background until the bridge comes up, so remote
+    # workers can always clone once the lab net is live — no manual restart. (S2 #5)
+    if pending:
+        def _rebind_loop(addrs_pending):
+            remaining = list(addrs_pending)
+            while remaining:
+                time.sleep(5)
+                remaining = [a for a in remaining if not _try_bind(a)]
+            sys.stderr.write(
+                "hal-git-http: all expected addresses now bound (%r:%d)\n"
+                % (addrs, PORT)
+            )
+        threading.Thread(
+            target=_rebind_loop, args=(pending,), daemon=True
+        ).start()
+        sys.stderr.write(
+            "hal-git-http: %d address(es) not yet assigned %r — retrying in "
+            "background every 5s until bound\n" % (len(pending), pending)
+        )
+
     threading.Event().wait()
 
 
