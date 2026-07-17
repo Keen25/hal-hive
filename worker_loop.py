@@ -246,6 +246,62 @@ def _mcp_disable_list(task: dict | None = None) -> list[str]:
     return out
 
 
+_configured_mcp_cache: set | None = None
+
+
+def _configured_mcp_names() -> set | None:
+    """The authoritative set of MCP server names this worker's copilot would
+    load, across ALL sources (user/workspace/plugin/builtin), via
+    ``copilot mcp list --json`` (-> {"mcpServers": {name: {...}}}). Cached per
+    process (the inventory is stable for a worker's lifetime). Returns None when
+    the inventory cannot be determined (copilot missing / command error / bad
+    JSON), which the caller must treat as fail-closed."""
+    global _configured_mcp_cache
+    if _configured_mcp_cache is not None:
+        return _configured_mcp_cache
+    exe = os.environ.get('HIVE_COPILOT_CMD', 'copilot')
+    try:
+        proc = subprocess.run([exe, 'mcp', 'list', '--json'],
+                              capture_output=True, text=True, timeout=30)
+        if proc.returncode != 0:
+            log.warning('mcp validation: `%s mcp list --json` exited %s: %s',
+                        exe, proc.returncode, (proc.stderr or '').strip()[:200])
+            return None
+        data = json.loads(proc.stdout)
+        names = set((data.get('mcpServers') or {}).keys())
+        _configured_mcp_cache = names
+        return names
+    except Exception as e:
+        log.warning('mcp validation: could not enumerate configured servers: %s', e)
+        return None
+
+
+def _check_mcp_disable(disable: list[str]) -> str | None:
+    """Fail-closed guard for context-scoped MCP (#MCP-03). The copilot CLI
+    silently IGNORES an unknown/typo'd ``--disable-mcp-server`` name (verified on
+    1.0.71): the server the operator meant to suppress stays loaded, failing
+    OPEN. So before launching copilot, verify every requested name is real.
+
+    Returns an error string when the disable list names a server copilot would
+    not recognise (or when the configured-server inventory cannot be determined —
+    we cannot prove the names are valid, so we also fail closed), else None. An
+    empty disable list is always fine (nothing to scope)."""
+    if not disable:
+        return None
+    valid = _configured_mcp_names()
+    if valid is None:
+        return ('cannot validate --disable-mcp name(s) — `copilot mcp list --json`'
+                ' is unavailable on this worker; failing closed rather than '
+                'running with an unverified MCP scope')
+    unknown = [n for n in disable if n not in valid]
+    if unknown:
+        return (f'unknown --disable-mcp server name(s) {unknown}; not in this '
+                f'worker\'s configured MCP set {sorted(valid)}. A typo would '
+                'silently fail OPEN (the server stays loaded), so the task is '
+                'failed closed. Fix the name(s) or omit --disable-mcp.')
+    return None
+
+
 def _worker_verify(cwd: str) -> tuple[bool, bool, str]:
     """Run the build/test gate in the worker's OWN clone (Sc1 #10) so verify
     happens in parallel across workers instead of serially in the merge loop.
@@ -650,10 +706,16 @@ def run_review_task(task: dict, worker_id: str, lab_git: str,
             fail_safe['exit_code'] = 1
             return fail_safe
 
+        disable_mcp = _mcp_disable_list(task)
+        mcp_err = _check_mcp_disable(disable_mcp)
+        if mcp_err:
+            fail_safe['findings'] = f'MCP scope validation failed (fail-closed): {mcp_err}'
+            fail_safe['exit_code'] = 1
+            return fail_safe
         with open(log_path, 'w') as logf:
             proc = subprocess.run(
                 _copilot_argv(f'@{prompt_path}', model=task.get('model'),
-                              disable_mcp=_mcp_disable_list(task)),
+                              disable_mcp=disable_mcp),
                 cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT,
                 timeout=COPILOT_TIMEOUT_S, text=True,
             )
@@ -866,10 +928,16 @@ def run_task(task: dict, worker_id: str, lab_git: str,
         # the rest of this function, so the `log.info(...)` after the verify step
         # would crash on the closed file object (AttributeError), turning an
         # already-pushed task into a reported failure.
+        disable_mcp = _mcp_disable_list(task)
+        mcp_err = _check_mcp_disable(disable_mcp)
+        if mcp_err:
+            return {'exit_code': 1,
+                    'error': f'MCP scope validation failed (fail-closed): {mcp_err}',
+                    'log_path': log_path}
         with open(log_path, 'w') as logf:
             proc = subprocess.run(
                 _copilot_argv(f'@{prompt_path}', model=task.get('model'),
-                              disable_mcp=_mcp_disable_list(task)),
+                              disable_mcp=disable_mcp),
                 cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT,
                 timeout=COPILOT_TIMEOUT_S, text=True,
             )
