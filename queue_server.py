@@ -422,6 +422,7 @@ def claim():
                 kind=task.kind, review_of=task.review_of,
                 review_branch=task.review_branch,
                 repo=task.repo,
+                disable_mcp=task.disable_mcp,
             )), 200
         if time.time() >= deadline:
             return _stamp(Response('', status=204))
@@ -482,6 +483,7 @@ def add():
             deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
             review_max=int(b.get('review_max', 0)),
             repo=b.get('repo', 'lab.git'),
+            disable_mcp=b.get('disable_mcp'),
             kind=b.get('kind', 'work'),
         )
     except KeyError as exc:

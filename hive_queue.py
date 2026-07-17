@@ -48,7 +48,7 @@ MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 REVIEW_STALL_MIN  = 15               # unclaimable review older than this -> degrade
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Max length of the human-readable task summary shown on the dashboard/CLI in
 # place of the full prompt. Kept short so it fits one table cell / status line.
@@ -151,7 +151,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_of     TEXT,                         -- review task -> the author task id it reviews
     review_exclude_worker TEXT,                 -- review task -> worker_id that must NOT claim it (the author's worker)
     repo          TEXT NOT NULL DEFAULT 'lab.git', -- central bare repo the task clones/pushes (lab.git | ActiveRoles.git ...)
-    progress_json TEXT                            -- live in-flight progress snapshot from the worker heartbeat (last tool, turn, events, elapsed); NULL until first beat
+    progress_json TEXT,                           -- live in-flight progress snapshot from the worker heartbeat (last tool, turn, events, elapsed); NULL until first beat
+    disable_mcp   TEXT                             -- space-separated MCP server names to suppress for this task's copilot run (--disable-mcp-server); NULL = load all configured servers
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -269,6 +270,14 @@ def init_db(db_path: str = QUEUE_DB) -> None:
         # 'claimed' box until completion. NULL until the first beat carries one.
         if 'progress_json' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN progress_json TEXT')
+        # Migration v14 -> v15: per-task, context-scoped MCP. A task may carry a
+        # space-separated list of MCP server names the worker suppresses for that
+        # task's copilot run via the CLI's native --disable-mcp-server flag. This
+        # scopes the agent's toolset per session WITHOUT editing the global
+        # ~/.copilot/mcp-config.json (no cross-task stomp; fully reversible).
+        # NULL = load every configured server, so existing tasks are unchanged.
+        if 'disable_mcp' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN disable_mcp TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -291,6 +300,39 @@ def canon_tags(value) -> Optional[str]:
     """Canonical stored form: sorted, space-joined, or None when empty."""
     tags = parse_tags(value)
     return ' '.join(sorted(tags)) if tags else None
+
+
+def parse_mcp_names(value) -> list[str]:
+    """Normalise an MCP-server-name spec into an ordered, de-duplicated list.
+
+    Accepts a list/tuple/set or a comma/whitespace-separated string. Unlike
+    capability tags, MCP server names are NOT lowercased or sorted — they must
+    match the exact key in ~/.copilot/mcp-config.json (e.g. 'azure-devops',
+    'microsoft-docs'), and preserving order keeps operator intent readable.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r'[\s,]+', value)
+    else:
+        parts = []
+        for item in value:
+            parts.extend(re.split(r'[\s,]+', str(item)))
+    out: list[str] = []
+    seen = set()
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def canon_mcp_names(value) -> Optional[str]:
+    """Canonical stored form for disable_mcp: space-joined, order-preserving,
+    or None when empty (NULL = suppress nothing)."""
+    names = parse_mcp_names(value)
+    return ' '.join(names) if names else None
 
 
 def ensure_lab_repo(lab_git: str = LAB_GIT, base_ref: str = DEFAULT_BASE_REF) -> None:
@@ -355,6 +397,7 @@ def add_task(
     review_of: Optional[str] = None,
     review_exclude_worker: Optional[str] = None,
     repo: str = 'lab.git',
+    disable_mcp: Optional[list[str]] = None,
     db_path: str = QUEUE_DB,
 ) -> None:
     """Insert a task (+ its dependency edges) into the queue.
@@ -382,6 +425,7 @@ def add_task(
         model = model_for_complexity(complexity)
     branch = branch or f'feature/{task_id}'
     repo = repo or 'lab.git'
+    disable_mcp_str = canon_mcp_names(disable_mcp)
     if summary:
         summary = ' '.join(summary.split())[:SUMMARY_MAX]
     else:
@@ -391,11 +435,11 @@ def add_task(
             """INSERT INTO tasks
                  (id, branch, base_ref, prompt, summary, worker, requires, scope,
                   priority, complexity, model, max_attempts,
-                  review_max, kind, review_of, review_exclude_worker, repo)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  review_max, kind, review_of, review_exclude_worker, repo, disable_mcp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, branch, base_ref, prompt, summary, worker, canon_tags(requires),
              scope, priority, complexity, model, max_attempts,
-             review_max, kind, review_of, review_exclude_worker, repo),
+             review_max, kind, review_of, review_exclude_worker, repo, disable_mcp_str),
         )
         for dep in (deps or []):
             cur.execute(
@@ -420,6 +464,7 @@ class ClaimedTask:
     review_of: Optional[str] = None
     review_branch: Optional[str] = None
     repo: str = 'lab.git'
+    disable_mcp: Optional[str] = None
 
 
 def claim_next(worker_id: str, worker_lane: Optional[str] = None,
@@ -458,7 +503,7 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
         rows = conn.execute(
             """
             SELECT t.id, t.branch, t.base_ref, t.prompt, t.scope, t.attempts,
-                   t.requires, t.model, t.kind, t.review_of, t.repo,
+                   t.requires, t.model, t.kind, t.review_of, t.repo, t.disable_mcp,
                    (SELECT a.branch FROM tasks a WHERE a.id = t.review_of) AS review_branch,
                    (SELECT a.repo   FROM tasks a WHERE a.id = t.review_of) AS review_repo
             FROM tasks t
@@ -518,6 +563,7 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
             # A review task clones the AUTHOR's repo (review_repo) so the reviewer
             # sees the same mirror the change lives in; work tasks use their own.
             repo=(chosen['review_repo'] or chosen['repo'] or 'lab.git'),
+            disable_mcp=chosen['disable_mcp'],
         )
     except Exception:
         conn.execute('ROLLBACK;')
@@ -793,7 +839,7 @@ def spawn_review(author_id: str, db_path: str = QUEUE_DB) -> str:
     with cursor(db_path) as cur:
         row = cur.execute(
             """SELECT prompt, branch, base_ref, worker_id, review_round,
-                      priority, complexity, model
+                      priority, complexity, model, disable_mcp
                FROM tasks WHERE id=?""",
             (author_id,),
         ).fetchone()
@@ -825,6 +871,7 @@ def spawn_review(author_id: str, db_path: str = QUEUE_DB) -> str:
         kind='review',
         review_of=author_id,
         review_exclude_worker=row['worker_id'],
+        disable_mcp=row['disable_mcp'],
         db_path=db_path,
     )
     log.info('spawned review %s for author %s (excludes worker %s)',

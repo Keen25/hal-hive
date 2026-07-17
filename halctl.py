@@ -48,6 +48,7 @@ def cmd_add(a):
                priority=a.priority, complexity=complexity, model=model,
                deps=a.dep, max_attempts=a.max_attempts, summary=a.summary,
                review_max=a.review, repo=a.repo,
+               disable_mcp=a.disable_mcp,
                kind='probe' if getattr(a, 'probe', False) else 'work')
     bits = [f'+ {tid}', f'prio={a.priority}',
             f'cx={complexity}/{model}{auto_note}',
@@ -62,6 +63,8 @@ def cmd_add(a):
         bits.append(f'requires={",".join(a.require)}')
     if a.dep:
         bits.append(f'deps={",".join(a.dep)}')
+    if getattr(a, 'disable_mcp', None):
+        bits.append(f'disable_mcp={",".join(q.parse_mcp_names(a.disable_mcp))}')
     if a.review:
         bits.append(f'review={a.review}')
     print('  '.join(bits))
@@ -395,6 +398,13 @@ def main():
                          ':8418 (default lab.git). Use ActiveRoles.git for ARS '
                          'source tasks so the change lands centrally and is '
                          'reviewable + promotable to ADO via `halctl promote`.')
+    pa.add_argument('--disable-mcp', action='append', metavar='SERVER',
+                    help='MCP server name to suppress for this task\'s copilot '
+                         'run (repeatable; also accepts a comma/space list). '
+                         'Names must match the key in ~/.copilot/mcp-config.json '
+                         '(e.g. salesforce, pagerduty). Scopes the agent toolset '
+                         'per session via --disable-mcp-server without touching '
+                         'the global MCP config. Default: load all configured.')
     pa.add_argument('--probe', action='store_true',
                     help='read-only / diagnostic task (kind=probe): a run that '
                          'produces no commit finishes terminally (probed) on the '

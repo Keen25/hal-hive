@@ -215,6 +215,37 @@ def _copilot_perms() -> list[str]:
     return shlex.split(override)
 
 
+def _mcp_disable_list(task: dict | None = None) -> list[str]:
+    """Names of MCP servers to suppress for this copilot run, merged from two
+    sources so scoping can be set per-worker AND per-task:
+
+      • HIVE_DISABLE_MCP (worker env) — servers this worker never needs (e.g. a
+        Windows ARS build box has no use for Salesforce/PagerDuty MCP). A
+        comma/space-separated list; unset = suppress nothing.
+      • task['disable_mcp'] — per-task scope decided by the queuer (halctl
+        add --disable-mcp), delivered on the claim payload.
+
+    Names must match the exact key in ~/.copilot/mcp-config.json. The result is
+    order-preserving and de-duplicated. Empty when neither source is set, so
+    existing workers/tasks are unaffected (every configured server loads)."""
+    names: list[str] = []
+    env = os.environ.get('HIVE_DISABLE_MCP', '')
+    names += [n for n in re.split(r'[\s,]+', env) if n]
+    if task:
+        raw = task.get('disable_mcp')
+        if isinstance(raw, str):
+            names += [n for n in re.split(r'[\s,]+', raw) if n]
+        elif isinstance(raw, (list, tuple)):
+            names += [str(n).strip() for n in raw if str(n).strip()]
+    out: list[str] = []
+    seen = set()
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
 def _worker_verify(cwd: str) -> tuple[bool, bool, str]:
     """Run the build/test gate in the worker's OWN clone (Sc1 #10) so verify
     happens in parallel across workers instead of serially in the merge loop.
@@ -235,7 +266,8 @@ def _worker_verify(cwd: str) -> tuple[bool, bool, str]:
     return True, proc.returncode == 0, ' | '.join(tail)
 
 
-def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
+def _copilot_argv(prompt_ref: str, model: str | None = None,
+                  disable_mcp: list[str] | None = None) -> list[str]:
     """Build the copilot invocation. The executable is configurable via
     HIVE_COPILOT_CMD because the CLI is not always named `copilot` on PATH —
     on Windows npm installs a `copilot.cmd` shim that CreateProcess cannot
@@ -251,11 +283,19 @@ def _copilot_argv(prompt_ref: str, model: str | None = None) -> list[str]:
 
     ``model`` (from the task's complexity tier) is passed through as ``--model``
     so cheap work runs on a cheap model and complex work on a frontier one. When
-    absent, copilot uses its configured default."""
+    absent, copilot uses its configured default.
+
+    ``disable_mcp`` is a list of MCP server names to suppress for this run via
+    the CLI's native ``--disable-mcp-server`` flag (context-scoped MCP). It never
+    touches the global ~/.copilot/mcp-config.json, so scoping is per-session and
+    fully reversible. Empty/None = load every configured server (prior
+    behaviour)."""
     exe = os.environ.get('HIVE_COPILOT_CMD', 'copilot')
     argv = [exe, '-p', prompt_ref, *_copilot_perms(), '--output-format', 'json']
     if model:
         argv += ['--model', model]
+    for name in (disable_mcp or []):
+        argv += ['--disable-mcp-server', name]
     return argv
 
 
@@ -612,7 +652,8 @@ def run_review_task(task: dict, worker_id: str, lab_git: str,
 
         with open(log_path, 'w') as logf:
             proc = subprocess.run(
-                _copilot_argv(f'@{prompt_path}', model=task.get('model')),
+                _copilot_argv(f'@{prompt_path}', model=task.get('model'),
+                              disable_mcp=_mcp_disable_list(task)),
                 cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT,
                 timeout=COPILOT_TIMEOUT_S, text=True,
             )
@@ -827,7 +868,8 @@ def run_task(task: dict, worker_id: str, lab_git: str,
         # already-pushed task into a reported failure.
         with open(log_path, 'w') as logf:
             proc = subprocess.run(
-                _copilot_argv(f'@{prompt_path}', model=task.get('model')),
+                _copilot_argv(f'@{prompt_path}', model=task.get('model'),
+                              disable_mcp=_mcp_disable_list(task)),
                 cwd=run_dir, stdout=logf, stderr=subprocess.STDOUT,
                 timeout=COPILOT_TIMEOUT_S, text=True,
             )
