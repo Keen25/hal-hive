@@ -228,4 +228,51 @@ assert q.get_task('st-2', db_path=db4)['status'] == 'awaiting_review'
 print('PASS 15: stalled review with a live reviewer is NOT degraded')
 
 os.remove(db3); os.remove(db4)
+
+# ── 16: live progress snapshot round-trips + is lease-guarded ──────────────────
+import json as _json
+dbp = tempfile.mktemp(suffix='.db', prefix='hive-progress-test-')
+q.init_db(dbp)
+q.upsert_worker('wP', db_path=dbp)
+q.add_task('prog-1', 'Do a build.', db_path=dbp)
+cp = q.claim_next('wP', db_path=dbp)
+assert cp.id == 'prog-1'
+# a fresh claim carries no progress yet
+row_p = q.get_task('prog-1', db_path=dbp)
+assert row_p['progress'] is None, 'fresh claim must have no progress'
+snap = {'turn': 2, 'elapsed_s': 40, 'phase': 'working',
+        'last_tool': {'tool': 'bash', 'detail': 'msbuild Service.sln', 'turn': '2'}}
+ok = q.heartbeat('prog-1', 'wP', db_path=dbp, lease_token=cp.lease_token,
+                 progress_json=_json.dumps(snap))
+assert ok, 'owned heartbeat should renew'
+got = q.get_task('prog-1', db_path=dbp)['progress']
+assert got and got['turn'] == 2 and got['last_tool']['tool'] == 'bash', got
+print('PASS 16a: progress snapshot written + parsed back on owned heartbeat')
+
+# a stale-token beat is rejected AND must not overwrite the stored progress
+ok2 = q.heartbeat('prog-1', 'wP', db_path=dbp, lease_token='WRONG',
+                  progress_json=_json.dumps({'turn': 99}))
+assert not ok2, 'stale-token beat must report not-owned'
+still = q.get_task('prog-1', db_path=dbp)['progress']
+assert still['turn'] == 2, f'stale beat must not overwrite progress, got {still}'
+print('PASS 16b: stale-token beat neither renews nor overwrites progress')
+
+# a beat with no progress must not clobber an existing snapshot (COALESCE)
+ok3 = q.heartbeat('prog-1', 'wP', db_path=dbp, lease_token=cp.lease_token)
+assert ok3
+keep = q.get_task('prog-1', db_path=dbp)['progress']
+assert keep and keep['turn'] == 2, 'progress-less beat must keep prior snapshot'
+print('PASS 16c: progress-less heartbeat preserves prior snapshot (COALESCE)')
+
+# re-claim clears stale progress
+conn = q.connect(dbp)
+conn.execute("UPDATE tasks SET status='pending', worker_id=NULL, lease_token=NULL, "
+             "lease_expires=NULL WHERE id='prog-1'")
+conn.commit(); conn.close()
+cp2 = q.claim_next('wP', db_path=dbp)
+assert cp2 and cp2.id == 'prog-1'
+assert q.get_task('prog-1', db_path=dbp)['progress'] is None, 're-claim must reset progress'
+print('PASS 16d: re-claim resets progress to NULL')
+os.remove(dbp)
+
 print('\nALL STATE-MACHINE ASSERTIONS PASSED')

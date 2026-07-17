@@ -421,6 +421,8 @@ def claim():
                 model=task.model, lease_token=task.lease_token,
                 kind=task.kind, review_of=task.review_of,
                 review_branch=task.review_branch,
+                repo=task.repo,
+                disable_mcp=task.disable_mcp,
             )), 200
         if time.time() >= deadline:
             return _stamp(Response('', status=204))
@@ -430,8 +432,17 @@ def claim():
 @app.post('/heartbeat')
 def heartbeat():
     body = request.get_json(force=True, silent=True) or {}
+    # progress: accept either a pre-serialised JSON string or an inline object
+    # (the worker sends a string; be lenient for manual/other callers).
+    prog = body.get('progress')
+    if prog is not None and not isinstance(prog, str):
+        try:
+            prog = json.dumps(prog)
+        except (TypeError, ValueError):
+            prog = None
     alive = q.heartbeat(body['task_id'], body['worker_id'],
-                        lease_token=body.get('lease_token'))
+                        lease_token=body.get('lease_token'),
+                        progress_json=prog)
     # A heartbeat means the worker is busy on this task — keep its liveness fresh.
     q.upsert_worker(body['worker_id'], status='busy',
                     current_task=body['task_id'], host=request.remote_addr)
@@ -471,6 +482,9 @@ def add():
             model=b.get('model'),
             deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
             review_max=int(b.get('review_max', 0)),
+            repo=b.get('repo', 'lab.git'),
+            disable_mcp=b.get('disable_mcp'),
+            kind=b.get('kind', 'work'),
         )
     except KeyError as exc:
         return jsonify(error=f'missing required field: {exc.args[0]}'), 400
@@ -644,7 +658,10 @@ def main():
     if not ssl_ctx:
         log.warning('TLS OFF — set HIVE_TLS_CERT/HIVE_TLS_KEY to encrypt (issue #8)')
     servers = []
-    for addr in addrs:
+
+    def _try_bind(addr):
+        """Bind+serve one address. Returns True on success, False if the address
+        is not assigned on the host yet (EADDRNOTAVAIL) or otherwise unbindable."""
         try:
             # threaded=True so long-poll /claim calls don't block reaper/others.
             srv = make_server(addr, port, app, threaded=True, ssl_context=ssl_ctx)
@@ -652,12 +669,37 @@ def main():
             # werkzeug turns a bind failure into a printed msg + SystemExit(1),
             # stdlib would raise OSError -- tolerate both so an absent NIC is skipped.
             log.warning('skip bind %s:%s (%s)', addr, port, exc or 'bind failed')
-            continue
+            return False
         servers.append(srv)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         log.info('listening on %s://%s:%s', scheme, addr, port)
-    if not servers:
+        return True
+
+    pending = [a for a in addrs if not _try_bind(a)]
+    if not servers and not pending:
         raise SystemExit(f'[server] FATAL: could not bind any of {addrs}:{port}')
+
+    # I2: self-heal the recurring "loopback-only" bug. The lab NIC (virbr1,
+    # 192.168.100.1) is frequently not yet assigned when this unit starts (it is
+    # brought up by libvirtd, which races network-online.target), so its bind is
+    # skipped and the control plane otherwise serves loopback-only FOREVER — all
+    # remote workers see "hal not responding" and Restart=on-failure never fires
+    # because nothing crashed. Retry any skipped address in the background until
+    # the bridge comes up, so remote workers reconnect with no manual restart.
+    # git_http_server already does this; this ports the same proven loop here.
+    if pending:
+        def _rebind_loop(addrs_pending):
+            remaining = list(addrs_pending)
+            while remaining and not stop.is_set():
+                stop.wait(5)
+                if stop.is_set():
+                    break
+                remaining = [a for a in remaining if not _try_bind(a)]
+            if not remaining:
+                log.info('all expected addresses now bound (%r:%s)', addrs, port)
+        threading.Thread(target=_rebind_loop, args=(pending,), daemon=True).start()
+        log.warning('%d address(es) not yet assigned %r — retrying every 5s '
+                    'until bound (no manual restart needed)', len(pending), pending)
     try:
         stop.wait()
     except KeyboardInterrupt:

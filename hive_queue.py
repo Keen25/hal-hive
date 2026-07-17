@@ -48,7 +48,7 @@ MERGE_INTERVAL_S  = 2                # §7 merge-loop cadence
 VERIFY_LEASE      = '+30 minutes'    # §7 max time a task may sit in 'verifying'
 REVIEW_STALL_MIN  = 15               # unclaimable review older than this -> degrade
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 15
 
 # Max length of the human-readable task summary shown on the dashboard/CLI in
 # place of the full prompt. Kept short so it fits one table cell / status line.
@@ -149,7 +149,10 @@ CREATE TABLE IF NOT EXISTS tasks (
     review_max    INTEGER NOT NULL DEFAULT 0,   -- author: max review rounds (0 = review disabled)
     review_round  INTEGER NOT NULL DEFAULT 0,   -- author: how many review rounds have COMPLETED
     review_of     TEXT,                         -- review task -> the author task id it reviews
-    review_exclude_worker TEXT                  -- review task -> worker_id that must NOT claim it (the author's worker)
+    review_exclude_worker TEXT,                 -- review task -> worker_id that must NOT claim it (the author's worker)
+    repo          TEXT NOT NULL DEFAULT 'lab.git', -- central bare repo the task clones/pushes (lab.git | ActiveRoles.git ...)
+    progress_json TEXT,                           -- live in-flight progress snapshot from the worker heartbeat (last tool, turn, events, elapsed); NULL until first beat
+    disable_mcp   TEXT                             -- space-separated MCP server names to suppress for this task's copilot run (--disable-mcp-server); NULL = load all configured servers
 );
 
 CREATE TABLE IF NOT EXISTS task_deps (
@@ -252,6 +255,29 @@ def init_db(db_path: str = QUEUE_DB) -> None:
             cur.execute('ALTER TABLE tasks ADD COLUMN review_of TEXT')
         if 'review_exclude_worker' not in cols:
             cur.execute('ALTER TABLE tasks ADD COLUMN review_exclude_worker TEXT')
+        # Repo routing: a task clones/pushes a named central bare repo (served by
+        # git_http_server on :8418). Default 'lab.git' keeps all existing tasks
+        # unchanged; ARS tasks carry 'ActiveRoles.git' so real source changes land
+        # centrally (reviewable + promotable) instead of escaping to an out-of-band
+        # checkout. Non-lab repos are NEVER auto-merged into their base branch —
+        # they are delivered to the mirror and pushed to ADO via `halctl promote`.
+        if 'repo' not in cols:
+            cur.execute("ALTER TABLE tasks ADD COLUMN repo TEXT NOT NULL DEFAULT 'lab.git'")
+        # Migration v13 -> v14: live in-flight progress. The worker heartbeat
+        # ships a compact snapshot (last tool call, turn depth, event count,
+        # elapsed, running usage) parsed from the live copilot JSONL log so the
+        # dashboard can show WHAT a busy worker is doing NOW instead of a blank
+        # 'claimed' box until completion. NULL until the first beat carries one.
+        if 'progress_json' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN progress_json TEXT')
+        # Migration v14 -> v15: per-task, context-scoped MCP. A task may carry a
+        # space-separated list of MCP server names the worker suppresses for that
+        # task's copilot run via the CLI's native --disable-mcp-server flag. This
+        # scopes the agent's toolset per session WITHOUT editing the global
+        # ~/.copilot/mcp-config.json (no cross-task stomp; fully reversible).
+        # NULL = load every configured server, so existing tasks are unchanged.
+        if 'disable_mcp' not in cols:
+            cur.execute('ALTER TABLE tasks ADD COLUMN disable_mcp TEXT')
         cur.execute(f'PRAGMA user_version = {SCHEMA_VERSION};')
 
 
@@ -274,6 +300,39 @@ def canon_tags(value) -> Optional[str]:
     """Canonical stored form: sorted, space-joined, or None when empty."""
     tags = parse_tags(value)
     return ' '.join(sorted(tags)) if tags else None
+
+
+def parse_mcp_names(value) -> list[str]:
+    """Normalise an MCP-server-name spec into an ordered, de-duplicated list.
+
+    Accepts a list/tuple/set or a comma/whitespace-separated string. Unlike
+    capability tags, MCP server names are NOT lowercased or sorted — they must
+    match the exact key in ~/.copilot/mcp-config.json (e.g. 'azure-devops',
+    'microsoft-docs'), and preserving order keeps operator intent readable.
+    """
+    if not value:
+        return []
+    if isinstance(value, str):
+        parts = re.split(r'[\s,]+', value)
+    else:
+        parts = []
+        for item in value:
+            parts.extend(re.split(r'[\s,]+', str(item)))
+    out: list[str] = []
+    seen = set()
+    for p in parts:
+        p = p.strip()
+        if p and p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def canon_mcp_names(value) -> Optional[str]:
+    """Canonical stored form for disable_mcp: space-joined, order-preserving,
+    or None when empty (NULL = suppress nothing)."""
+    names = parse_mcp_names(value)
+    return ' '.join(names) if names else None
 
 
 def ensure_lab_repo(lab_git: str = LAB_GIT, base_ref: str = DEFAULT_BASE_REF) -> None:
@@ -337,6 +396,8 @@ def add_task(
     kind: str = 'work',
     review_of: Optional[str] = None,
     review_exclude_worker: Optional[str] = None,
+    repo: str = 'lab.git',
+    disable_mcp: Optional[list[str]] = None,
     db_path: str = QUEUE_DB,
 ) -> None:
     """Insert a task (+ its dependency edges) into the queue.
@@ -363,6 +424,8 @@ def add_task(
         from hive_caps import model_for_complexity
         model = model_for_complexity(complexity)
     branch = branch or f'feature/{task_id}'
+    repo = repo or 'lab.git'
+    disable_mcp_str = canon_mcp_names(disable_mcp)
     if summary:
         summary = ' '.join(summary.split())[:SUMMARY_MAX]
     else:
@@ -372,11 +435,11 @@ def add_task(
             """INSERT INTO tasks
                  (id, branch, base_ref, prompt, summary, worker, requires, scope,
                   priority, complexity, model, max_attempts,
-                  review_max, kind, review_of, review_exclude_worker)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                  review_max, kind, review_of, review_exclude_worker, repo, disable_mcp)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (task_id, branch, base_ref, prompt, summary, worker, canon_tags(requires),
              scope, priority, complexity, model, max_attempts,
-             review_max, kind, review_of, review_exclude_worker),
+             review_max, kind, review_of, review_exclude_worker, repo, disable_mcp_str),
         )
         for dep in (deps or []):
             cur.execute(
@@ -400,6 +463,8 @@ class ClaimedTask:
     kind: str = 'work'
     review_of: Optional[str] = None
     review_branch: Optional[str] = None
+    repo: str = 'lab.git'
+    disable_mcp: Optional[str] = None
 
 
 def claim_next(worker_id: str, worker_lane: Optional[str] = None,
@@ -438,8 +503,9 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
         rows = conn.execute(
             """
             SELECT t.id, t.branch, t.base_ref, t.prompt, t.scope, t.attempts,
-                   t.requires, t.model, t.kind, t.review_of,
-                   (SELECT a.branch FROM tasks a WHERE a.id = t.review_of) AS review_branch
+                   t.requires, t.model, t.kind, t.review_of, t.repo, t.disable_mcp,
+                   (SELECT a.branch FROM tasks a WHERE a.id = t.review_of) AS review_branch,
+                   (SELECT a.repo   FROM tasks a WHERE a.id = t.review_of) AS review_repo
             FROM tasks t
             WHERE t.status = 'pending'
               AND (t.not_before IS NULL OR t.not_before <= datetime('now'))
@@ -479,6 +545,7 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
                 attempts      = attempts + 1,
                 claimed_at    = datetime('now'),
                 heartbeat_at  = datetime('now'),
+                progress_json = NULL,
                 lease_expires = datetime('now', :lease)
             WHERE id = :tid
             """,
@@ -493,6 +560,10 @@ def _claim_next_once(worker_id: str, worker_lane: Optional[str] = None,
             lease_token=lease_token,
             kind=chosen['kind'], review_of=chosen['review_of'],
             review_branch=chosen['review_branch'],
+            # A review task clones the AUTHOR's repo (review_repo) so the reviewer
+            # sees the same mirror the change lives in; work tasks use their own.
+            repo=(chosen['review_repo'] or chosen['repo'] or 'lab.git'),
+            disable_mcp=chosen['disable_mcp'],
         )
     except Exception:
         conn.execute('ROLLBACK;')
@@ -513,23 +584,30 @@ def mark_running(task_id: str, worker_id: str, db_path: str = QUEUE_DB) -> None:
 # ── Heartbeat (fixes C3) ───────────────────────────────────────────────────────
 
 def heartbeat(task_id: str, worker_id: str, db_path: str = QUEUE_DB,
-              lease_token: Optional[str] = None) -> bool:
+              lease_token: Optional[str] = None,
+              progress_json: Optional[str] = None) -> bool:
     """Renew the lease. Returns False if the task was reaped/reassigned (stop work).
 
     When `lease_token` is supplied it must match the token stored at claim time,
     so a worker that lost its claim (reaped, then re-claimed by anyone — including
     a new claim by the same worker_id) is told to abandon rather than renewing a
-    lease it no longer owns."""
+    lease it no longer owns.
+
+    `progress_json` (optional) is a compact live-progress snapshot built by the
+    worker from the in-flight copilot log; it is persisted only when the lease is
+    still owned (same WHERE guard), so a stale beat can never overwrite the
+    progress of a re-claimed task."""
     with cursor(db_path) as cur:
         cur.execute(
             """
             UPDATE tasks
             SET heartbeat_at  = datetime('now'),
-                lease_expires = datetime('now', ?)
+                lease_expires = datetime('now', ?),
+                progress_json = COALESCE(?, progress_json)
             WHERE id = ? AND worker_id = ? AND status IN ('claimed','running')
               AND (? IS NULL OR lease_token = ?)
             """,
-            (HEARTBEAT_RENEW, task_id, worker_id, lease_token, lease_token),
+            (HEARTBEAT_RENEW, progress_json, task_id, worker_id, lease_token, lease_token),
         )
         return cur.rowcount > 0
 
@@ -575,6 +653,35 @@ def complete_task(
         ).fetchone()
         if row is None:
             raise KeyError(f'unknown task {task_id}')
+
+        # I3: a 'probe' (read-only / diagnostic) task NEVER merges and NEVER
+        # requeues on an empty result. A build check, log read, or validation run
+        # legitimately produces no commit — under the normal path that returns
+        # exit_code=1 'no changes produced' and is retried up to max_attempts,
+        # repaying the full fresh-clone cost each cycle. Here a probe that exits 0
+        # (which the worker returns even when it wrote no commit) goes straight to
+        # the terminal 'probed' state on the FIRST run. A non-zero exit is a real
+        # failure (copilot crash/timeout) and falls through to retry/dead-letter
+        # exactly like a normal task, so probes still surface genuine breakage.
+        if row['kind'] == 'probe':
+            if exit_code == 0:
+                cur.execute(
+                    f"""UPDATE tasks
+                       SET status='probed', done_at=datetime('now'),
+                           exit_code=?, commit_hash=?, turns=?, cost_pr=?,
+                           log_path=?, log_tail=?, error=NULL,
+                           usage_json=COALESCE(?, usage_json),
+                           lease_expires=NULL, heartbeat_at=NULL
+                       WHERE id=? AND {guard}""",
+                    (exit_code, commit_hash, turns, cost_pr, log_path, log_tail,
+                     usage_json, task_id, worker_id, lease_token, lease_token),
+                )
+                if cur.rowcount == 0:
+                    log.warning('ignored stale/late probe-complete for %s by %s',
+                                task_id, worker_id)
+                    return 'stale'
+                return 'probed'
+            # exit_code != 0 -> fall through to the retry/dead-letter path below.
 
         # A 'review' task never merges: the worker posts its verdict to the
         # /review endpoint (which closes it server-side to 'reviewed'). If a
@@ -732,7 +839,7 @@ def spawn_review(author_id: str, db_path: str = QUEUE_DB) -> str:
     with cursor(db_path) as cur:
         row = cur.execute(
             """SELECT prompt, branch, base_ref, worker_id, review_round,
-                      priority, complexity, model
+                      priority, complexity, model, disable_mcp
                FROM tasks WHERE id=?""",
             (author_id,),
         ).fetchone()
@@ -764,6 +871,7 @@ def spawn_review(author_id: str, db_path: str = QUEUE_DB) -> str:
         kind='review',
         review_of=author_id,
         review_exclude_worker=row['worker_id'],
+        disable_mcp=row['disable_mcp'],
         db_path=db_path,
     )
     log.info('spawned review %s for author %s (excludes worker %s)',
@@ -1087,6 +1195,20 @@ def _merge_one(db_path: str, task: sqlite3.Row) -> None:
     """
     branch, base_ref = task['branch'], task['base_ref'] or DEFAULT_BASE_REF
     task_id = task['id']
+    # Repo routing: only lab.git is auto-merged into its base branch here. A task
+    # on a mirror repo (e.g. ActiveRoles.git) has already pushed its branch to the
+    # central mirror; we deliberately do NOT rebase/ff-merge it into the mirror's
+    # base branch — that base tracks an external upstream (ADO) and integration is
+    # a human-gated `halctl promote` (review→validate→apply to the ADO PR). So we
+    # mark it 'merged' (== delivered to the mirror, ready to promote) and stop.
+    repo = (task['repo'] if 'repo' in task.keys() else None) or 'lab.git'
+    if repo != 'lab.git':
+        _set_status(db_path, task_id, 'merged',
+                    commit_hash=task['commit_hash'], clear_lease=True)
+        hive_log.incr('merges')
+        log.info('delivered %s to mirror %s (branch %s) — awaiting promote',
+                 task_id, repo, branch)
+        return
     # Stamp a lease on 'verifying' so a merge-loop crash mid-transition is
     # recoverable: merge_once sweeps expired 'verifying' rows back to 'done'
     # (see _sweep_stale_verifying). Without this the row would have a NULL lease,
@@ -1436,7 +1558,8 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
         rows = [dict(r) for r in cur.execute(
             """SELECT id, status, worker_id, worker, requires, priority,
                       complexity, model, branch, commit_hash, error, prompt, summary,
-                      created_at, done_at, usage_json, kind, review_of, review_round
+                      created_at, done_at, usage_json, kind, review_of, review_round,
+                      progress_json, heartbeat_at
                FROM tasks ORDER BY
                  CASE status WHEN 'running' THEN 0 WHEN 'claimed' THEN 1
                              WHEN 'pending' THEN 2 ELSE 3 END,
@@ -1476,6 +1599,17 @@ def status_snapshot(db_path: str = QUEUE_DB) -> dict:
             except Exception:
                 pass
         row['usage'] = usage
+        # Live in-flight progress snapshot (present only for claimed/running
+        # tasks whose worker has sent at least one beat). Parse to an object so
+        # the dashboard can render it directly; drop the raw string.
+        raw_prog = row.pop('progress_json', None)
+        prog = None
+        if raw_prog:
+            try:
+                prog = _json.loads(raw_prog)
+            except Exception:
+                prog = None
+        row['progress'] = prog
     return {
         'counts': counts,
         'tasks': rows,
@@ -1510,6 +1644,12 @@ def get_task(task_id: str, db_path: str = QUEUE_DB) -> Optional[dict]:
         task['usage'] = _json.loads(raw_usage) if raw_usage else None
     except Exception:
         task['usage'] = None
+    # Parse the live progress snapshot (present for in-flight tasks) into a dict.
+    raw_prog = task.get('progress_json')
+    try:
+        task['progress'] = _json.loads(raw_prog) if raw_prog else None
+    except Exception:
+        task['progress'] = None
     # Best-effort "last activity": most recent of the lifecycle timestamps.
     task['last_activity'] = max(
         (t for t in (task.get('created_at'), task.get('claimed_at'),

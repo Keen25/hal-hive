@@ -28,7 +28,7 @@ _ICON = {
     'running': '▶', 'claimed': '◔', 'pending': '·', 'done': '✓',
     'verifying': '⟳', 'awaiting_review': '⧗', 'reviewed': '⊚',
     'merged': '●', 'needs_attention': '⚠', 'failed': '✗',
-    'dead': '☠', 'cancelled': '⊘',
+    'dead': '☠', 'cancelled': '⊘', 'probed': '⊙',
 }
 
 
@@ -47,16 +47,24 @@ def cmd_add(a):
                worker=a.worker, requires=a.require, scope=a.scope,
                priority=a.priority, complexity=complexity, model=model,
                deps=a.dep, max_attempts=a.max_attempts, summary=a.summary,
-               review_max=a.review)
+               review_max=a.review, repo=a.repo,
+               disable_mcp=a.disable_mcp,
+               kind='probe' if getattr(a, 'probe', False) else 'work')
     bits = [f'+ {tid}', f'prio={a.priority}',
             f'cx={complexity}/{model}{auto_note}',
             f'branch={a.branch or f"feature/{tid}"}']
+    if getattr(a, 'probe', False):
+        bits.append('kind=probe')
+    if a.repo and a.repo != 'lab.git':
+        bits.append(f'repo={a.repo}')
     if a.worker:
         bits.append(f'pin={a.worker}')
     if a.require:
         bits.append(f'requires={",".join(a.require)}')
     if a.dep:
         bits.append(f'deps={",".join(a.dep)}')
+    if getattr(a, 'disable_mcp', None):
+        bits.append(f'disable_mcp={",".join(q.parse_mcp_names(a.disable_mcp))}')
     if a.review:
         bits.append(f'review={a.review}')
     print('  '.join(bits))
@@ -84,11 +92,164 @@ def cmd_classify(a):
         print(f"  · {why}")
 
 
+# ── promote: the human-gated bridge from the hive mirror to ADO ────────────────
+# review -> validate -> apply. Air-gap preserved: the hive never pushes to ADO on
+# its own; an operator runs `halctl promote <task>` and confirms before anything
+# reaches the ADO PR branch.
+
+_ADO_RESOURCE = '499b84ac-1321-427f-aa17-267ca6975798'  # Azure DevOps AAD resource
+_ADO_ARS_URL = ('https://dev.azure.com/1id/Active%20Roles/_git/ActiveRoles')
+
+
+def _run(cmd, cwd=None, check=True, capture=True):
+    import subprocess
+    r = subprocess.run(cmd, cwd=cwd, text=True,
+                       capture_output=capture)
+    if check and r.returncode != 0:
+        err = (r.stderr or r.stdout or '').strip()
+        raise RuntimeError(f'command failed ({r.returncode}): {" ".join(cmd)}\n{err}')
+    return r
+
+
+def _ado_token():
+    r = _run(['az', 'account', 'get-access-token', '--resource', _ADO_RESOURCE,
+              '--query', 'accessToken', '-o', 'tsv'])
+    tok = r.stdout.strip()
+    if not tok:
+        raise RuntimeError('could not mint ADO token (az account get-access-token '
+                           'returned empty — run `az login`)')
+    return tok
+
+
+def cmd_promote(a):
+    """Promote a delivered mirror task's branch onto its ADO PR branch.
+
+    Flow: fetch the task branch from the local hive mirror -> show the diff and
+    commit list (REVIEW) -> summarize what will change (VALIDATE) -> on --yes,
+    cherry-pick the task's commits onto the live ADO PR branch and push (APPLY).
+    Default is a dry run: nothing is pushed without --yes.
+    """
+    import os
+    import subprocess
+    import sqlite3
+    import tempfile
+    import shutil
+
+    # 1. Look up the task.
+    con = q.connect(q.QUEUE_DB)
+    con.row_factory = sqlite3.Row
+    row = con.execute('SELECT id, branch, base_ref, repo, status FROM tasks WHERE id=?',
+                      (a.task_id,)).fetchone()
+    if row is None:
+        print(f'unknown task {a.task_id}', file=sys.stderr); sys.exit(2)
+    repo = row['repo'] or 'lab.git'
+    if repo == 'lab.git':
+        print(f'{a.task_id} is a lab.git task — promote is for mirror-repo (ADO) '
+              f'tasks only.', file=sys.stderr); sys.exit(2)
+    branch = row['branch']
+    base_ref = row['base_ref']
+    pr_branch = a.pr_branch or base_ref
+    mirror_dir = os.path.expanduser(a.mirror_dir or os.path.join(q.HIVE_DIR, repo))
+    if row['status'] not in ('merged', 'reviewed', 'done'):
+        print(f'warning: {a.task_id} status is {row["status"]} (expected merged/'
+              f'reviewed) — the worker may not have delivered its branch yet.',
+              file=sys.stderr)
+
+    if not os.path.isdir(mirror_dir):
+        print(f'mirror repo not found: {mirror_dir}', file=sys.stderr); sys.exit(2)
+
+    SB = ['-c', 'safe.bareRepository=all']
+    # Confirm the task branch exists on the mirror.
+    r = _run(['git', *SB, '--git-dir', mirror_dir, 'rev-parse', '--verify',
+              f'refs/heads/{branch}'], check=False)
+    if r.returncode != 0:
+        print(f'task branch {branch} not present on mirror {repo} — did the worker '
+              f'push it? (status={row["status"]})', file=sys.stderr); sys.exit(2)
+
+    print(f'promote {a.task_id}: mirror {repo} branch {branch} -> ADO {pr_branch}')
+
+    # 2. Fresh ADO clone at the PR branch (no persisted auth header -> avoids the
+    #    duplicate-Authorization 400). Blobless for speed; we only need the tip
+    #    tree + the ability to cherry-pick.
+    tok = _ado_token()
+    authhdr = f'http.extraheader=Authorization: Bearer {tok}'
+    work = tempfile.mkdtemp(prefix=f'promote-{a.task_id}-')
+    keep_work = False
+    try:
+        cl = _run(['git', '-c', authhdr, 'clone', '--filter=blob:none',
+                   '--single-branch', '--branch', pr_branch,
+                   _ADO_ARS_URL, work], check=False)
+        if cl.returncode != 0:
+            print(f'ADO clone of {pr_branch} failed:\n{cl.stderr.strip()}',
+                  file=sys.stderr); sys.exit(1)
+
+        def g(*args, check=True):
+            return _run(['git', '-c', authhdr, *args], cwd=work, check=check)
+
+        g('config', 'user.name', 'Arpad Fodor')
+        g('config', 'user.email', 'Arpad.Fodor@quest.com')
+
+        # 3. Bring the task branch's commits in from the hive mirror.
+        g('remote', 'add', 'hive', mirror_dir)
+        g('-c', 'safe.bareRepository=all', 'fetch', 'hive', branch)
+        # The task's own commits = base_ref..task_branch. base_ref exists in the
+        # ADO clone (it's the PR branch we cloned). Resolve the mirror base too.
+        mirror_base = _run(['git', *SB, '--git-dir', mirror_dir, 'rev-parse',
+                            f'refs/heads/{base_ref}'], check=False).stdout.strip()
+        rangespec = f'{mirror_base}..FETCH_HEAD' if mirror_base else 'FETCH_HEAD~1..FETCH_HEAD'
+        commits = g('rev-list', '--reverse', rangespec).stdout.split()
+
+        # 4. REVIEW — show the diff and commit list.
+        print(f'\n── commits to promote ({len(commits)}) ─────────────────────────')
+        print(g('log', '--oneline', '--no-decorate', rangespec, '-n', '50').stdout.rstrip())
+        print('\n── diffstat ─────────────────────────────────────────────────')
+        print((g('diff', '--stat', mirror_base, 'FETCH_HEAD').stdout.rstrip()
+               if mirror_base else g('show', '--stat', 'FETCH_HEAD').stdout.rstrip()))
+        if a.show_diff:
+            print('\n── full diff ────────────────────────────────────────────────')
+            print(g('diff', mirror_base, 'FETCH_HEAD').stdout)
+
+        # 5. VALIDATE — summary + guardrails.
+        print('\n── validate ─────────────────────────────────────────────────')
+        print(f'  target ADO branch : {pr_branch}')
+        print(f'  commits to apply  : {len(commits)}')
+        print(f'  strategy          : cherry-pick onto live {pr_branch} tip, then push')
+        print('  note              : ADO CI is the authoritative build/test gate')
+
+        if not commits:
+            print('\nnothing to promote (no commits in range).'); return
+
+        # 6. APPLY — only with --yes.
+        if not a.yes:
+            print('\n[dry run] re-run with --yes to cherry-pick and push to ADO.')
+            print('          add --show-diff to print the full patch.')
+            return
+
+        cp = g('cherry-pick', *commits, check=False)
+        if cp.returncode != 0:
+            print(f'cherry-pick failed (conflict) — resolve manually in {work}:\n'
+                  f'{cp.stdout}\n{cp.stderr}', file=sys.stderr)
+            print(f'workspace kept at {work} for manual resolution.')
+            keep_work = True
+            return  # keep workspace; do not rmtree in finally
+        push = g('push', 'origin', f'HEAD:{pr_branch}', check=False)
+        if push.returncode != 0:
+            print(f'push to ADO failed:\n{push.stderr.strip()}', file=sys.stderr)
+            sys.exit(1)
+        tip = g('rev-parse', 'HEAD').stdout.strip()
+        print(f'\n✓ promoted {a.task_id}: {len(commits)} commit(s) pushed to '
+              f'ADO {pr_branch} (tip {tip[:10]}).')
+        print('  ADO CI will now validate. Reply/resolve the PR review thread if applicable.')
+    finally:
+        if os.path.isdir(work) and not keep_work:
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def cmd_status(a):
     snap = q.status_snapshot()
     counts = snap['counts']
     order = ['running', 'claimed', 'pending', 'done', 'verifying',
-             'awaiting_review', 'reviewed', 'merged',
+             'awaiting_review', 'reviewed', 'merged', 'probed',
              'needs_attention', 'dead', 'cancelled']
     summary = '  '.join(f'{_ICON.get(s,"?")} {s}:{counts[s]}'
                         for s in order if s in counts)
@@ -232,6 +393,23 @@ def main():
     pa.add_argument('--review', type=int, default=0, metavar='N',
                     help='spawn N rounds of automated peer review before merge '
                          '(0 = disabled, default)')
+    pa.add_argument('--repo', default='lab.git',
+                    help='central bare repo the task clones/pushes, served on '
+                         ':8418 (default lab.git). Use ActiveRoles.git for ARS '
+                         'source tasks so the change lands centrally and is '
+                         'reviewable + promotable to ADO via `halctl promote`.')
+    pa.add_argument('--disable-mcp', action='append', metavar='SERVER',
+                    help='MCP server name to suppress for this task\'s copilot '
+                         'run (repeatable; also accepts a comma/space list). '
+                         'Names must match the key in ~/.copilot/mcp-config.json '
+                         '(e.g. salesforce, pagerduty). Scopes the agent toolset '
+                         'per session via --disable-mcp-server without touching '
+                         'the global MCP config. Default: load all configured.')
+    pa.add_argument('--probe', action='store_true',
+                    help='read-only / diagnostic task (kind=probe): a run that '
+                         'produces no commit finishes terminally (probed) on the '
+                         'first attempt instead of requeuing. Never merges. Use '
+                         'for build checks, log reads, validation runs.')
     pa.set_defaults(fn=cmd_add)
 
     ps = sub.add_parser('status', help='fleet snapshot')
@@ -242,6 +420,17 @@ def main():
     pcl.add_argument('prompt')
     pcl.add_argument('--json', action='store_true', help='machine-readable output')
     pcl.set_defaults(fn=cmd_classify)
+
+    ppr = sub.add_parser('promote',
+                         help='review+push a delivered mirror task branch to its ADO PR branch')
+    ppr.add_argument('task_id')
+    ppr.add_argument('--pr-branch', help='ADO target branch (default: the task base_ref)')
+    ppr.add_argument('--mirror-dir', help='hive bare mirror path (default ~/hive/<repo>)')
+    ppr.add_argument('--show-diff', action='store_true', help='print the full patch, not just diffstat')
+    ppr.add_argument('--yes', action='store_true',
+                     help='APPLY: cherry-pick onto the ADO PR branch and push '
+                          '(default is a dry-run review only)')
+    ppr.set_defaults(fn=cmd_promote)
 
     pc = sub.add_parser('cancel', help='cancel a task')
     pc.add_argument('task_id')

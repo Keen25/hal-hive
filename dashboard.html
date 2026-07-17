@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>HAL Swarm — Control Plane</title>
+<title>HAL — the school · Control Plane</title>
 <style>
   :root {
     --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#c9d1d9;
@@ -65,6 +65,8 @@
   .b-done,.b-verifying{background:rgba(210,153,34,.15);color:var(--warn);}
   .b-awaiting_review{background:rgba(163,113,247,.22);color:#d2a8ff;}
   .b-reviewed{background:rgba(63,185,80,.10);color:var(--merge);}
+  .b-probed{background:rgba(88,166,255,.12);color:#79c0ff;}
+  .b-kind-probe{background:rgba(210,153,34,.14);color:#e3b341;}
   .b-merged{background:rgba(63,185,80,.15);color:var(--merge);}
   .b-needs_attention{background:rgba(210,153,34,.20);color:var(--warn);}
   .b-dead,.b-cancelled{background:rgba(248,81,73,.15);color:var(--bad);}
@@ -97,6 +99,8 @@
   .btn:hover{ border-color:var(--bad); color:var(--bad); }
   .empty { padding:22px; text-align:center; color:var(--muted); }
   .err { color:var(--bad); font-size:11px; }
+  .prog { color:var(--run); font-size:11px; margin-top:3px; max-width:320px;
+    overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-family:var(--mono,monospace); opacity:.9; }
   .addw { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; }
   .addw label { display:flex; flex-direction:column; gap:3px; font-size:11px;
                 text-transform:uppercase; letter-spacing:.5px; color:var(--muted); }
@@ -132,7 +136,7 @@
 <header>
   <svg class="logo" viewBox="0 0 45 21" xmlns="http://www.w3.org/2000/svg" shape-rendering="crispEdges" role="img" aria-label="pixel fish"><rect x="12" y="0" width="3" height="3" fill="#58a6ff"/><rect x="15" y="0" width="3" height="3" fill="#58a6ff"/><rect x="18" y="0" width="3" height="3" fill="#58a6ff"/><rect x="21" y="0" width="3" height="3" fill="#58a6ff"/><rect x="24" y="0" width="3" height="3" fill="#58a6ff"/><rect x="42" y="0" width="3" height="3" fill="#388bfd"/><rect x="6" y="3" width="3" height="3" fill="#58a6ff"/><rect x="9" y="3" width="3" height="3" fill="#58a6ff"/><rect x="12" y="3" width="3" height="3" fill="#79c0ff"/><rect x="15" y="3" width="3" height="3" fill="#79c0ff"/><rect x="18" y="3" width="3" height="3" fill="#79c0ff"/><rect x="21" y="3" width="3" height="3" fill="#58a6ff"/><rect x="24" y="3" width="3" height="3" fill="#58a6ff"/><rect x="27" y="3" width="3" height="3" fill="#58a6ff"/><rect x="36" y="3" width="3" height="3" fill="#388bfd"/><rect x="39" y="3" width="3" height="3" fill="#388bfd"/><rect x="42" y="3" width="3" height="3" fill="#388bfd"/><rect x="3" y="6" width="3" height="3" fill="#58a6ff"/><rect x="6" y="6" width="3" height="3" fill="#58a6ff"/><rect x="9" y="6" width="3" height="3" fill="#79c0ff"/><rect x="12" y="6" width="3" height="3" fill="#79c0ff"/><rect x="15" y="6" width="3" height="3" fill="#79c0ff"/><rect x="18" y="6" width="3" height="3" fill="#79c0ff"/><rect x="21" y="6" width="3" height="3" fill="#79c0ff"/><rect x="24" y="6" width="3" height="3" fill="#58a6ff"/><rect x="27" y="6" width="3" height="3" fill="#58a6ff"/><rect x="30" y="6" width="3" height="3" fill="#58a6ff"/><rect x="33" y="6" width="3" height="3" fill="#388bfd"/><rect x="36" y="6" width="3" height="3" fill="#388bfd"/><rect x="39" y="6" width="3" height="3" fill="#388bfd"/><rect x="42" y="6" width="3" height="3" fill="#388bfd"/><rect x="0" y="9" width="3" height="3" fill="#58a6ff"/><rect x="3" y="9" width="3" height="3" fill="#0d1117"/><rect x="6" y="9" width="3" height="3" fill="#58a6ff"/><rect x="9" y="9" width="3" height="3" fill="#79c0ff"/><rect x="12" y="9" width="3" height="3" fill="#79c0ff"/><rect x="15" y="9" width="3" height="3" fill="#79c0ff"/><rect x="18" y="9" width="3" height="3" fill="#79c0ff"/><rect x="21" y="9" width="3" height="3" fill="#79c0ff"/><rect x="24" y="9" width="3" height="3" fill="#58a6ff"/><rect x="27" y="9" width="3" height="3" fill="#58a6ff"/><rect x="30" y="9" width="3" height="3" fill="#58a6ff"/><rect x="33" y="9" width="3" height="3" fill="#388bfd"/><rect x="36" y="9" width="3" height="3" fill="#388bfd"/><rect x="3" y="12" width="3" height="3" fill="#58a6ff"/><rect x="6" y="12" width="3" height="3" fill="#58a6ff"/><rect x="9" y="12" width="3" height="3" fill="#79c0ff"/><rect x="12" y="12" width="3" height="3" fill="#79c0ff"/><rect x="15" y="12" width="3" height="3" fill="#79c0ff"/><rect x="18" y="12" width="3" height="3" fill="#79c0ff"/><rect x="21" y="12" width="3" height="3" fill="#79c0ff"/><rect x="24" y="12" width="3" height="3" fill="#58a6ff"/><rect x="27" y="12" width="3" height="3" fill="#58a6ff"/><rect x="30" y="12" width="3" height="3" fill="#58a6ff"/><rect x="33" y="12" width="3" height="3" fill="#388bfd"/><rect x="36" y="12" width="3" height="3" fill="#388bfd"/><rect x="39" y="12" width="3" height="3" fill="#388bfd"/><rect x="42" y="12" width="3" height="3" fill="#388bfd"/><rect x="6" y="15" width="3" height="3" fill="#58a6ff"/><rect x="9" y="15" width="3" height="3" fill="#58a6ff"/><rect x="12" y="15" width="3" height="3" fill="#79c0ff"/><rect x="15" y="15" width="3" height="3" fill="#79c0ff"/><rect x="18" y="15" width="3" height="3" fill="#79c0ff"/><rect x="21" y="15" width="3" height="3" fill="#58a6ff"/><rect x="24" y="15" width="3" height="3" fill="#58a6ff"/><rect x="27" y="15" width="3" height="3" fill="#58a6ff"/><rect x="36" y="15" width="3" height="3" fill="#388bfd"/><rect x="39" y="15" width="3" height="3" fill="#388bfd"/><rect x="42" y="15" width="3" height="3" fill="#388bfd"/><rect x="12" y="18" width="3" height="3" fill="#58a6ff"/><rect x="15" y="18" width="3" height="3" fill="#58a6ff"/><rect x="18" y="18" width="3" height="3" fill="#58a6ff"/><rect x="21" y="18" width="3" height="3" fill="#58a6ff"/><rect x="24" y="18" width="3" height="3" fill="#58a6ff"/><rect x="42" y="18" width="3" height="3" fill="#388bfd"/></svg>
   <span class="dot" id="livedot"></span>
-  <h1>HAL&nbsp;SWARM</h1>
+  <h1 title="hal = fish (Hungarian) · a nod to HAL 9000 · and a Hardware Abstraction Layer over the fleet">HAL&nbsp;School</h1>
   <span class="meta" id="clock"></span>
   <span class="spacer"></span>
   <span class="meta">queue :5001 · git-http :8418</span>
@@ -143,7 +147,7 @@
   <div class="cards" id="cards"></div>
   <div class="grid">
     <div>
-      <h2>Tasks</h2>
+      <h2 title="tasks flowing through the queue">The Current <span class="meta">tasks</span></h2>
       <div class="panel"><table id="tasktbl">
         <thead><tr>
           <th class="sortable" data-sort="id">ID<span class="arw"></span></th>
@@ -161,13 +165,13 @@
       </div>
     </div>
     <div>
-      <h2>Workers <button type="button" class="btn muted" id="prune_btn" style="font-size:11px;margin-left:8px">Prune offline</button></h2>
+      <h2 title="the fleet of workers (mini-HALs)">The School <span class="meta">workers</span> <button type="button" class="btn muted" id="prune_btn" style="font-size:11px;margin-left:8px">Prune offline</button></h2>
       <div class="panel" id="workers"><div class="empty">—</div></div>
       <h2 style="margin-top:22px">Transports</h2>
       <div class="panel" id="transports"><div class="empty">—</div></div>
-      <h2 style="margin-top:22px">Add a worker</h2>
+      <h2 style="margin-top:22px" title="provision a new worker into the fleet">Add a minnow <span class="meta">worker</span></h2>
       <div class="panel" style="padding:14px">
-        <button type="button" id="addw_open" class="bigbtn">+ Add a worker</button>
+        <button type="button" id="addw_open" class="bigbtn">+ Add a minnow</button>
       </div>
     </div>
   </div>
@@ -175,7 +179,7 @@
 
 <dialog id="addw_dlg" class="modal">
   <form method="dialog" class="modal-head">
-    <h2>Add a worker</h2>
+    <h2>Add a minnow <span class="meta">worker</span></h2>
     <button class="x" value="close" aria-label="Close" title="Close">&#10005;</button>
   </form>
   <div class="addw">
@@ -235,7 +239,7 @@ const H = { 'Authorization': 'Bearer ' + RO_TOKEN };
 // it once; it lives only in this browser tab's sessionStorage.
 function ctlToken(){ return sessionStorage.getItem('hive_ctl') || ''; }
 function ctlHeaders(){ return {'Authorization':'Bearer '+ctlToken(),'Content-Type':'application/json'}; }
-const ORDER = ['running','claimed','pending','done','verifying','awaiting_review','needs_attention','reviewed','merged','cancelled','dead'];
+const ORDER = ['running','claimed','pending','done','verifying','awaiting_review','needs_attention','reviewed','merged','probed','cancelled','dead'];
 const STATUS_RANK = Object.fromEntries(ORDER.map((s,i)=>[s,i]));
 // Sort state for the task table. Default: newest-first by time (current -> older).
 const SORT = { key:'time', dir:-1 };   // dir: 1 asc, -1 desc
@@ -288,6 +292,31 @@ let LAST_DATA = null;
 
 function el(t, cls, txt){ const e=document.createElement(t); if(cls)e.className=cls;
   if(txt!=null)e.textContent=txt; return e; }
+
+// Live in-flight progress line for a claimed/running task, built from the
+// worker heartbeat snapshot (last tool call, turn depth, elapsed). Keeps a busy
+// worker's row from being a blank box until the task completes.
+function fmtElapsed(s){
+  if(s==null) return '';
+  if(s<60) return s+'s';
+  const m=Math.floor(s/60), r=s%60; return m+'m'+(r?(' '+r+'s'):'');
+}
+function progressLine(p){
+  const d=el('div','prog');
+  let head;
+  if(p.last_tool){
+    const tl=p.last_tool;
+    head='🔧 '+(tl.tool||'?')+(tl.detail?': '+tl.detail:'');
+  } else if(p.last_msg){ head='💬 '+p.last_msg; }
+  else { head=(p.phase==='finishing'?'finishing…':'working…'); }
+  const bits=[];
+  if(p.turn!=null && p.turn>0) bits.push('turn '+p.turn);
+  const dur=fmtElapsed(p.elapsed_s); if(dur) bits.push(dur);
+  if(p.phase==='finishing') bits.push('finishing');
+  d.textContent = head + (bits.length? '  ('+bits.join(' · ')+')':'');
+  if(p.last_msg) d.title=p.last_msg;
+  return d;
+}
 
 async function poll(){
   const dot = document.getElementById('livedot');
@@ -346,10 +375,18 @@ function render(d){
     tr.appendChild(cell(t.title||'—','title'));
     const sc=document.createElement('td');
     sc.appendChild(el('span','badge b-'+t.status,t.status.replace('_',' ')));
+    // I3: read-only / diagnostic task class — flag it so the operator knows an
+    // empty result is expected (terminal 'probed'), not a failure.
+    if(t.kind==='probe'){ sc.appendChild(el('span','badge b-kind-probe','probe')); }
     // Peer-review linkage: a review task shows what it reviews; an author task
     // awaiting review shows its spawned review task id.
     if(t.review_of){ sc.appendChild(el('span','rtag','review of '+t.review_of)); }
     else if(t.status==='awaiting_review'){ sc.appendChild(el('span','rtag','rev '+t.id+'-rev'+((t.review_round||0)+1))); }
+    // Live in-flight progress (heartbeat snapshot): what the busy worker is
+    // doing NOW. Only claimed/running tasks carry a fresh progress object.
+    if(t.progress && ['claimed','running'].includes(t.status)){
+      sc.appendChild(progressLine(t.progress));
+    }
     if(t.error){ const e=el('div','err',t.error); sc.appendChild(e);} tr.appendChild(sc);
     tr.appendChild(cell(t.worker_id || t.worker || '—', 'muted'));
     tr.appendChild(cell(modelLabel(t), 'muted'));
@@ -363,7 +400,7 @@ function render(d){
     tr.appendChild(timeCell(t));
     const ac=document.createElement('td');
     const lb=el('button','btn','log'); lb.onclick=()=>viewLog(t.id); ac.appendChild(lb);
-    if(!['merged','cancelled','dead'].includes(t.status)){
+    if(!['merged','cancelled','dead','probed'].includes(t.status)){
       const b=el('button','btn','cancel'); b.onclick=()=>cancel(t.id); ac.appendChild(b);}
     tr.appendChild(ac);
     tb.appendChild(tr);
@@ -452,7 +489,7 @@ function timeCell(t){
   if(!ms) return cell('—','muted');
   const age = Math.max(0, Math.floor((Date.now()-ms)/1000));
   const td = el('td','muted', fmtAge(age));
-  const terminal = ['merged','cancelled','dead','done','needs_attention'].includes(t.status);
+  const terminal = ['merged','cancelled','dead','done','needs_attention','probed'].includes(t.status);
   td.title = (terminal && t.done_at ? 'finished ' : 'created ')
     + new Date(ms).toLocaleString() + (t.created_at?('  ·  created '+new Date(parseTs(t.created_at)).toLocaleString()):'');
   return td;

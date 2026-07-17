@@ -175,12 +175,21 @@ build/test on `ar1` to gate merges.
 
 - HAL host: `queue_server.service` (control plane) + `hive-worker@.service`
   (templated per lane, e.g. `hive-worker@hal.service`). See `~/hive/systemd/`.
-- Windows workers (ar1): `worker_loop.py` launched at boot by a **scheduled task**
-  (not direct WinRM — copilot needs a fuller session), reaching HAL's queue over
-  HTTP `http://<HAL>:5001` with the shared token. Dispatch to ar1 from Linux is
-  always via WinRM (pywinrm), never SSH.
+- Windows workers (ar1): `worker_loop.py` runs as a **WinSW Windows service**
+  (`hive-worker-<lane>.exe`, provisioned by `bootstrap.py`) under the
+  least-privilege local **`.\svc-hive`** account, `<onfailure restart>` on exit
+  (the retired scheduled-task/`run-worker.ps1` path as `fodor\a` is gone).
+  It reaches HAL's queue over HTTP `http://<HAL>:5001` with the shared token, and
+  clones/pushes over smart-HTTP (`:8418`). Dispatch to ar1 from Linux is
+  always via WinRM (pywinrm), never SSH. Per-task copilot ceiling =
+  `COPILOT_TIMEOUT_S` in the WinSW XML (bootstrap seeds 5400s; ar1 currently
+  2400s — an ARS full-solution build+test needs ~40 min, so keep this generous).
 
-### ar1 scheduled-task launch recipe (verified 2026-07-03)
+### ar1 scheduled-task launch recipe (one-shot `copilot` dispatch; verified 2026-07-03)
+
+> **Not the worker daemon.** The persistent worker runs as the `hive-worker-ar1`
+> **WinSW service** (above). This recipe is only for launching an *ad-hoc,
+> one-shot* `copilot` run on ar1 (mini-HAL dispatch outside the queue).
 
 Launching `copilot` on ar1 via a one-shot Scheduled Task is the ONLY reliable
 way to survive the WinRM session (direct `run_ps` dies on long agentic runs;
