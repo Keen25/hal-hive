@@ -86,6 +86,12 @@ def config() -> dict:
         'py_url': os.environ.get(
             'HIVE_PY_URL',
             'https://www.python.org/ftp/python/3.12.7/python-3.12.7-amd64.exe'),
+        # Per-task copilot subprocess ceiling (worker_loop COPILOT_TIMEOUT_S).
+        # Its code default is 840s (14 min) — far too short for an ARS full-solution
+        # build+test, which needs ~40 min+. Seed a generous 90 min so the timeout is
+        # reproducible from bootstrap and a re-provision never silently reverts a
+        # builder to 14 min. Override with HIVE_COPILOT_TIMEOUT_S.
+        'copilot_timeout': os.environ.get('HIVE_COPILOT_TIMEOUT_S', '5400'),
     }
 
 
@@ -108,6 +114,7 @@ def build_script(os_kind: str, lane: str, caps: str, wid: str, token: str) -> st
 def _windows(lane, caps, wid, token, cfg) -> str:
     cap_args = ' '.join(f'--cap {c}' for c in caps)
     q, g, ght, pyurl = cfg['queue'], cfg['git'], cfg['ghtok'], cfg['py_url']
+    timeout = cfg['copilot_timeout']
     if cfg['tls'] and cfg['ca_pem']:
         # Import the lab CA into LocalMachine\\Root so IWR (downloads) and
         # git-over-schannel verify HAL; python-requests ignores the Windows
@@ -125,7 +132,7 @@ def _windows(lane, caps, wid, token, cfg) -> str:
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $QUEUE = '{q}'; $GIT = '{g}'; $TOKEN = '{token}'; $GHTOK = '{ght}'
-$LANE = '{lane}'; $WID = '{wid}'; $DIR = 'C:\\hive'
+$LANE = '{lane}'; $WID = '{wid}'; $DIR = 'C:\\hive'; $TIMEOUT = '{timeout}'
 Write-Host "== HAL swarm worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
 New-Item -ItemType Directory -Force $DIR | Out-Null
 {ca_setup_ps}
@@ -269,6 +276,7 @@ $xml = @"
   <arguments>$DIR\\worker_loop.py --worker-id $WID --lane $LANE {cap_args}</arguments>
   <workingdirectory>$DIR</workingdirectory>
   <env name="PYTHONUNBUFFERED" value="1"/>
+  <env name="COPILOT_TIMEOUT_S" value="$TIMEOUT"/>
   <env name="HIVE_QUEUE_URL" value="$QUEUE"/>
   <env name="HIVE_TOKEN" value="$TOKEN"/>
   <env name="HIVE_LAB_GIT" value="$GIT"/>
@@ -317,6 +325,7 @@ def _unix(lane, caps, wid, token, cfg) -> str:
                   f'    <string>{_xml_escape(c)}</string>']
     prog_args_xml = '\n'.join(_prog)
     q, g, ght = cfg['queue'], cfg['git'], cfg['ghtok']
+    timeout = cfg['copilot_timeout']
     if cfg['tls'] and cfg['ca_pem']:
         # Plant the lab CA on the new box, then verify every fetch + all worker
         # traffic against it: requests honours REQUESTS_CA_BUNDLE and git honours
@@ -336,7 +345,7 @@ def _unix(lane, caps, wid, token, cfg) -> str:
 # HAL hive worker bootstrap (Linux/systemd or macOS/launchd)
 set -eu
 QUEUE='{q}'; GIT='{g}'; TOKEN='{token}'; GHTOK='{ght}'
-LANE='{lane}'; WID='{wid}'; DIR="$HOME/.hive-worker"
+LANE='{lane}'; WID='{wid}'; DIR="$HOME/.hive-worker"; TIMEOUT='{timeout}'
 echo "== HAL swarm worker bootstrap  lane=$LANE  id=$WID  caps={' '.join(caps) or '(auto)'} =="
 mkdir -p "$DIR"
 {ca_write_sh}
@@ -376,6 +385,7 @@ After=network-online.target
 ExecStart=$PY $ARGS
 WorkingDirectory=$DIR
 Environment=PYTHONUNBUFFERED=1
+Environment=COPILOT_TIMEOUT_S=$TIMEOUT
 Environment=HIVE_QUEUE_URL=$QUEUE
 Environment=HIVE_TOKEN=$TOKEN
 Environment=HIVE_LAB_GIT=$GIT
@@ -407,6 +417,7 @@ elif [ "$OS" = "Darwin" ]; then
   <key>WorkingDirectory</key><string>$DIR</string>
   <key>EnvironmentVariables</key><dict>
     <key>PYTHONUNBUFFERED</key><string>1</string>
+    <key>COPILOT_TIMEOUT_S</key><string>$TIMEOUT</string>
     <key>HIVE_QUEUE_URL</key><string>$QUEUE</string>
     <key>HIVE_TOKEN</key><string>$TOKEN</string>
     <key>HIVE_LAB_GIT</key><string>$GIT</string>

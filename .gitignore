@@ -4,9 +4,18 @@ queue.db-wal
 queue.db-shm
 *.db-wal
 *.db-shm
+queue.db.bak-*
+
+# Self-update timestamped backups (worker swaps the .py, keeps a .bak-<ts>)
+*.bak-*
 
 # Bare lab repo — separately managed (git://) and repaired; do not nest
 lab.git/
+
+# On-hive bare MIRROR of the ADO product repo (multi-GB packs) — runtime-fetched,
+# never source. Must be ignored or `git add -A` vacuums the whole 1.2 GB pack.
+ActiveRoles.git/
+*.git/
 
 # Worker scratch clones
 workspace/

@@ -104,6 +104,89 @@ def _parse_usage_from_log(path: str | None) -> dict | None:
         pass
     return last_usage
 
+
+# How much of the LIVE copilot log to scan each heartbeat for a progress
+# snapshot. Only the tail matters ("what is it doing NOW"); a large multi-MB
+# JSONL is never fully read on the hot heartbeat path.
+PROGRESS_TAIL_BYTES = int(os.environ.get('HIVE_PROGRESS_TAIL_BYTES', '65536'))
+
+
+class _ProgressHolder:
+    """Shared, mutable handle the Heartbeat reads to build a live snapshot.
+    The copilot log path is only born INSIDE run_task/run_review_task (mkstemp),
+    after the Heartbeat is already constructed in loop(); this holder bridges the
+    two so the heartbeat thread can tail the in-flight log. `log_path` is None
+    until the run sets it (heartbeat is a no-op progress-wise until then)."""
+    __slots__ = ('log_path', 'started_at')
+
+    def __init__(self):
+        self.log_path = None
+        self.started_at = time.time()
+
+
+def _progress_snapshot(log_path: str | None, started_at: float | None) -> dict | None:
+    """Build a compact in-flight progress snapshot from the tail of the live
+    copilot JSONL log. Returns None until the log exists / has parseable events.
+
+    Fields: last_tool (toolName + a human-legible arg + turn), last_msg (latest
+    assistant text), turn (max turnId seen in the tail), elapsed_s, phase
+    ('working' | 'finishing' once the terminal result frame appears). Cheap: tail
+    read only, unparseable/partial first line silently skipped."""
+    if not log_path or not os.path.exists(log_path):
+        return None
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, 'rb') as f:
+            if size > PROGRESS_TAIL_BYTES:
+                f.seek(-PROGRESS_TAIL_BYTES, os.SEEK_END)
+            data = f.read()
+    except OSError:
+        return None
+    last_tool = None
+    last_msg = None
+    turn = 0
+    result_seen = False
+    for line in data.decode('utf-8', errors='replace').splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue  # partial first line from the tail cut, or non-JSON noise
+        t = o.get('type')
+        if t == 'tool.execution_start':
+            d = o.get('data') or {}
+            args = d.get('arguments') or {}
+            detail = (args.get('description') or args.get('command')
+                      or args.get('path') or args.get('summary') or '')
+            last_tool = {'tool': d.get('toolName'),
+                         'detail': str(detail)[:120],
+                         'turn': d.get('turnId')}
+            try:
+                turn = max(turn, int(d.get('turnId')))
+            except (TypeError, ValueError):
+                pass
+        elif t == 'assistant.message':
+            txt = o.get('text') or o.get('content')
+            if isinstance(txt, str) and txt.strip():
+                last_msg = txt.strip()[:160]
+        elif t == 'result':
+            result_seen = True
+    if last_tool is None and last_msg is None and turn == 0 and not result_seen:
+        return None  # nothing meaningful yet
+    snap = {
+        'turn': turn,
+        'elapsed_s': int(time.time() - started_at) if started_at else None,
+        'phase': 'finishing' if result_seen else 'working',
+    }
+    if last_tool:
+        snap['last_tool'] = last_tool
+    if last_msg:
+        snap['last_msg'] = last_msg
+    return snap
+
+
 HEARTBEAT_INTERVAL_S = 60
 POLL_BACKOFF_S       = 3         # sleep when /claim returns empty (204)
 COPILOT_TIMEOUT_S    = int(os.environ.get('COPILOT_TIMEOUT_S', '840'))
@@ -225,11 +308,14 @@ class QueueClient:
         return r.content
 
     def heartbeat(self, task_id: str, worker_id: str,
-                  lease_token: str | None = None) -> bool:
+                  lease_token: str | None = None,
+                  progress: str | None = None) -> bool:
+        body = {'task_id': task_id, 'worker_id': worker_id,
+                'lease_token': lease_token}
+        if progress is not None:
+            body['progress'] = progress
         r = requests.post(f'{self.base}/heartbeat',
-                          json={'task_id': task_id, 'worker_id': worker_id,
-                                'lease_token': lease_token},
-                          headers=self.h, timeout=15)
+                          json=body, headers=self.h, timeout=15)
         r.raise_for_status()
         return r.json().get('alive', False)
 
@@ -257,20 +343,37 @@ class QueueClient:
 # ── Heartbeat thread ──────────────────────────────────────────────────────────
 
 class Heartbeat:
-    """Renews the lease every HEARTBEAT_INTERVAL_S; signals abandon if reaped."""
+    """Renews the lease every HEARTBEAT_INTERVAL_S; signals abandon if reaped.
+
+    When given a `progress` holder it also ships a compact live snapshot of the
+    in-flight copilot run (last tool call, turn, elapsed) on every beat, so the
+    dashboard shows what a busy worker is doing NOW instead of a blank box until
+    completion. Progress is best-effort: any failure to build/attach it never
+    affects lease renewal (the abandon signal)."""
     def __init__(self, client: QueueClient, task_id: str, worker_id: str,
-                 lease_token: str | None = None):
+                 lease_token: str | None = None,
+                 progress: '_ProgressHolder | None' = None):
         self.client, self.task_id, self.worker_id = client, task_id, worker_id
         self.lease_token = lease_token
+        self.progress = progress
         self.abandon = threading.Event()
         self._stop = threading.Event()
         self._t = threading.Thread(target=self._run, daemon=True)
 
     def _run(self):
         while not self._stop.wait(HEARTBEAT_INTERVAL_S):
+            snap_json = None
+            if self.progress is not None:
+                try:
+                    snap = _progress_snapshot(self.progress.log_path,
+                                              self.progress.started_at)
+                    if snap is not None:
+                        snap_json = json.dumps(snap)
+                except Exception as e:
+                    log.debug('progress snapshot failed for %s: %s', self.task_id, e)
             try:
                 if not self.client.heartbeat(self.task_id, self.worker_id,
-                                             self.lease_token):
+                                             self.lease_token, progress=snap_json):
                     log.warning('heartbeat: lease lost for %s — abandoning', self.task_id)
                     self.abandon.set()
                     return
@@ -299,6 +402,31 @@ def _git_auth_args() -> list:
     if tok:
         return ['-c', f'http.extraheader=Authorization: Bearer {tok}']
     return []
+
+
+def _repo_url(lab_git: str, repo: str | None) -> str:
+    """Map a task's `repo` name onto a clone URL/path, sibling to the lab.git base.
+
+    The worker is configured with one `lab_git` endpoint (a smart-HTTP URL like
+    `http://192.168.100.1:8418/lab.git` on remote workers, or a local bare path
+    `~/hive/lab.git` on the hal lane). Repo routing swaps just the final path
+    segment, so `ActiveRoles.git` resolves to the mirror served alongside lab.git
+    by the same token-authed git_http_server. Default/omitted -> the lab_git
+    endpoint unchanged (backward compatible for every existing task)."""
+    repo = (repo or 'lab.git').strip()
+    if repo in ('', 'lab.git'):
+        return lab_git
+    base, sep, _name = lab_git.rstrip('/').rpartition('/')
+    return f'{base}{sep}{repo}' if sep else repo
+
+
+def _clone_source(task: dict, lab_git: str) -> tuple[str, bool]:
+    """Return (clone_url, is_mirror_repo) for a task. Mirror repos (non-lab.git)
+    are full source trees seeded shallow from an upstream (ADO); they are cloned
+    WITHOUT the blobless filter because the worker must materialize every blob to
+    build, and a shallow+blobless combination is fragile."""
+    repo = task.get('repo') or 'lab.git'
+    return _repo_url(lab_git, repo), (repo not in ('', 'lab.git'))
 
 
 def _provision_build_secrets(task: dict, base_url: str, token: str) -> None:
@@ -421,7 +549,8 @@ def _nuget_config_targets() -> list[str]:
     return [os.path.join(home, '.nuget', 'NuGet', 'NuGet.Config')]
 
 
-def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
+def run_review_task(task: dict, worker_id: str, lab_git: str,
+                    progress: '_ProgressHolder | None' = None) -> dict:
     """Run a peer-review task: clone lab.git, checkout the AUTHOR branch, run
     copilot with the review prompt (read-only intent — the prompt forbids
     push/edit), then parse HIVE_REVIEW_VERDICT.json from the workspace.
@@ -429,6 +558,9 @@ def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
     Returns {'verdict', 'findings', 'exit_code', 'log_path'}. If the verdict file
     is missing/unparseable, fails safe to REQUEST_CHANGES (never auto-approves).
     Does NOT commit or push — reviewing only reads the diff.
+
+    `progress` (optional): a holder the heartbeat tails for a live snapshot; we
+    publish the copilot log path onto it as soon as the log exists.
     """
     # A review task's OWN branch (feature/<review_id>) never exists in lab.git —
     # the reviewer must check out the AUTHOR's branch under review, delivered as
@@ -439,6 +571,8 @@ def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
     run_dir = tempfile.mkdtemp(prefix=f'{tid}-', dir=WORK_DIR)
     log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl', dir=WORK_DIR)
     os.close(log_fd)
+    if progress is not None:
+        progress.log_path = log_path
     prompt_fd, prompt_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.prompt', dir=WORK_DIR)
     with os.fdopen(prompt_fd, 'w', encoding='utf-8') as pf:
         pf.write(task['prompt'])
@@ -452,11 +586,12 @@ def run_review_task(task: dict, worker_id: str, lab_git: str) -> dict:
                  'findings': 'reviewer produced no parseable verdict; failing safe (no auto-approve)',
                  'log_path': log_path}
     try:
-        clone_filter = os.environ.get('HIVE_CLONE_FILTER', 'blob:none').strip()
+        clone_url, is_mirror = _clone_source(task, lab_git)
+        clone_filter = '' if is_mirror else os.environ.get('HIVE_CLONE_FILTER', 'blob:none').strip()
         clone_args = ['clone']
         if clone_filter:
             clone_args.append(f'--filter={clone_filter}')
-        clone_args += [lab_git, run_dir]
+        clone_args += [clone_url, run_dir]
         cl = subprocess.run(['git', *auth, *clone_args], capture_output=True, text=True)
         if cl.returncode != 0:
             fail_safe['findings'] = f'review clone failed: {cl.stderr.strip()}'
@@ -531,10 +666,70 @@ def _read_review_verdict(run_dir: str) -> tuple[str, str]:
         return safe
 
 
-def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
+def _resume_digest(g, base_sha: str, attempt) -> str | None:
+    """Build a resume preamble from prior committed work on the task branch.
+
+    A timed-out attempt WIP-commits its partial work to the task branch (see the
+    TimeoutExpired handler). When a later attempt re-claims the task it clones
+    that branch back, so `base_sha..HEAD` is exactly the prior progress. Summarise
+    it (commit log + diffstat) so the model CONTINUES instead of restarting from
+    zero. Returns None when there is nothing on top of base (fresh start)."""
+    if not base_sha:
+        return None
+    log_oneline = g('log', '--oneline', f'{base_sha}..HEAD').stdout.strip()
+    if not log_oneline:
+        return None
+    diffstat = g('diff', '--stat', f'{base_sha}..HEAD').stdout.strip()
+    return (
+        f"=== RESUME (attempt {attempt}) — prior partial work is ALREADY COMMITTED on this branch ===\n"
+        "A previous attempt timed out before finishing. Its work is committed on this\n"
+        "branch; do NOT redo it from scratch. Inspect it first, then finish the rest:\n"
+        f"  git log --oneline {base_sha[:12]}..HEAD\n"
+        f"  git diff {base_sha[:12]}..HEAD\n\n"
+        "Prior commits:\n" + log_oneline + "\n\n"
+        "Files touched so far:\n" + (diffstat or '(none)') + "\n\n"
+        "Verify each item below against what is already done; if prior work is broken\n"
+        "or incomplete, fix it. Everything must COMPILE and tests must PASS.\n"
+        "=== ORIGINAL TASK ===\n"
+    )
+
+
+def _wip_commit_push(g, branch: str, tid: str, attempt) -> str | None:
+    """Preserve a timed-out attempt's partial work: commit whatever is in the
+    working tree and push it to the task branch, so the NEXT attempt resumes from
+    it instead of a clean base clone. Best-effort — never raises; returns a short
+    status string for the error field (or None if nothing was preserved)."""
+    try:
+        g('add', '-A')
+        if g('diff', '--cached', '--quiet').returncode == 0:
+            return None  # nothing changed to preserve
+        ci = g('commit', '-m', f'{tid}: WIP [hive-resume] attempt {attempt}')
+        if ci.returncode != 0:
+            return None
+        # ff on resume (WIP already on remote), plain create on first attempt;
+        # --force-with-lease is safe (hive owns this branch) and covers the rare
+        # case where a finalize collapse rewrote history under us.
+        push = g('push', '--force-with-lease', 'origin', branch)
+        if push.returncode != 0:
+            return f'WIP preserve push failed: {push.stderr.strip()[:120]}'
+        return 'WIP preserved on branch'
+    except Exception as e:
+        return f'WIP preserve error: {e}'
+
+
+def run_task(task: dict, worker_id: str, lab_git: str,
+             progress: '_ProgressHolder | None' = None) -> dict:
     """
     Clone lab.git, branch, run copilot headless, commit, push. Returns dict with
     exit_code, commit_hash, log_path, error.
+
+    `progress` (optional): a holder the heartbeat tails for a live snapshot; we
+    publish the copilot log path onto it as soon as the log exists.
+
+    Resume: if a prior attempt timed out, its partial work is WIP-committed to the
+    task branch. A re-claim clones that branch back, prepends a resume digest to
+    the prompt so the model continues, and folds the WIP into ONE coherent commit
+    on success.
     """
     branch, base_ref, tid = task['branch'], task['base_ref'], task['id']
     run_dir = tempfile.mkdtemp(prefix=f'{tid}-', dir=WORK_DIR)
@@ -542,12 +737,13 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
     # run_dir pollutes every commit and causes cross-task rebase conflicts).
     log_fd, log_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.jsonl', dir=WORK_DIR)
     os.close(log_fd)
+    if progress is not None:
+        progress.log_path = log_path
     # Prompt also lives outside the clone and is fed to copilot via `-p @file`
     # (see _copilot_argv): a large embedded prompt overflows the Windows argv
     # limit (WinError 206). Writing it inside run_dir would also get committed.
     prompt_fd, prompt_path = tempfile.mkstemp(prefix=f'{tid}-', suffix='.prompt', dir=WORK_DIR)
-    with os.fdopen(prompt_fd, 'w', encoding='utf-8') as pf:
-        pf.write(task['prompt'])
+    os.close(prompt_fd)  # content written after resume detection (may prepend a digest)
 
     auth = _git_auth_args()
 
@@ -564,11 +760,14 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         # Needs uploadpack.allowFilter on the server (git_http_server sets it);
         # against a server without it git prints a warning and falls back to a
         # full clone, so this is safe either way. HIVE_CLONE_FILTER='' disables.
-        clone_filter = os.environ.get('HIVE_CLONE_FILTER', 'blob:none').strip()
+        # Repo routing: mirror repos (ActiveRoles.git) clone FULL (no filter) —
+        # they are shallow source trees and the worker must build them.
+        clone_url, is_mirror = _clone_source(task, lab_git)
+        clone_filter = '' if is_mirror else os.environ.get('HIVE_CLONE_FILTER', 'blob:none').strip()
         clone_args = ['clone']
         if clone_filter:
             clone_args.append(f'--filter={clone_filter}')
-        clone_args += [lab_git, run_dir]
+        clone_args += [clone_url, run_dir]
         cl = subprocess.run(['git', *auth, *clone_args],
                             capture_output=True, text=True)
         if cl.returncode != 0:
@@ -582,9 +781,31 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         # loop can tell whether the base moved (rebase drift) before trusting a
         # worker-side verify.
         base_sha = g('rev-parse', 'HEAD').stdout.strip() or None
-        g('checkout', '-b', branch)
+        # Resume: if a prior (timed-out) attempt already pushed partial work to the
+        # task branch, continue from it rather than a clean base — otherwise every
+        # timeout throws away all progress and long jobs can never converge. A
+        # git-native signal (does origin/<branch> exist?) needs no schema change
+        # and is cross-worker safe: any worker that re-claims sees the WIP.
+        resume = g('rev-parse', '--verify', f'origin/{branch}').returncode == 0
+        if resume:
+            g('checkout', '-B', branch, f'origin/{branch}')
+        else:
+            g('checkout', '-b', branch)
         g('config', 'user.email', 'hal@lab')
         g('config', 'user.name', f'HAL worker {worker_id}')
+
+        # Write the prompt now (after resume detection): on a resume, prepend a
+        # digest of the prior committed work so the model continues instead of
+        # restarting. On a fresh attempt this is just the task prompt.
+        prompt_body = task['prompt']
+        if resume:
+            digest = _resume_digest(g, base_sha, task.get('attempts'))
+            if digest:
+                prompt_body = digest + '\n' + prompt_body
+                log.info('worker %s resuming %s from prior WIP on %s',
+                         worker_id, tid, branch)
+        with open(prompt_path, 'w', encoding='utf-8') as pf:
+            pf.write(prompt_body)
 
         # Just-in-time build-credential provisioning (replaces the ar1 scheduled
         # task). Do it after clone/branch prep and BEFORE copilot/build starts so
@@ -612,6 +833,12 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
             )
 
         g('add', '-A')
+        # On a resume, fold prior WIP commits + this attempt's work into ONE
+        # coherent commit on base (the deliverable contract is a single commit).
+        # reset --soft moves the branch ref back to base while keeping every change
+        # staged, so the commit below captures the full cumulative diff.
+        if resume and base_sha:
+            g('reset', '--soft', base_sha)
         if g('diff', '--cached', '--quiet').returncode != 0:
             ci = g('commit', '-m', f'{tid}: automated dispatch')
             if ci.returncode != 0:
@@ -630,9 +857,22 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
         # otherwise we'd drop copilot's own commit(s) and report a false failure.
         head = g('rev-parse', 'HEAD').stdout.strip()
         if not head or head == base_sha:
+            # I3: a probe (read-only/diagnostic) task legitimately produces no
+            # commit — that is SUCCESS, not failure. Return exit_code=0 so
+            # complete_task moves it to the terminal 'probed' state instead of
+            # requeuing it (and repaying the fresh-clone cost) up to max_attempts.
+            if task.get('kind') == 'probe':
+                return {'exit_code': 0, 'error': None, 'log_path': log_path}
             return {'exit_code': 1, 'error': 'no changes produced', 'log_path': log_path}
 
-        push = g('push', 'origin', branch)
+        # A resume collapse rewrote branch history (WIP commits -> one commit that
+        # is not their descendant), so the push must overwrite the remote WIP.
+        # --force-with-lease is safe: the hive solely owns this task branch.
+        push_args = ['push']
+        if resume:
+            push_args.append('--force-with-lease')
+        push_args += ['origin', branch]
+        push = g(*push_args)
         if push.returncode != 0:
             return {'exit_code': 1, 'error': f'push failed: {push.stderr.strip()}',
                     'log_path': log_path}
@@ -658,7 +898,10 @@ def run_task(task: dict, worker_id: str, lab_git: str) -> dict:
             pass
         return result
     except subprocess.TimeoutExpired:
-        return {'exit_code': 124, 'error': 'copilot timed out', 'log_path': log_path}
+        # Preserve partial work so the next attempt resumes instead of restarting.
+        wip = _wip_commit_push(g, branch, tid, task.get('attempts'))
+        err = 'copilot timed out' + (f'; {wip}' if wip else '; no partial work to preserve')
+        return {'exit_code': 124, 'error': err, 'log_path': log_path}
     except Exception as e:
         return {'exit_code': 1, 'error': str(e), 'log_path': log_path}
     finally:
@@ -779,6 +1022,19 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
             _maybe_self_update(client)
             continue  # long-poll already waited server-side
 
+        # A *commanded* update (operator `halctl update`) must apply even when the
+        # queue never drains to idle — otherwise a continuously-busy worker would
+        # run every task on stale code and never pick up the new version. Apply it
+        # BEFORE processing this freshly-claimed task: _maybe_self_update exits the
+        # process on success, so this claim's lease expires and the reaper re-queues
+        # it for the restarted (new-version) worker. Best-effort: if the update
+        # fails it logs and we fall through to run the task on the current code.
+        if client.update_to is not None and client.update_to != CODE_VERSION:
+            log.warning('worker %s: commanded update v%s->v%s pending; applying '
+                        'before running %s (claim will be re-queued)',
+                        worker_id, CODE_VERSION, client.update_to, task['id'])
+            _maybe_self_update(client)
+
         tid = task['id']
         ltok = task.get('lease_token')
         kind = task.get('kind', 'work')
@@ -787,8 +1043,9 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
         t0 = time.time()
 
         if kind == 'review':
-            with Heartbeat(client, tid, worker_id, ltok) as hb:
-                result = run_review_task(task, worker_id, lab_git)
+            prog = _ProgressHolder()
+            with Heartbeat(client, tid, worker_id, ltok, progress=prog) as hb:
+                result = run_review_task(task, worker_id, lab_git, progress=prog)
                 if hb.abandon.is_set():
                     log.warning('worker %s: %s abandoned (reaped); not reporting',
                                 worker_id, tid)
@@ -814,8 +1071,9 @@ def loop(worker_id: str, lane: str | None, client: QueueClient, lab_git: str,
                      worker_id, tid, result['verdict'], res, dt)
             continue
 
-        with Heartbeat(client, tid, worker_id, ltok) as hb:
-            result = run_task(task, worker_id, lab_git)
+        prog = _ProgressHolder()
+        with Heartbeat(client, tid, worker_id, ltok, progress=prog) as hb:
+            result = run_task(task, worker_id, lab_git, progress=prog)
             if hb.abandon.is_set():
                 log.warning('worker %s: %s abandoned (reaped); not reporting',
                             worker_id, tid)
