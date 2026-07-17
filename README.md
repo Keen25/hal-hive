@@ -304,6 +304,15 @@ copy-to-clipboard button also gains the native secure-context path.
 Both servers share one cert/key pair. The CA key never leaves HAL. Only the
 public `ca.crt` is distributed. All `*.key`/`*.crt`/`*.pem` are gitignored.
 
+## Multi-host fleet (stretched LABNet)
+
+Workers can run on **more than one physical host** while staying on a single
+`192.168.100.0/24` L2 segment, so every worker reaches the control plane at one
+address (`192.168.100.1`) — no routing or per-host IP ranges. This is done with a
+point-to-point **VXLAN overlay** (VNI 100, UDP 4789) bridging LABNet across hosts.
+Currently deployed across two KVM/libvirt hosts (HAL + Lenin). Full prerequisites,
+per-host systemd units, join steps, and verification: [`docs/labnet-stretch.md`](docs/labnet-stretch.md).
+
 ## Scaling & known limits (honest take)
 
 The queue/claim/lease/reaper/merge core is built for a small distributed fleet,
