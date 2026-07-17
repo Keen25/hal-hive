@@ -17,7 +17,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `hive_queue.py` | queue core — schema, atomic `claim` (dep-gate + lease + capability match), reaper, merge-loop |
 | `queue_server.py` | REST control plane (bearer-token auth), reaper + merge-loop threads |
 | `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps; **version-driven self-update** |
-| `halctl.py` | control CLI: `add` (`--review N`) / `status` / `workers` / `update` / `cancel` / `requeue` / `prio` / `classify` |
+| `halctl.py` | control CLI: `add` (`--review N`, `--repo`, `--disable-mcp`) / `status` / `workers` / `update` / `cancel` / `requeue` / `prio` / `classify` / `promote` (mirror-repo → ADO PR) |
 | `hive_caps.py` | capability vocabulary — `probe_caps()` (worker) + `classify_prompt()` (intake) |
 | `hive_version.py` | single source of truth for the worker code version (`CODE_VERSION`); bump to release a fleet self-update |
 | `classifier_rules.d/` | external classifier rule packs (product-specific `requires` rules; ships `activeroles.json`) |
@@ -98,6 +98,34 @@ blips, e.g. a worker on `D:\hive` while an operator assumes `C:\hive`):
 
 `halctl workers` prints these per worker; the dashboard shows a compact
 `os · build-tools` line with the full identity on hover.
+
+**Live per-task progress** — a busy worker piggybacks a compact in-flight
+snapshot on its 60s heartbeat, tailed cheaply from the live copilot JSONL log
+(no extra process): `last_tool` (tool + a legible arg + turn), `last_msg` (latest
+assistant text), `turn`, `elapsed_s`, and `phase` (`working` → `finishing` once
+the terminal result frame appears). `halctl status` and the dashboard surface it
+so a long run is visibly progressing rather than an opaque `running`. Cleared on
+completion and reset to `NULL` on re-claim.
+
+## Task routing across repos + ADO promote (`--repo` / `halctl promote`)
+
+A task defaults to the `lab.git` sandbox, but `--repo <name>` points its
+clone/branch/push at a different central bare repo served on `:8418` (e.g.
+`--repo ActiveRoles.git` for an ARS source task), so the change lands centrally
+and stays reviewable before it ever reaches ADO.
+
+```bash
+python3 halctl.py add "<ARS change>" --repo ActiveRoles.git --require os:windows --complexity 3
+python3 halctl.py promote <task-id>          # DRY-RUN: fetch the delivered branch, show diff + commits
+python3 halctl.py promote <task-id> --yes    # APPLY: cherry-pick onto the ADO PR branch and push
+```
+
+- **`promote` is mirror-repo only** — a `lab.git` task has nothing to promote; it
+  errors out. It never merges into the mirror itself, only cherry-picks the
+  task's commits onto the live **ADO PR branch** (`--pr-branch`, default the
+  task's `base_ref`) and pushes.
+- **Dry run by default** — nothing is pushed without `--yes`; `--show-diff`
+  prints the full patch instead of just the diffstat.
 
 ## Automated peer-review loop (opt-in, `--review N`)
 
@@ -183,7 +211,7 @@ Controls in place:
 | **Non-admin service account** | On Windows the worker service (`svc-hive`) runs as a **standard user**, never a local Administrator. `bootstrap.py` removes it from `Administrators` on (re)provision. A task can no longer own the box. |
 | **Per-task sandbox dir** | All clones/logs/prompts live under `HIVE_WORK_DIR` (Windows: `C:\hive\work`, Full Control to `svc-hive` only, also the account's `TEMP`). Unset = system temp (Linux `--user` unit already runs unprivileged). |
 | **Scoped copilot perms** | `HIVE_COPILOT_PERMS` overrides the copilot permission flags without a code change (default = the lab-proven `--no-ask-user --allow-all --autopilot`; a narrower `--allow-all-tools` blocks writes outside CWD and breaks tasks). Tighten per-deployment as your task mix allows. |
-| **Scoped MCP toolset** | Suppress specific MCP servers for a task's copilot run without touching the global `~/.copilot/mcp-config.json`. Per task: `halctl add "<prompt>" --disable-mcp salesforce --disable-mcp pagerduty` (repeatable; also accepts a comma/space list). Per worker: `HIVE_DISABLE_MCP="salesforce pagerduty"` in the worker env (merged + de-duped with the task list). Names must match the **key** in `~/.copilot/mcp-config.json`. Emitted as `--disable-mcp-server <name>` flags; unset = load all configured servers (backward compatible). Review tasks inherit their author task's scope. |
+| **Scoped MCP toolset** | Suppress specific MCP servers for a task's copilot run without touching the global `~/.copilot/mcp-config.json`. Per task: `halctl add "<prompt>" --disable-mcp salesforce --disable-mcp pagerduty` (repeatable; also accepts a comma/space list). Per worker: `HIVE_DISABLE_MCP="salesforce pagerduty"` in the worker env (merged + de-duped with the task list). Names must match the **key** in `~/.copilot/mcp-config.json`. Emitted as `--disable-mcp-server <name>` flags; unset = load all configured servers (backward compatible). Review tasks inherit their author task's scope. **Fail-closed validation:** before launch the worker checks every requested name against `copilot mcp list --json`; an unknown/typo'd name (or an un-enumerable inventory) **fails the task** — a work task errors out, a review task returns `REQUEST_CHANGES` — rather than silently running with the wrong scope (the copilot CLI otherwise **ignores** an unknown `--disable-mcp-server` name and leaves that server loaded). |
 | **Control-token gating + TLS** | Only the control token can `/add`/`/claim`/`/cancel`; enable TLS (below) so tokens aren't sniffable on the wire. |
 
 **Residual, accepted risk:** a holder of the control token still gets
