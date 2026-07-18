@@ -21,8 +21,12 @@ Exit codes: 0 ok · 2 bad args · 3 no credential · 4 remoting/command failure.
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $Ip,
-    # The command to run in-guest. Runs as the local Administrator of the box.
-    [Parameter(Mandatory)] [string] $Command,
+    # The command to run in-guest (runs as the box's local Administrator).
+    # Provide EITHER -Command (inline) or -ScriptFile (a local .ps1 whose text is
+    # sent to the guest — used for the secret-bearing hive bootstrap so the body
+    # never appears on a command line).
+    [string] $Command,
+    [string] $ScriptFile,
     # Where lab-config.psd1 lives (defaults to the autofedora repo).
     [string] $AutofedoraDir = $(if ($env:AUTOFEDORA_DIR) { $env:AUTOFEDORA_DIR } else { Join-Path $HOME 'work/Toolz/autofedora' }),
     # How long to keep retrying the initial WinRM connect (guest may still be booting).
@@ -32,6 +36,17 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Die([string]$msg, [int]$code) { Write-Error $msg; exit $code }
+
+# Resolve the script text from exactly one of -Command / -ScriptFile.
+if ($Command -and $ScriptFile) { Die "Pass only one of -Command / -ScriptFile." 2 }
+if ($ScriptFile) {
+    if (-not (Test-Path $ScriptFile)) { Die "ScriptFile not found: $ScriptFile" 2 }
+    $scriptText = Get-Content -Raw -LiteralPath $ScriptFile
+} elseif ($Command) {
+    $scriptText = $Command
+} else {
+    Die "Nothing to run: pass -Command or -ScriptFile." 2
+}
 
 $cfgFile = Join-Path $AutofedoraDir 'lab-config.psd1'
 if (-not (Test-Path $cfgFile)) { Die "lab-config.psd1 not found at $cfgFile (set -AutofedoraDir)" 2 }
@@ -67,9 +82,19 @@ while ($null -eq $session -and (Get-Date) -lt $deadline) {
 if ($null -eq $session) { Die "Could not open a WinRM session to $Ip within ${ConnectTimeoutSec}s." 4 }
 
 try {
-    $sb = [ScriptBlock]::Create($Command)
-    Invoke-Command -Session $session -ScriptBlock $sb
-    if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { Die "In-guest command exited $LASTEXITCODE." 4 }
+    # Run the script text IN the remote session and return the guest-side
+    # $LASTEXITCODE back to us. A local `$LASTEXITCODE` check after
+    # Invoke-Command is unreliable — it reflects the local pwsh, not the remote
+    # native command — so we capture and return it explicitly from the guest.
+    $remote = {
+        param($code)
+        $sb = [ScriptBlock]::Create($code)
+        & $sb
+        if ($null -eq $LASTEXITCODE) { return 0 } else { return $LASTEXITCODE }
+    }
+    $rc = Invoke-Command -Session $session -ScriptBlock $remote -ArgumentList $scriptText
+    $rc = @($rc)[-1]
+    if ($null -ne $rc -and [int]$rc -ne 0) { Die "In-guest command exited $rc." 4 }
 } finally {
     Remove-PSSession $session -ErrorAction SilentlyContinue
 }
