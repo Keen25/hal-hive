@@ -418,6 +418,147 @@ def cmd_new(a) -> int:
     return 0
 
 
+# ── DC promotion (replica / child / tree) ────────────────────────────────────
+
+def _dc_probe_domain(a) -> str:
+    """The EXISTING domain whose DC we must reach via --dc-dns for this mode.
+    replica promotes into it; child/tree are created UNDER it, so we locate the
+    parent (the new domain does not exist yet)."""
+    if a.dc_mode == "replica":
+        return a.target_domain or ""
+    return a.parent_domain or ""  # child / tree
+
+
+def _dc_arg_problems(a) -> list[str]:
+    """Mode-specific argument validation (before any clone)."""
+    problems: list[str] = []
+    if a.dc_mode == "new-forest":
+        problems.append("--dc-mode new-forest is a fresh forest — use `labctl new <name> "
+                        "--role dc` instead of `promote`.")
+        return problems
+    if not a.dc_dns:
+        problems.append(f"--dc-mode {a.dc_mode} requires --dc-dns (an existing DC of the "
+                        f"target forest/domain, used as the new box's DNS).")
+    if a.dc_mode == "replica" and not a.target_domain:
+        problems.append("--dc-mode replica requires --target-domain (the existing domain FQDN).")
+    if a.dc_mode == "child" and not (a.parent_domain and a.child_label):
+        problems.append("--dc-mode child requires --parent-domain and --child-label.")
+    if a.dc_mode == "tree" and not (a.parent_domain and a.tree_dns):
+        problems.append("--dc-mode tree requires --parent-domain and --tree-dns.")
+    return problems
+
+
+def _srv_resolves(dns_ip: str, srv: str) -> bool | None:
+    """True/False if the SRV record resolves via `dns_ip`; None if no resolver
+    tool is available (skip the check rather than block)."""
+    if shutil.which("dig"):
+        r = subprocess.run(["dig", f"@{dns_ip}", "+short", "+time=3", "+tries=1", "SRV", srv],
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            return bool(r.stdout.strip())
+        return False
+    if shutil.which("nslookup"):
+        r = subprocess.run(["nslookup", "-type=SRV", srv, dns_ip],
+                           capture_output=True, text=True)
+        out = (r.stdout or "").lower()
+        return ("service =" in out) or ("srv service location" in out)
+    return None
+
+
+def _dc_dns_problems(a) -> tuple[list[str], list[str]]:
+    """Confirm --dc-dns is really a DC for the target domain: TCP 389 answers and
+    _ldap._tcp.<domain> SRV resolves via that DNS. Returns (problems, warnings)."""
+    problems: list[str] = []
+    warnings: list[str] = []
+    if a.dc_mode == "new-forest" or not a.dc_dns:
+        return problems, warnings
+    # 389/LDAP reachable on the claimed DC
+    try:
+        with socket.create_connection((a.dc_dns, 389), timeout=4):
+            pass
+    except OSError:
+        problems.append(f"--dc-dns {a.dc_dns}: TCP 389 (LDAP) is not answering — not a reachable DC.")
+    domain = _dc_probe_domain(a)
+    if domain:
+        srv = f"_ldap._tcp.{domain}"
+        ok = _srv_resolves(a.dc_dns, srv)
+        if ok is False:
+            problems.append(f"--dc-dns {a.dc_dns}: SRV {srv} did not resolve via that DNS — "
+                            f"it is not a DC for '{domain}'.")
+        elif ok is None:
+            warnings.append(f"no dig/nslookup on PATH — skipped SRV check for {srv} "
+                            f"(cannot confirm {a.dc_dns} is a DC for '{domain}').")
+    # dup DC/computer object is a best-effort warn (needs target creds to query AD).
+    warnings.append(f"dup-object check skipped (needs target-domain creds): if a DC/computer "
+                    f"named '{a.name}' already exists in the target, do AD metadata cleanup "
+                    f"first or the promotion will fail.")
+    return problems, warnings
+
+
+def cmd_promote(a) -> int:
+    """Promote a fresh box into an EXISTING forest/domain (replica/child/tree)."""
+    autofedora = Path(a.autofedora)
+    if a.host:
+        die("--host (remote KVM / Hyper-V) is not implemented yet; run labctl on the "
+            "target KVM host.")
+    cfg = read_labconfig(autofedora)
+
+    # Reuse the provisioner preflight (URI/media/reservation/cred/name/IP) + the
+    # DC-specific arg + DNS checks, all before any clone.
+    problems = preflight(a.name, "dc", a.ip, autofedora, cfg, a.labnet,
+                         force=a.force, allow_partial=a.allow_partial)
+    problems += _dc_arg_problems(a)
+    dns_problems, warnings = _dc_dns_problems(a)
+    problems += dns_problems
+    if problems:
+        log(f"PREFLIGHT FAIL — refusing to promote '{a.name}':")
+        for p in problems:
+            print(f"  ✗ {p}")
+        return 1
+    for w in warnings:
+        log(f"WARN: {w}")
+    log(f"PREFLIGHT OK — promoting '{a.name}' as {a.dc_mode} (dns={a.dc_dns})")
+
+    if a.force and virsh("dominfo", a.name).returncode == 0:
+        log(f"--force: destroying existing '{a.name}' first")
+        _destroy(a.name, autofedora, cfg, a.labnet, ip=a.ip, dry=a.dry_run)
+
+    ps = [shutil.which("pwsh"), "-NoProfile", "-File", str(autofedora / "autofedora.ps1"),
+          "-Role", "dc", "-Name", a.name, "-Ip", a.ip, "-DcMode", a.dc_mode]
+    if a.dc_dns:
+        ps += ["-DcDnsIp", a.dc_dns]
+    if a.target_domain:
+        ps += ["-TargetDomain", a.target_domain]
+    if a.parent_domain:
+        ps += ["-ParentDomain", a.parent_domain]
+    if a.child_label:
+        ps += ["-ChildLabel", a.child_label]
+    if a.tree_dns:
+        ps += ["-TreeDnsName", a.tree_dns]
+    if a.domain_admin:
+        ps += ["-DomainAdminUser", a.domain_admin]
+    if a.site:
+        ps += ["-SiteName", a.site]
+    if a.domain:
+        ps += ["-DomainSuffix", a.domain]
+    r = run(ps, dry=a.dry_run, check=False, cwd=str(autofedora))
+    if r is not None and r.returncode != 0:
+        die(f"autofedora DC promotion failed (exit {r.returncode}) for '{a.name}'", r.returncode)
+
+    # A DC is not enrolled as a hive worker by default (promote defaults --no-enroll).
+    if a.enroll:
+        try:
+            _enroll(a.name, "dc", a.ip, autofedora, lane=a.lane, caps=a.caps,
+                    hive_url=a.hive_url, dry=a.dry_run)
+        except EnrollError as e:
+            log(f"PROMOTED but NOT ENROLLED: {e}")
+            log(f"retry with: labctl enroll {a.name} --ip {a.ip} --role dc")
+            return 2
+
+    log(f"DONE — '{a.name}' promoted ({a.dc_mode})" + (" and enrolled" if a.enroll else ""))
+    return 0
+
+
 class EnrollError(RuntimeError):
     """Enrollment failed AFTER the VM was successfully provisioned."""
 
@@ -643,6 +784,30 @@ def main(argv=None) -> int:
     p_new.add_argument("--no-enroll", action="store_true", help="do not register as a hive worker")
     p_new.add_argument("--host", default="", help="[reserved] remote KVM/Hyper-V target (not yet implemented)")
 
+    p_pro = sub.add_parser("promote",
+                           help="promote a fresh box into an EXISTING forest/domain (replica/child/tree)",
+                           parents=[gopts])
+    p_pro.add_argument("name", help="VM / hostname")
+    p_pro.add_argument("--ip", required=True, help="static IP for the new DC")
+    p_pro.add_argument("--dc-mode", default="replica", choices=("replica", "child", "tree"),
+                       help="replica: add DC to an existing domain; child: new child domain; "
+                            "tree: new domain tree in the existing forest")
+    p_pro.add_argument("--target-domain", default="", help="replica: existing domain FQDN to promote into")
+    p_pro.add_argument("--parent-domain", default="", help="child/tree: existing parent/forest-root FQDN")
+    p_pro.add_argument("--child-label", default="", help="child: new single label (e.g. 'emea')")
+    p_pro.add_argument("--tree-dns", default="", help="tree: new tree DNS root (e.g. 'contoso.test')")
+    p_pro.add_argument("--dc-dns", default="", help="IP of an EXISTING DC of the target (used as the new box's DNS)")
+    p_pro.add_argument("--domain-admin", default="",
+                       help="target DA/EA as DOM\\user or UPN (defaults to same-forest Domain\\administrator)")
+    p_pro.add_argument("--site", default="Default-First-Site-Name", help="AD site for the new DC")
+    p_pro.add_argument("--domain", default="", help="AD domain suffix override (rarely needed for promote)")
+    p_pro.add_argument("--force", action="store_true", help="destroy+rebuild if the box/reservation already exists")
+    p_pro.add_argument("--allow-partial", action="store_true", help="(unused for dc; accepted for symmetry)")
+    p_pro.add_argument("--enroll", action="store_true",
+                       help="also enroll the DC as a hive worker (default: no — a DC is not a worker)")
+    p_pro.add_argument("--host", default="", help="[reserved] remote KVM/Hyper-V target (not yet implemented)")
+    add_enroll_opts(p_pro)
+
     p_enr = sub.add_parser("enroll", help="enroll an already-built box as a hive worker", parents=[gopts])
     p_enr.add_argument("name", help="VM / hostname")
     p_enr.add_argument("--role", default="", help="lab role (informational)")
@@ -673,6 +838,8 @@ def main(argv=None) -> int:
         return cmd_preflight(a)
     if a.command == "new":
         return cmd_new(a)
+    if a.command == "promote":
+        return cmd_promote(a)
     if a.command == "enroll":
         return cmd_enroll(a)
     if a.command == "destroy":
