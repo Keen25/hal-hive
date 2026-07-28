@@ -38,3 +38,6 @@ hive.env
 __pycache__/
 *.pyc
 winsw.exe
+
+# hive-console runtime deliveries + watcher state
+inbox/
