@@ -1,46 +1,76 @@
 #!/usr/bin/env python3
-"""hive_queue_active.py -- compact live view of ACTIONABLE hive tasks.
+"""hive_queue_active.py -- legible live view of ACTIONABLE hive tasks.
 
-Renders the `halctl status` summary line plus only the task blocks whose status
-is actionable (claimed / pending / running / needs_attention). Merged, probed,
-reviewed, dead and cancelled history is suppressed so the console pane stays
-readable. Refreshes in place.
+Top block = what the hive is doing NOW: one line per task whose status is
+live (needs-attention / running / claimed / verifying / pending), each with a
+plain-word label, colour, worker and branch. Terminal history (merged, probed,
+reviewed, done, dead, cancelled) is collapsed into a single dim "lifetime"
+footer so the pane stays readable. Refreshes in place.
+
+Reads hive_queue.status_snapshot() directly instead of scraping halctl text.
 
 Usage: python3 hive_queue_active.py [--interval N] [--once]
 """
 import argparse
 import os
-import subprocess
+import sys
 import time
 
 HIVE_DIR = os.path.dirname(os.path.abspath(__file__))
-KEEP = ("claimed", "pending", "running", "needs_attention", "needs attention")
+sys.path.insert(0, HIVE_DIR)
+
+# Live statuses, in the order we want them surfaced (most urgent first).
+# status -> (glyph, plain label, ANSI colour code)
+STYLE = {
+    "needs_attention": ("⚠", "needs-attention", "1;31"),  # bold red
+    "running":         ("▶", "running",         "32"),     # green
+    "claimed":         ("◔", "claimed",         "36"),     # cyan
+    "verifying":       ("⟳", "verifying",       "36"),     # cyan
+    "awaiting_review": ("⧗", "awaiting-review", "35"),     # magenta
+    "pending":         ("·", "pending",         "33"),     # yellow
+}
+ACTIVE_ORDER = list(STYLE.keys())
+# Terminal / historical statuses collapsed into the footer.
+LIFETIME_ORDER = ["merged", "reviewed", "probed", "done", "dead", "failed", "cancelled"]
+
+
+def _c(code, s):
+    return f"\x1b[{code}m{s}\x1b[0m"
 
 
 def one_pass():
+    import hive_queue as q
     try:
-        out = subprocess.run(
-            ["python3", "halctl.py", "status"],
-            cwd=HIVE_DIR, capture_output=True, text=True, timeout=25,
-        ).stdout.splitlines()
-    except Exception as exc:  # noqa: BLE001 - keep pane alive
-        return [f"status error: {exc}"]
-    lines = []
-    if out:
-        lines.append(out[0])  # summary counts
-    show = False
-    for ln in out[1:]:
-        head = ln.lstrip()
-        # a task header line starts at column 0-ish with a status glyph, not a
-        # continuation (↳ prompt / · meta / → arrow)
-        is_header = bool(head) and head[:1] not in ("↳", "·", "→") and not ln.startswith("      ")
-        if is_header:
-            show = any(k in ln for k in KEEP)
-        if show:
-            lines.append(ln)
-    if len(lines) <= 1:
-        lines.append("(no active tasks)")
-    return lines
+        snap = q.status_snapshot()
+    except Exception as exc:  # noqa: BLE001 - keep the pane alive
+        return [_c("31", f"status error: {exc}")]
+
+    counts = snap.get("counts", {})
+    tasks = snap.get("tasks", [])
+    active = [t for t in tasks if t.get("status") in STYLE]
+
+    out = []
+    if active:
+        active.sort(key=lambda t: (ACTIVE_ORDER.index(t["status"]),
+                                   t.get("priority") if t.get("priority") is not None else 9))
+        for t in active:
+            glyph, label, colour = STYLE[t["status"]]
+            wid = t.get("worker_id") or "—"
+            branch = t.get("branch") or ""
+            out.append(_c(colour, f"{glyph} {label:<15}") +
+                       f" {t['id']:<16} {wid:<10} {branch}")
+            if t.get("title"):
+                out.append(_c("2", f"     ↳ {t['title']}"))
+            if t["status"] == "needs_attention" and t.get("error"):
+                out.append(_c("31", f"     ! {t['error']}"))
+    else:
+        out.append(_c("2", "  (nothing active right now)"))
+
+    life = "  ".join(f"{s} {counts[s]}" for s in LIFETIME_ORDER if counts.get(s))
+    if life:
+        out.append("")
+        out.append(_c("2", f"─ lifetime ─  {life}"))
+    return out
 
 
 def main(argv=None):
@@ -54,7 +84,9 @@ def main(argv=None):
     try:
         while True:
             print("\x1b[2J\x1b[H", end="")
-            print(f"QUEUE (active)  {time.strftime('%H:%M:%S')}  refresh {args.interval}s\n")
+            print(_c("1", "QUEUE · live") +
+                  _c("2", f"    {time.strftime('%H:%M:%S')} · every {args.interval}s"))
+            print(_c("2", "what the hive is doing right now") + "\n")
             print("\n".join(one_pass()), flush=True)
             time.sleep(args.interval)
     except KeyboardInterrupt:

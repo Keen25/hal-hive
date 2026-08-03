@@ -122,7 +122,7 @@ def render(rows):
     print(f"{'':1} {'PID':>6} {'STATE':<8} {'UPTIME':>8} {'IDLE':>7}  {'SESSION':<9} TASK")
     for r in rows:
         icon = icons.get(r["state"], " ")
-        idle = fmt_dur(r["idle_s"]) if r["idle_s"] >= 0 else "?"
+        idle = fmt_dur(r["idle_s"]) if r["idle_s"] >= 0 else "\u2014"
         print(
             f"{icon} {r['pid']:>6} {r['state']:<8} {fmt_dur(r['uptime_s']):>8} "
             f"{idle:>7}  {r['session'][:8]:<9} {r['label']}"
@@ -131,6 +131,7 @@ def render(rows):
     if waiting:
         print(f"\n\u23f8  {len(waiting)} session(s) waiting for you: "
               + ", ".join(r["session"][:8] for r in waiting))
+    print("\x1b[2m\u25b6 active  \u2699 working  \u23f8 waiting-for-you  \u00b7 idle\x1b[0m")
 
 
 def main(argv=None):

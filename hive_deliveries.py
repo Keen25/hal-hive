@@ -57,6 +57,9 @@ def main(argv=None):
     scan(emit=False)
     if args.once:
         return
+    print("\x1b[1mDELIVERIES · live\x1b[0m", flush=True)
+    print("\x1b[2mfinished offloads land here as they complete (\u2713)\x1b[0m\n",
+          flush=True)
     while True:
         try:
             scan(emit=True)
