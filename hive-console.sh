@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # hive-console.sh -- one-window operator console for Copilot sessions + the hive.
 #
-# Replaces juggling separate Konsole tabs. Four panes in one detachable tmux
-# window (all read-only except the prompt you type):
+# Replaces juggling separate Konsole tabs. The CLI you type in is DOMINANT on the
+# left; three read-only glance panes stack in a narrow right column.
 #
 #   ┌────────────────────────────┬───────────────────────────┐
-#   │ SESSIONS (top-left)        │ QUEUE active (top-right)  │
-#   │ hive_sessions.py --watch   │ hive_queue_active.py      │
-#   ├────────────────────────────┼───────────────────────────┤
-#   │ CLI (bottom-left)          │ DELIVERIES (bottom-right) │
-#   │ interactive `copilot`      │ hive_deliveries.py        │
+#   │                            │ SESSIONS (top-right)      │
+#   │  CLI (left, ~68%)          │ hive_sessions.py --watch  │
+#   │  interactive `copilot`     ├───────────────────────────┤
+#   │  — type here               │ QUEUE (mid-right)         │
+#   │                            │ hive_queue_active.py      │
+#   │                            ├───────────────────────────┤
+#   │                            │ DELIVERIES (bottom-right) │
+#   │                            │ hive_deliveries.py        │
 #   └────────────────────────────┴───────────────────────────┘
 #
 # Usage:
@@ -59,28 +62,43 @@ fi
 
 # ---- build the window if absent (deterministic 2x2 layout) ----------------
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  tmux new-session -d -s "$SESSION" -n console -x 220 -y 50
+  # No fixed -x/-y: inherit the attaching client's REAL size. The old
+  # `-x 220 -y 50` capped the console at 220x50 cells even on a 4K display,
+  # which is why the CLI pane felt tiny.
+  tmux new-session -d -s "$SESSION" -n console
   W="$SESSION:console"
 
-  # Start: single pane 0. Split horizontally -> 0 (left) | 1 (right).
-  tmux split-window -h -t "$W.0"
-  # Split left pane vertically  -> 0 (top-left) / 2 (bottom-left).
-  tmux split-window -v -t "$W.0"
-  # Split right pane vertically -> 1 (top-right) / 3 (bottom-right).
-  tmux split-window -v -t "$W.1"
-  tmux select-layout -t "$W" tiled
+  # Resize to the most-recent client on attach, and label every pane border so
+  # it is obvious "what is what".
+  tmux set-option        -t "$SESSION" window-size latest
+  tmux set-window-option -t "$SESSION" aggressive-resize on
+  tmux set-option        -t "$SESSION" pane-border-status top
+  tmux set-option        -t "$SESSION" pane-border-format ' #{pane_title} '
 
-  # Pane map after the splits above:
-  #   0 top-left    -> sessions
-  #   2 bottom-left -> CLI (interactive Copilot)
-  #   1 top-right   -> queue
-  #   3 bottom-right-> deliveries
-  tmux send-keys -t "$W.0" "$sessions_cmd" C-m
-  tmux send-keys -t "$W.2" "$cli_cmd"      C-m
-  tmux send-keys -t "$W.1" "$queue_cmd"    C-m
+  # Layout: the CLI (where you actually type) is DOMINANT on the left (~68%);
+  # the three glance-only watchers stack in a narrow right column (~32%).
+  #   ┌────────────────────┬──────────────┐
+  #   │                    │ SESSIONS     │  pane 1
+  #   │  CLI  (pane 0)     ├──────────────┤
+  #   │  interactive       │ QUEUE        │  pane 2
+  #   │  copilot           ├──────────────┤
+  #   │                    │ DELIVERIES   │  pane 3
+  #   └────────────────────┴──────────────┘
+  tmux split-window -h -l 32% -t "$W.0"     # 0 left (CLI) | 1 right column
+  tmux split-window -v -l 66% -t "$W.1"     # 1 top / 2 (lower two-thirds)
+  tmux split-window -v -l 50% -t "$W.2"     # 2 mid / 3 bottom -> ~equal thirds
+
+  tmux select-pane -t "$W.0" -T 'CLI · copilot (type here)'
+  tmux select-pane -t "$W.1" -T 'SESSIONS · your copilot windows'
+  tmux select-pane -t "$W.2" -T 'QUEUE · hive tasks'
+  tmux select-pane -t "$W.3" -T 'DELIVERIES · finished offloads'
+
+  tmux send-keys -t "$W.0" "$cli_cmd"      C-m
+  tmux send-keys -t "$W.1" "$sessions_cmd" C-m
+  tmux send-keys -t "$W.2" "$queue_cmd"    C-m
   tmux send-keys -t "$W.3" "$deliver_cmd"  C-m
 
-  tmux select-pane -t "$W.2"   # focus the CLI
+  tmux select-pane -t "$W.0"   # focus the CLI
 fi
 
 if [[ -n "${TMUX:-}" ]]; then
