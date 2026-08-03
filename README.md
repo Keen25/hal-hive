@@ -18,6 +18,11 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `queue_server.py` | REST control plane (bearer-token auth), reaper + merge-loop threads |
 | `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps; **version-driven self-update** |
 | `halctl.py` | control CLI: `add` (`--review N`, `--repo`, `--disable-mcp`) / `status` / `workers` / `update` / `cancel` / `requeue` / `prio` / `classify` / `promote` (mirror-repo → ADO PR) |
+| `hive-console.sh` | one-window tmux operator console: **sessions · queue · live Copilot CLI · deliveries** (see [Operator console](#operator-console-delivery--resume)) |
+| `hive_sessions.py` | single-pane status of all local Copilot CLI sessions; flags idle/`WAITING` ones |
+| `hive_watch.py` | delivery→resume watcher: `register`/`wait`/`run` — pushes offloaded-task completions back into a session inbox |
+| `hive_queue_active.py` | compact live view of actionable queue tasks (claimed/pending/running/needs_attention) |
+| `hive_deliveries.py` | robust follower of `inbox/*.jsonl` delivery logs (console DELIVERIES pane) |
 | `hive_caps.py` | capability vocabulary — `probe_caps()` (worker) + `classify_prompt()` (intake) |
 | `hive_version.py` | single source of truth for the worker code version (`CODE_VERSION`); bump to release a fleet self-update |
 | `classifier_rules.d/` | external classifier rule packs (product-specific `requires` rules; ships `activeroles.json`) |
@@ -39,6 +44,37 @@ python3 halctl.py add "<prompt>" --require build:dotnet   # or use the hive-task
 python3 halctl.py status
 python3 halctl.py workers                                 # per-worker quirks: host, install dir, os/build caps, code version
 ```
+
+## Operator console (delivery → resume)
+
+One tmux window instead of juggling separate terminal tabs. Four panes, all
+read-only except the CLI: **sessions** (which chat is `WAITING`) · **queue**
+(active tasks) · **live `copilot`** (chat from inside the console) ·
+**deliveries** (offloaded-task completions land here).
+
+```bash
+./hive-console.sh                       # attach (creates it if needed); Ctrl-b d to detach
+./hive-console.sh --kill                # tear down
+HIVE_SESSION_ID=<sid> ./hive-console.sh # also write completions into that session's inbox
+# CLI pane knobs: HIVE_CLI_ARGS=--continue  HIVE_CLI_DIR=/repo  HIVE_CLI_CMD=bash
+```
+
+**Async-offload workflow** — offload a self-contained task, keep working, pick
+up the thread when the worker delivers:
+
+```bash
+TID=$(python3 halctl.py add "<defect/build/verify task>" --require build:dotnet | awk '/^\+ /{print $2; exit}')
+python3 hive_watch.py register "$TID"                     # add to this session's watchlist
+python3 hive_watch.py wait "$TID" &                       # detached: its EXIT is the wake signal
+#   ... continue interactive work ...
+#   on completion: delivery written to inbox/<sid>.jsonl + session.db inbox_entries,
+#   and the DELIVERIES pane prints it.
+```
+
+> Note: the native `inbox_entries` table does **not** auto-surface to an agent;
+> the `wait` process exiting (or the `run` loop) is what signals "pick up the
+> thread". `hive_sessions.py` alone (no console) also works: `--watch` for a
+> live table, `--json` for scripting.
 
 ## Secrets & state (NOT in this repo)
 
