@@ -1,0 +1,16 @@
+[Unit]
+Description=HAL Live Hive — litestream continuous backup of queue.db (I6 DR)
+After=hive-queue-server.service
+Wants=hive-queue-server.service
+
+[Service]
+Type=simple
+# %h = the user's home; litestream lives in ~/.local/bin (user install)
+ExecStart=%h/.local/bin/litestream replicate -config %h/.hive/litestream.yml
+Restart=on-failure
+RestartSec=5
+# litestream is a plain backup daemon; keep it lightweight and out of the way.
+Nice=10
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,16 @@
+{
+  "version": "1.0",
+  "_comment": "Minimal VS Build Tools 2022 component set proven on the 'wg' worker to build ActiveRoles (native C++ codegen + managed + vstest). Reuse to seed any new ARS builder: vs_BuildTools.exe --config ars-buildtools.vsconfig --passive --norestart. Extracted from wg (C:\\BuildTools, VS BT 17.14.37411.7) via vswhere -include packages. CANDIDATE until task-320f21ab build-smoke confirms sufficiency.",
+  "components": [
+    "Microsoft.VisualStudio.Workload.VCTools",
+    "Microsoft.VisualStudio.Workload.MSBuildTools",
+    "Microsoft.VisualStudio.Workload.ManagedDesktopBuildTools",
+    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+    "Microsoft.VisualStudio.Component.VC.Redist.14.Latest",
+    "Microsoft.VisualStudio.Component.Windows10SDK",
+    "Microsoft.VisualStudio.Component.Windows11SDK.22621",
+    "Microsoft.VisualStudio.Component.Windows11SDK.26100",
+    "Microsoft.VisualStudio.Component.VC.CoreIde",
+    "Microsoft.VisualStudio.Component.TestTools.BuildTools"
+  ]
+}
