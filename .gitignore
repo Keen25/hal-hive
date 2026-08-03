@@ -41,3 +41,12 @@ winsw.exe
 
 # hive-console runtime deliveries + watcher state
 inbox/
+
+# Stray per-task SQLite scratch blobs dropped in the hive root (e.g. task-039dbbfd)
+/task-*
+
+# litestream runtime replica data (the .service unit IS tracked; the data is not)
+.queue.db-litestream/
+
+# ad-overload generated LDIF fixtures (regenerate via overload_tool.py)
+ad-overload/*.ldif

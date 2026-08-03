@@ -1,0 +1,42 @@
+TASK: T4 (ADO #726462) — live NDJ UPN-onboarding + DJ-regression test of the 726452 change set, ON THIS BOX (wg1, a non-domain-joined WS2025 ARS host). You are running AS LocalSystem, so you have full local admin: you may write Program Files, control the ARAdminSvc service, and set Machine env vars. This is a LAB — user directive: do what it takes. No backup required. Capture ALL evidence.
+
+WHAT IS UNDER TEST (branch feature/726452_ndj-upn-downlevel-resolver, already built into this clone):
+- T1: LdapIdentifierLookup.ResolveDownLevelByUserPrincipalName (UPN -> DOMAIN\sAMAccountName). Same-domain fast path via constructed msDS-PrincipalName; cross-domain/alternate-suffix fallback via GC -> objectSid -> forest Partitions sweep. New AmbiguousIdentifierException on multi-forest UPN. Requires OneIdentity.Ldap rc.10 (pinned in Common/Build/ActiveRoles.Directory.Packages.props).
+- T2: StoredAccountPasswordHandler.NormalizeManagedOverrideAccountName (assembly ActiveRoles.Service.CorePolicies.dll). On create AND edit of a managed-domain override account, if the account is UPN-form (contains @) and NDJ mode is on and a managed-domain DN is present, it locates a DC, binds AS the entered override account (Kerberos signed+sealed on :389 primary; Simple bind over LDAPS :636 fallback), resolves the UPN to down-level, and stores the down-level name. Ambiguous UPN -> actionable error, no fallback. Not-found -> actionable error. Both binds fail -> actionable error naming ports 389/636.
+
+ENVIRONMENT (already verified from hal):
+- This host wg1 192.168.100.18: workgroup, PartOfDomain=False, Domain=NDJ, WS2025. Build toolchain at C:\BuildTools (msbuild, cl.exe, vstest).
+- ARS 9.0 installed at C:\Program Files\One Identity\Active Roles\9.0\Service (arssvc.exe, service name ARAdminSvc, StartName .\Administrator, currently Stopped). Currently deployed OneIdentity.Ldap.dll is rc.7 (STALE — must be replaced with rc.10). 40 ActiveRoles.*.dll present incl ActiveRoles.Service.CorePolicies.dll, ActiveRoles.Service.ActiveDirectory.dll, ActiveRoles.Common.Ldap.dll.
+- DC1 192.168.100.10 = dc1.fodor.monster.local. This host DNS = 192.168.100.10. SRV _ldap._tcp.fodor.monster.local resolves to dc1. DC1 reachable on 389, 3268 (GC), 636 (LDAPS).
+- SQL host sql1 192.168.100.12:1433 reachable (for the ARS config DB).
+- Override-account creds for the managed domain fodor.monster.local: try administrator@fodor.monster.local (or fodor\a) with the lab password; if unknown, discover the working credential from the existing DC1 setup and RECORD which one worked. The DOMAIN NetBIOS is FODOR.
+
+STEP 1 — BUILD the 726452 managed assemblies at rc.10 (managed-only; do NOT attempt the native/codesigner chain — it is blocked on this feed). In the repo clone:
+- Confirm OI.Ldap pin is rc.10 in Common/Build/ActiveRoles.Directory.Packages.props.
+- Build ActiveRoles.Common.Services.ActiveDirectory (the T1 assembly) and ActiveRoles.Service.CorePolicies (the T2 assembly) and their managed dependencies. Use msbuild from C:\BuildTools. If a full solution build pulls the native chain, build just the needed managed csproj(s) with BuildProjectReferences as needed, restoring rc.10 OneIdentity.Ldap. Locate the produced OneIdentity.Ldap.dll rc.10 from the NuGet package cache if the build does not copy it.
+- Record the produced assembly FileVersions/ProductVersions and the resolved OneIdentity.Ldap package version (must be 1.0.0-rc.10...).
+
+STEP 2 — OVERLAY onto the installed service (mirror the #725472 overlay pattern):
+- Stop-Service ARAdminSvc -Force; wait for arssvc.exe to exit.
+- Copy the freshly built ActiveRoles.Common.Services.ActiveDirectory.dll (if that is the T1 assembly name it produces) / ActiveRoles.Service.CorePolicies.dll and OneIdentity.Ldap.dll (rc.10) plus any changed managed dependency DLLs into C:\Program Files\One Identity\Active Roles\9.0\Service, overwriting. EXCLUDE any *Tests*, *Fakes*, vstest*, testhost*, xunit*, nunit*, Moq* — never ship test assemblies into the service dir.
+- Confirm post-copy: OneIdentity.Ldap.dll ProductVersion now shows rc.10, and the CorePolicies/AD assemblies are the new build.
+
+STEP 3 — FORCE NDJ mode + confirm config:
+- [Environment]::SetEnvironmentVariable('ARS_NDJ_MODE','1','Machine')
+- Create dir C:\ProgramData\OneIdentity\ActiveRoles and write ndj-endpoints.json there with a servers array entry pointing at this host (serverName wg1 or its FQDN, a port, and domainDN DC=fodor,DC=monster,DC=local). Exact endpoint values are not critical — the factory finds the DC via DNS SRV.
+- Ensure the ARS config DB on sql1 is reachable and the service is configured to use it. If the service is not yet configured (no config DB), configure it via Configuration Center / the ARS config tooling against sql1, creating the admin service instance. RECORD exactly what you did.
+
+STEP 4 — RUN THE TEST MATRIX. Start-Service ARAdminSvc. For each case, drive the override-account onboarding (register a managed domain with the override account, or edit its account name) and capture the OUTCOME plus supporting evidence (ARS event log entries, the arssvc trace/log, and where noted an LDAP/network capture). Capture everything under C:\tmp\t4\.
+  Case A (PRIMARY UPN repro): managed domain fodor.monster.local, override account in UPN form administrator@fodor.monster.local. Expected: the domain reaches Available for management; edsaAccountName is stored in down-level FODOR\Administrator form; previously this produced events 1010->2509 / domain could not be contacted. Record the stored edsaAccountName value.
+  Case B (alternate-suffix / cross-domain UPN): if an alternate UPN suffix or a second forest domain exists, register an override account whose UPN suffix differs from its DNS domain; expect the GC/Partitions fallback to resolve it to the correct NETBIOS\sam. If no second domain exists, record that this case is N/A here and note the GC fast-path vs fallback branch actually exercised.
+  Case C (down-level unchanged): override account in down-level form FODOR\Administrator. Expect it onboards exactly as before (byte-for-byte path; NormalizeManagedOverrideAccountName returns the input untouched because it has no @). Confirm no UPN-resolution code ran.
+  Case D (failure path — bad creds): UPN-form override account with a wrong password. Expect an ACTIONABLE ArsException naming the resolve failure (both Kerberos :389 and LDAPS :636), NOT the generic domain-could-not-be-contacted. Capture the exact message.
+  Case E (failure path — DC unreachable): temporarily break DC reachability (e.g. point at a dead DC / block the port) and confirm the DC-locate failure surfaces the actionable domain-controller message, then restore.
+  Case F (GC-reachability precheck): confirm DC1 answers :3268; for a cross-domain UPN when only :389 answers, expect an actionable not-found, not a hang. (If single-domain only, record the :3268 reachability result and mark the cross-domain sub-case N/A.)
+  Case G (WS2025 signed+seal on :389, NO LDAPS cert): confirm NO server-auth/LDAPS certificate is installed in the service host LocalMachine\My store (mirror-negative: prove the no-cert claim is actually exercised). With DC LDAP signing enforcement ON (LDAPServerEnforceIntegrity=1) + channel binding, the Kerberos signed+sealed resolve bind on :389 must SUCCEED with no LDAPS cert. Confirm via a network capture OR DC event 2889 that the resolve bind is signed (no unsigned-bind event logged for it). If the DC is not currently hardened, record its current signing setting and note whether it was toggled.
+
+DELIVERABLE:
+- Put all raw evidence (event exports, trace snippets, capture files, cert-store listing, stored edsaAccountName) under C:\tmp\t4\ on this box and keep it there.
+- Write a consolidated results report as a NEW file at the repo path Service/Tests/Service.CorePolicies.Tests/ndj-t4-live-results.md summarizing every case with PASS/FAIL/N-A, the observed evidence, the deployed assembly + OI.Ldap versions, and any config steps you performed. Commit ONLY that report file (this is a test-evidence artifact; do NOT modify any product source or test code). This gives a mergeable diff and lands the evidence centrally.
+- If you hit a hard blocker (e.g. cannot obtain override-account creds, cannot configure the config DB, DC not hardenable), STOP and write what you found to the report and to C:\tmp\t4\BLOCKER.txt rather than flailing — a captured blocker is a valid result.
+Be dense and factual in the report. No filler.
