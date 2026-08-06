@@ -59,6 +59,50 @@ Two cooperating pieces (both in `~/hive/`, single vocabulary in `hive_caps.py`):
    (never a silent stall). If it should run but no worker qualifies, either start
    a capable worker (see hive-queue-ops for the ar1/mini-HAL lane) or re-scope.
 
+5. **Wire report-back (never skip if you're expected to report):** register the
+   task to this session and launch a **tracked async** `hive_watch wait` so the
+   runtime wakes you when it finishes. See *Report-back wiring* below.
+
+## Report-back wiring — close the loop (never skip after add)
+
+Dispatching is only half the job. The control plane MUST bridge the completion
+signal back to *this* session or you go silent until the human nudges you. The
+bridge is `hive_watch.py` (queue.db terminal status → session `inbox_entries`).
+
+After every `halctl add` you're expected to report on:
+
+1. **Register** the task to this session's watchlist:
+   ```bash
+   python3 ~/hive/hive_watch.py --session-id "<sid>" \
+       --session-dir "$HOME/.copilot/session-state/<sid>" register <task-id>
+   ```
+   `$COPILOT_SESSION_ID` is often **empty** in the shell env — pass `<sid>`
+   explicitly (you know it from the session-state path in your context).
+
+2. **Launch the watcher as a TRACKED async job** (bash tool `mode=async`), NOT
+   `setsid`/detached. Detached = the runtime never notifies you = loop stays open
+   (this was yesterday's bug: radio unplugged).
+   ```bash
+   python3 ~/hive/hive_watch.py --session-id "<sid>" \
+       --session-dir "$HOME/.copilot/session-state/<sid>" \
+       wait <task-id> --interval 15 --timeout 900
+   ```
+   Its **exit is the push signal**: the runtime sends a completion notification
+   the instant the task hits a terminal status (`merged|reviewed|probed|dead|
+   failed|needs_attention`).
+
+3. **On the notification:** `read_bash` the watcher shell, then read the delivered
+   `inbox_entries` row (`interaction_id = hive:<task-id>`) for outcome, commit,
+   and log tail. Summarize to the human, then mark it read
+   (`UPDATE inbox_entries SET unread=0, read_at=strftime('%s','now') WHERE …`).
+
+4. **Cleanup:** `hive_watch.py … unregister <task-id>` and remove the wait log.
+
+Batch: register all tasks, launch one `wait` per task (or `wait --all <ids…>` to
+wake only on the batch's final signal). `inbox/state-<sid>.json` dedups, so no
+double delivery. Read-only probes / fire-and-forget tasks you won't report on can
+skip this — otherwise wire it.
+
 ## Capability vocabulary (edit ONLY in `hive_caps.py`)
 
 `os:{windows,linux,darwin}` · `platform:{windows,posix}` · `arch:*` ·
