@@ -19,6 +19,8 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps; **version-driven self-update** |
 | `halctl.py` | control CLI: `add` (`--review N`, `--repo`, `--disable-mcp`) / `status` / `workers` / `update` / `cancel` / `requeue` / `prio` / `classify` / `promote` (mirror-repo → ADO PR) |
 | `hive-console.sh` | one-window tmux operator console: **sessions · queue · live Copilot CLI · deliveries** (see [Operator console](#operator-console-delivery--resume)) |
+| `hive-chat.sh` | multi-session orchestrator: open / resume / switch HAL chats, each in its own tmux window (`run`/`new`/`resume`/`pick`/`ls`/`switch`/`kill`) |
+| `hive_pick.py` | dependency-free picker of resumable past sessions (reads each `workspace.yaml`); prints the chosen id |
 | `hive_sessions.py` | single-pane status of all local Copilot CLI sessions; flags idle/`WAITING` ones |
 | `hive_watch.py` | delivery→resume watcher: `register`/`wait`/`run` — pushes offloaded-task completions back into a session inbox |
 | `hive_queue_active.py` | compact live view of actionable queue tasks (claimed/pending/running/needs_attention) |
@@ -58,6 +60,33 @@ read-only except the CLI: **sessions** (which chat is `WAITING`) · **queue**
 HIVE_SESSION_ID=<sid> ./hive-console.sh # also write completions into that session's inbox
 # CLI pane knobs: HIVE_CLI_ARGS=--continue  HIVE_CLI_DIR=/repo  HIVE_CLI_CMD=bash
 ```
+
+### Multi-session chats (new / resume / switch)
+
+Each chat is a HAL-persona `copilot` in its own tmux window; `hive-chat.sh`
+drives them and shares one launcher (`run`) with the console CLI pane, so every
+chat gets the same persona refresh + relaunch loop. From inside the console:
+
+| Key | Action |
+|-----|--------|
+| `prefix + C` | open a **new** HAL chat window |
+| `prefix + R` | **pick** a past session to resume (interactive menu) |
+| `prefix + w` | native window switcher (choose-tree) · `prefix + n/p/<num>` also work |
+
+Or drive it from the CLI pane / any shell in the `hive-console` session:
+
+```bash
+./hive-chat.sh new ["name"]      # new chat (optionally names the copilot session, -n)
+./hive-chat.sh resume [id|name]  # resume a session; no arg -> picker
+./hive-chat.sh pick              # interactive picker (newest first; * = live)
+./hive-chat.sh ls                # list open chat windows
+./hive-chat.sh switch <n>        # jump to chat window n
+./hive-chat.sh kill <n>          # close chat window n
+```
+
+Resume matching uses copilot's own `-r` (session id, id prefix, or exact name).
+The picker reads each session's `workspace.yaml`, newest first, and prints the
+chosen id for `hive-chat.sh resume`.
 
 **Async-offload workflow** — offload a self-contained task, keep working, pick
 up the thread when the worker delivers:

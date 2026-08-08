@@ -71,6 +71,21 @@ def cmd_add(a):
     eff_summary = ' '.join(a.summary.split())[:q.SUMMARY_MAX] if a.summary \
         else q._task_title(a.prompt, q.SUMMARY_MAX)
     print(f'  ↳ {eff_summary}')
+    if not getattr(a, 'no_wire_hint', False):
+        import os
+        sid = os.environ.get('COPILOT_SESSION_ID') or '<sid>'
+        sdir = os.environ.get('COPILOT_SESSION_DIR') \
+            or f'$HOME/.copilot/session-state/{sid}'
+        print('  ↻ report-back NOT wired — dispatch is half the job. To be woken '
+              'on completion, register + launch a TRACKED async watcher (never '
+              'setsid/detached):')
+        print(f'      python3 ~/hive/hive_watch.py --session-id {sid} '
+              f'--session-dir {sdir} register {tid}')
+        print(f'      python3 ~/hive/hive_watch.py --session-id {sid} '
+              f'--session-dir {sdir} wait {tid} --interval 15 --timeout 900')
+        if sid == '<sid>':
+            print('    (env COPILOT_SESSION_ID empty — substitute this session\'s '
+                  'id. skip with --no-wire-hint for fire-and-forget.)')
 
 
 def cmd_classify(a):
@@ -410,6 +425,10 @@ def main():
                          'produces no commit finishes terminally (probed) on the '
                          'first attempt instead of requeuing. Never merges. Use '
                          'for build checks, log reads, validation runs.')
+    pa.add_argument('--no-wire-hint', action='store_true',
+                    help='suppress the report-back watcher-wiring reminder printed '
+                         'after queueing (use for fire-and-forget / scripted adds '
+                         'you will not report on)')
     pa.set_defaults(fn=cmd_add)
 
     ps = sub.add_parser('status', help='fleet snapshot')

@@ -42,6 +42,12 @@ winsw.exe
 # hive-console runtime deliveries + watcher state
 inbox/
 
+# HAL persona for the console CLI pane — generated from the canonical personal
+# context (~/.agents/context/0_hal_persona.md) and carries personal identifiers
+# (Entra/ADO IDs, emails). Regenerated on every hive-console.sh launch; never
+# commit it to this public control repo.
+AGENTS.md
+
 # Stray per-task SQLite scratch blobs dropped in the hive root (e.g. task-039dbbfd)
 /task-*
 
