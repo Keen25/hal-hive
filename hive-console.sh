@@ -38,6 +38,12 @@ fi
 
 SID="${HIVE_SESSION_ID:-}"
 
+# ---- persona/CLI launch is delegated to hive-chat.sh ---------------------
+# `hive-chat.sh run` refreshes AGENTS.md from the HAL persona and runs the
+# relaunch loop. Sharing it means the CLI pane and every `new`/`resume` chat
+# window boot identically. hive-chat.sh also honors HAL_PERSONA / HIVE_CLI_*.
+CHAT="$HIVE_DIR/hive-chat.sh"
+
 # ---- single-line pane commands (send-keys safe) ---------------------------
 sessions_cmd="cd '$HIVE_DIR' && exec $PY hive_sessions.py --watch --interval 5"
 queue_cmd="cd '$HIVE_DIR' && exec $PY hive_queue_active.py --interval 5"
@@ -46,19 +52,14 @@ if [[ -n "$SID" ]]; then
 else
   deliver_cmd="cd '$HIVE_DIR' && mkdir -p inbox && echo 'DELIVERIES — offloaded tasks appear here (bind with HIVE_SESSION_ID)' && exec $PY hive_deliveries.py"
 fi
-# CLI pane: launch an interactive Copilot CLI session so you can chat from
-# inside the console. Configurable:
+# CLI pane: launch the interactive HAL chat via hive-chat.sh (persona refresh +
+# relaunch loop live there now, shared with every new/resume chat window).
+# Configurable:
 #   HIVE_CLI_CMD   command to run   (default: copilot; set to a shell to opt out)
 #   HIVE_CLI_DIR   working dir      (default: \$HIVE_DIR)
 #   HIVE_CLI_ARGS  extra CLI args   (e.g. "--continue" or "-C /path/to/repo")
-CLI_BIN="${HIVE_CLI_CMD:-copilot}"
-CLI_DIR="${HIVE_CLI_DIR:-$HIVE_DIR}"
-CLI_ARGS="${HIVE_CLI_ARGS:-}"
-if command -v "${CLI_BIN%% *}" >/dev/null 2>&1; then
-  cli_cmd="cd '$CLI_DIR' && exec $CLI_BIN $CLI_ARGS"
-else
-  cli_cmd="cd '$CLI_DIR' && echo '[$CLI_BIN not found — falling back to shell. Set HIVE_CLI_CMD]' && exec \${SHELL:-/bin/bash}"
-fi
+# We pass HIVE_CLI_ARGS through as HIVE_CHAT_ARGS so `run` picks them up.
+cli_cmd="HIVE_CLI_CMD='${HIVE_CLI_CMD:-copilot}' HIVE_CLI_DIR='${HIVE_CLI_DIR:-$HIVE_DIR}' HIVE_CHAT_ARGS='${HIVE_CLI_ARGS:-}' exec '$CHAT' run"
 
 # ---- build the window if absent (deterministic 2x2 layout) ----------------
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
@@ -74,6 +75,11 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux set-window-option -t "$SESSION" aggressive-resize on
   tmux set-option        -t "$SESSION" pane-border-status top
   tmux set-option        -t "$SESSION" pane-border-format ' #{pane_title} '
+
+  # Keep a pane visible ("Pane is dead", respawnable) if its command ever exits,
+  # instead of destroying it and reflowing the layout. The CLI pane self-heals via
+  # its relaunch loop; this covers the watcher panes if their python ever crashes.
+  tmux set-window-option -t "$SESSION" remain-on-exit on
 
   # Layout: the CLI (where you actually type) is DOMINANT on the left (~68%);
   # the three glance-only watchers stack in a narrow right column (~32%).
@@ -99,6 +105,22 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux send-keys -t "$W.3" "$deliver_cmd"  C-m
 
   tmux select-pane -t "$W.0"   # focus the CLI
+
+  # ---- orchestrator keybindings (create / resume / switch chats) ----------
+  # Each chat is its own tmux window; hive-chat.sh drives creation & resume.
+  #   prefix + C : open a NEW HAL chat window
+  #   prefix + R : PICK a past session to resume (interactive)
+  #   prefix + w : native window switcher (choose-tree)
+  # Bindings are server-global but act on the client's current session, so they
+  # add windows to whichever console you're attached to.
+  tmux bind-key C new-window -c "$HIVE_DIR" "exec '$CHAT' run"
+  tmux bind-key R new-window -c "$HIVE_DIR" "exec '$CHAT' pick"
+
+  # Always-visible hint in the status bar.
+  tmux set-option -t "$SESSION" status on
+  tmux set-option -t "$SESSION" status-right \
+    ' #[fg=green]prefix+C#[default] new · #[fg=green]prefix+R#[default] resume · #[fg=green]prefix+w#[default] switch '
+  tmux set-option -t "$SESSION" status-right-length 80
 fi
 
 if [[ -n "${TMUX:-}" ]]; then
