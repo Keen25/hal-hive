@@ -469,6 +469,41 @@ def complete():
     return jsonify(status=status), 200
 
 
+def _normalize_complexity(raw, prompt=''):
+    """Accept a tier as an int, a numeric string, a label
+    ('simple'/'standard'/'complex'), or 'auto' (classified from the prompt).
+    Returns an int 1..3 or None. Raises ValueError on an unknown value so the
+    caller can answer 400 instead of leaking a 500."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s == '' or s == 'none':
+            return None
+        if s == 'auto':
+            import hive_caps
+            return int(hive_caps.classify_complexity(prompt or '')['complexity'])
+        import hive_caps
+        label_to_tier = {v: k for k, v in hive_caps.COMPLEXITY_LABELS.items()}
+        if s in label_to_tier:
+            return int(label_to_tier[s])
+        raw = s  # fall through to int() for a numeric string
+    tier = int(raw)
+    if tier not in (1, 2, 3):
+        raise ValueError(f'complexity must be 1..3, got {tier}')
+    return tier
+
+
+def _normalize_model(raw):
+    """Treat 'auto'/'' as unset so add_task derives the model from complexity."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if s.lower() in ('', 'auto', 'none'):
+        return None
+    return s
+
+
 @app.post('/add')
 def add():
     b = request.get_json(force=True, silent=True) or {}
@@ -478,8 +513,8 @@ def add():
             base_ref=b.get('base_ref', q.DEFAULT_BASE_REF), worker=b.get('worker'),
             requires=b.get('requires'), scope=b.get('scope'),
             priority=int(b.get('priority', 5)),
-            complexity=(int(b['complexity']) if b.get('complexity') is not None else None),
-            model=b.get('model'),
+            complexity=_normalize_complexity(b.get('complexity'), b.get('prompt', '')),
+            model=_normalize_model(b.get('model')),
             deps=b.get('deps'), max_attempts=int(b.get('max_attempts', 3)),
             review_max=int(b.get('review_max', 0)),
             repo=b.get('repo', 'lab.git'),
@@ -488,6 +523,8 @@ def add():
         )
     except KeyError as exc:
         return jsonify(error=f'missing required field: {exc.args[0]}'), 400
+    except ValueError as exc:
+        return jsonify(error=f'invalid field value: {exc}'), 400
     except sqlite3.IntegrityError as exc:
         # Duplicate task id (PK) or branch (UNIQUE) — a conflict, not a 500. (U4)
         return jsonify(error=f'task already exists (id or branch conflict): {exc}'), 409
