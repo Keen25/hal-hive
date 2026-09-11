@@ -18,6 +18,7 @@ Design history + phase docs: gist `Keen25/08d90e38b9a9aad47120ef8e8b38036b`.
 | `queue_server.py` | REST control plane (bearer-token auth), reaper + merge-loop threads |
 | `worker_loop.py` | self-driving worker: claim → run `copilot` → push → complete; self-probes its caps; **version-driven self-update** |
 | `halctl.py` | control CLI: `add` (`--review N`, `--repo`, `--disable-mcp`) / `status` / `workers` / `update` / `cancel` / `requeue` / `prio` / `classify` / `promote` (mirror-repo → ADO PR) |
+| `hive_mcp.py` | stdio **MCP server** — exposes the control plane to Copilot; read-only unless `HIVE_MCP_ALLOW_WRITE` (see [MCP server](#mcp-server-agent-access-hive_mcppy)) |
 | `hive-console.sh` | one-window tmux operator console: **sessions · queue · live Copilot CLI · deliveries** (see [Operator console](#operator-console-delivery--resume)) |
 | `hive-chat.sh` | multi-session orchestrator: open / resume / switch HAL chats, each in its own tmux window (`run`/`new`/`resume`/`pick`/`ls`/`switch`/`kill`) |
 | `hive_pick.py` | dependency-free picker of resumable past sessions (reads each `workspace.yaml`); prints the chosen id |
@@ -284,6 +285,68 @@ Controls in place:
 token this is an accepted risk; on a shared/less-trusted network, additionally
 scope `HIVE_COPILOT_PERMS`, run workers in throwaway VMs/containers, and rotate
 the control token.
+
+## MCP server (agent access, `hive_mcp.py`)
+
+`hive_mcp.py` exposes the control plane to Copilot (and any other MCP client) as
+a stdio MCP server. Zero dependencies — stdlib only, no `mcp` SDK, no Flask.
+It is a thin client of the REST API above, so it inherits the same auth model
+rather than inventing a second one.
+
+**Read-only by default.** Write tools are not merely refused, they are *not
+advertised* unless `HIVE_MCP_ALLOW_WRITE` is set **and** a control token is
+available. Either one alone fails closed, and a gated agent never sees a
+temptation it can't act on.
+
+| Tool | Auth needed | What it does |
+|------|-------------|--------------|
+| `hive-status` | read | Queue counts + worker fleet. **In-flight tasks only** by default — the queue holds hundreds of finished rows. |
+| `hive-task` | read | One task in full, minus `lease_token` (a live credential) and the `*_json` blobs that duplicate parsed fields. Long prompts are truncated. |
+| `hive-logs` | read | Tail of a task's log. |
+| `hive-metrics` | read | Counters + task counts. |
+| `hive-add` | **control** + write flag | Queues a task. |
+| `hive-cancel` | **control** + write flag | Cancels a task. |
+| `hive-requeue` | **control** + write flag | Requeues a task, optionally resetting attempts. |
+
+The worker plane (`/claim`, `/heartbeat`, `/complete`) is deliberately **not**
+exposed: an agent that can claim a lease can strand a real worker's task.
+
+### Environment
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `HIVE_URL` | `http://127.0.0.1:5001` | Control-plane base URL. |
+| `HIVE_RO_TOKEN` | *(falls back to `HIVE_TOKEN`)* | Read token. Prefer this — it cannot write. |
+| `HIVE_TOKEN` | — | Control token. Only needed for the write tools. |
+| `HIVE_MCP_ALLOW_WRITE` | unset | Truthy value advertises the three write tools. |
+| `HIVE_ENV_FILE` | `~/.hive/hive.env` | Read for any of the above not already in the environment. |
+
+### Wiring
+
+Add to `~/.copilot/mcp-config.json` (the **key** becomes the tool prefix, so
+`hive` yields `hive-status`, `hive-task`, ...):
+
+```jsonc
+{
+  "mcpServers": {
+    "hive": {
+      "type": "local",
+      "command": "/usr/bin/python3",
+      "args": ["/home/afodor/hive/hive_mcp.py"],
+      "tools": ["*"]
+      // add "env": { "HIVE_MCP_ALLOW_WRITE": "1" } to enable writes
+    }
+  }
+}
+```
+
+MCP servers are read at client startup, so restart Copilot (an extension reload
+is not enough) before the tools appear.
+
+**On workers:** workers run `copilot`, so a worker that can reach these tools
+can queue tasks from inside a task. Scope it off with the mechanism the hive
+already has — `halctl add ... --disable-mcp hive`, or `HIVE_DISABLE_MCP=hive`
+in the worker env — unless recursion is the point.
 
 ## TLS (optional, issue #8 / S5)
 
