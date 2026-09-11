@@ -315,10 +315,11 @@ exposed: an agent that can claim a lease can strand a real worker's task.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `HIVE_URL` | `http://127.0.0.1:5001` | Control-plane base URL. |
+| `HIVE_QUEUE_URL` | `http://127.0.0.1:5001` | Control-plane base URL. Same variable the workers and `halctl` use. |
 | `HIVE_RO_TOKEN` | *(falls back to `HIVE_TOKEN`)* | Read token. Prefer this — it cannot write. |
 | `HIVE_TOKEN` | — | Control token. Only needed for the write tools. |
 | `HIVE_MCP_ALLOW_WRITE` | unset | Truthy value advertises the three write tools. |
+| `HIVE_MCP_TIMEOUT_S` | `15` | Per-request HTTP timeout, in seconds. |
 | `HIVE_ENV_FILE` | `~/.hive/hive.env` | Read for any of the above not already in the environment. |
 
 ### Wiring
