@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Minimal WinRM runner for ar1 (NTLM). Usage: winrm_run.py '<powershell>'"""
-import sys, os, winrm
+"""Minimal WinRM runner for ar1 (NTLM). Usage: winrm_run.py '<powershell>'
 
-HOST = '192.168.100.11'
-USER = r'fodor\a'
-PASS = os.environ.get('LAB_PASS')
-if not PASS:
-    raise SystemExit('LAB_PASS not set — source ~/.hive/hive.env')
+Auth rejections are diagnosed, not blamed on the password — see hive_winrm.
+"""
+import sys
+
+import hive_winrm
+
+HOST = hive_winrm.DEFAULT_HOST
+USER = hive_winrm.DEFAULT_USER
 
 def run(ps):
-    s = winrm.Session(f'http://{HOST}:5985/wsman',
-                      auth=(USER, PASS), transport='ntlm')
-    r = s.run_ps(ps)
+    s = hive_winrm.session(HOST, USER)
+    r = hive_winrm.run_ps(s, ps, HOST, USER)
     out = r.std_out.decode('utf-8', 'replace')
     err = r.std_err.decode('utf-8', 'replace')
     return r.status_code, out, err
