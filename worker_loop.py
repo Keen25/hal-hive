@@ -58,21 +58,117 @@ PYTHON_EXE  = sys.executable or ''
 # The full JSONL can be large; the tail is what matters for failure triage.
 LOG_TAIL_BYTES = int(os.environ.get('HIVE_LOG_TAIL_BYTES', '16384'))
 
+# How much of the END of the log to PARSE when distilling that tail. This must
+# be far larger than the shipped budget: a single ephemeral event (usage
+# checkpoint carrying the whole tool-schema dump, ~15 KB) or a burst of
+# identical background-task pings will otherwise evict the run's closing report
+# out of a 16 KB byte window, and the build/test numbers are lost for good.
+LOG_SCAN_BYTES = int(os.environ.get('HIVE_LOG_SCAN_BYTES', str(1 << 20)))
+
+# Per-event clip. Oversized events keep their head AND tail, because build and
+# test summaries sit at the END of tool output ("Build succeeded",
+# "Passed! - Failed: 0, Passed: 123") while the command sits at the start.
+LOG_EVENT_CLIP_BYTES = int(os.environ.get('HIVE_LOG_EVENT_CLIP_BYTES', '2048'))
+
+# Ephemeral session events with no triage value. They repeat freely (one per
+# background-task state change) and can account for >90% of the raw tail.
+LOG_NOISE_TYPES = frozenset({
+    'session.background_tasks_changed',
+    'session.tools_changed',
+    'session.usage',
+    'session.usagecheckpoint',
+    'session.usage_checkpoint',
+    'session.checkpoint',
+    'assistant.idle',
+})
+
+
+def _clip_event(line: str, limit: int = LOG_EVENT_CLIP_BYTES) -> str:
+    """Shrink one oversized event, preserving both ends (see LOG_EVENT_CLIP_BYTES)."""
+    if len(line) <= limit:
+        return line
+    head = limit // 2
+    tail = limit - head
+    return f'{line[:head]}…[clipped {len(line) - limit} chars]…{line[-tail:]}'
+
+
+def _distill_log_tail(text: str, max_bytes: int, partial_first: bool) -> str | None:
+    """Reduce a JSONL log window to the last ``max_bytes`` of SIGNAL.
+
+    Drops ephemeral noise events, clips oversized ones, then walks BACKWARDS
+    from the newest event so the closing report is the last thing evicted
+    rather than the first. Returns None when the window holds no JSON at all,
+    letting the caller fall back to a raw byte tail for non-JSONL logs."""
+    lines = text.splitlines()
+    if partial_first and lines:
+        lines = lines[1:]          # first line was cut mid-record by the seek
+    kept: list[str] = []
+    dropped = 0
+    json_seen = False
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            kept.append(_clip_event(line))   # plain stderr/stdout noise: keep it
+            continue
+        json_seen = True
+        if isinstance(obj, dict) and obj.get('type') in LOG_NOISE_TYPES:
+            dropped += 1
+            continue
+        kept.append(_clip_event(line))
+    if not json_seen:
+        return None
+    # Walk backwards so the newest signal wins the budget.
+    out: list[str] = []
+    used = 0
+    for line in reversed(kept):
+        cost = len(line) + 1
+        if out and used + cost > max_bytes:
+            break
+        out.append(line)
+        used += cost
+    out.reverse()
+    if not out:
+        return f'[worker: log tail held no signal; {dropped} ephemeral events dropped]'
+    body = '\n'.join(out)
+    if len(body) > max_bytes:        # single event larger than the whole budget
+        body = _clip_event(body, max_bytes)
+    header = (f'…[distilled tail: {len(out)} of {len(kept)} signal events, '
+              f'{dropped} ephemeral events dropped]…')
+    return header + '\n' + body
+
 
 def _read_log_tail(path: str | None, max_bytes: int = LOG_TAIL_BYTES) -> str | None:
-    """Return the last ``max_bytes`` of the worker copilot log as text, or None.
-    Reads from the end so a multi-MB JSONL never loads fully into memory."""
+    """Return a distilled tail of the worker copilot log as text, or None.
+
+    Reads only the last ``LOG_SCAN_BYTES`` from the end so a multi-MB JSONL
+    never loads fully into memory, then distills that window down to
+    ``max_bytes`` of actual signal. A blind byte slice is NOT used for JSONL:
+    one 15 KB usage checkpoint after the closing report is enough to push the
+    build and test numbers out of the window entirely."""
     if not path or not os.path.exists(path):
         return None
     try:
         size = os.path.getsize(path)
+        scan = max(max_bytes, LOG_SCAN_BYTES)
         with open(path, 'rb') as f:
-            if size > max_bytes:
-                f.seek(-max_bytes, os.SEEK_END)
+            if size > scan:
+                f.seek(-scan, os.SEEK_END)
             data = f.read()
         text = data.decode('utf-8', errors='replace')
-        if size > max_bytes:
-            text = f'…[truncated, showing last {max_bytes} of {size} bytes]…\n' + text
+        distilled = _distill_log_tail(text, max_bytes, partial_first=size > scan)
+        if distilled is not None:
+            if size > scan:
+                distilled = (f'…[scanned last {scan} of {size} bytes]…\n'
+                             + distilled)
+            return distilled
+        # Not JSONL - fall back to the plain byte tail.
+        if len(text) > max_bytes:
+            text = (f'…[truncated, showing last {max_bytes} of {size} bytes]…\n'
+                    + text[-max_bytes:])
         return text
     except OSError as e:
         return f'[worker: could not read log tail: {e}]'
