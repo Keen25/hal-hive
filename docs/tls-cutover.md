@@ -103,6 +103,12 @@ scp ~/.hive-ca/ca.crt <worker>:/tmp/hal-hive-ca.crt
 ssh <worker> 'sudo cp /tmp/hal-hive-ca.crt /etc/pki/ca-trust/source/anchors/ && sudo update-ca-trust'
 ```
 
+The OS store only covers a **distro-packaged** `requests` (Fedora's reads
+`/etc/pki`). A pip/venv-installed `requests` uses certifi and ignores it — check
+with `python3 -c "import requests.certs; print(requests.certs.where())"`. If
+that prints a certifi path, also set `REQUESTS_CA_BUNDLE` (and `GIT_SSL_CAINFO`)
+to the PEM in the worker's environment, as `bootstrap.py` does for new joins.
+
 **Windows worker (e.g. `ar1`):** copy `ca.crt` over, then from an **elevated**
 PowerShell:
 

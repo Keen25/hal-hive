@@ -320,7 +320,9 @@ exposed: an agent that can claim a lease can strand a real worker's task.
 | `HIVE_TOKEN` | — | Control token. Only needed for the write tools. |
 | `HIVE_MCP_ALLOW_WRITE` | unset | Truthy value advertises the three write tools. |
 | `HIVE_MCP_TIMEOUT_S` | `15` | Per-request HTTP timeout, in seconds. |
-| `HIVE_ENV_FILE` | `~/.hive/hive.env` | Read for any of the above not already in the environment. |
+
+Any of the above not set in the environment is read from `~/.hive/hive.env`;
+`HIVE_TOKEN` finally falls back to `~/.hive/worker.token`.
 
 ### Wiring
 

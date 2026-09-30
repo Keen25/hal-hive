@@ -73,10 +73,11 @@ DEFAULT_TIMEOUT_S = 15
 # counting on the live box, most of them merged or capability-probe rows), so
 # listing everything by default would bury the handful that actually need eyes.
 # An allowlist rather than a terminal-state denylist: an unknown/new status is
-# then quietly excluded from the default view instead of flooding it.
+# then quietly excluded from the default view instead of flooding it. Kept in
+# step with the live set in hive_queue_active.STYLE.
 ACTIVE_STATES = frozenset({
-    "queued", "pending", "claimed", "running",
-    "probing", "reviewing", "needs_attention", "merging",
+    "needs_attention", "running", "claimed", "verifying",
+    "awaiting_review", "pending",
 })
 
 TASK_SUMMARY_FIELDS = (
@@ -218,7 +219,7 @@ def _request(path: str, method: str = "GET", body: dict | None = None,
         raise HiveError(
             f"cannot reach the hive at {base_url()}: {exc.reason}",
             hint="is queue_server running? check HIVE_QUEUE_URL and "
-                 "`systemctl --user status hive-queue`",
+                 "`systemctl --user status hive-queue-server`",
         ) from exc
 
     if raw_text:
