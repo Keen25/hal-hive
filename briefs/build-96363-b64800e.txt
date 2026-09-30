@@ -1,0 +1,23 @@
+BUILD VALIDATION ONLY — read-only. Do NOT modify, create, or commit any files. Report results only.
+
+Context: This is a compile + unit-test validation of commit b64800e on the Active Roles PR !96363 branch feature/732291_addon-import-mi ("Wire Managed Identity into ConfigCenter add-on DB import validation"). The changes were authored on a Linux box with no MSBuild, so they have NOT been compiled or test-run. Your job is to be the first real build gate.
+
+Files touched by the commit under validation:
+- ConfigCenter/Configuration.UI/Tabs/AdministrationService/ImportDatabase/ValidateAddOnDatabaseHelper.cs
+- ConfigCenter/Configuration.UI/Tabs/AdministrationService/ImportDatabase/Pages/ValidateTenantPage.cs
+- ConfigCenter/Configuration.UI/Strings.de-DE.resx
+- ConfigCenter/Tests/Configuration.UI.Tests/ImportDatabase/ValidateAddOnDatabaseHelperManagedIdentityTests.cs
+
+Steps:
+1. Locate the ConfigCenter solution (.sln) and the Configuration.UI project (.csproj) plus the Configuration.UI.Tests project. Search under the ConfigCenter/ directory. Prefer building via the enclosing .sln if one cleanly covers both projects; otherwise build the two .csproj files.
+2. Restore NuGet packages as needed (nuget restore or msbuild /t:Restore). Use the Windows MSBuild toolchain already installed on this box (Developer Command Prompt / vswhere-located MSBuild.exe). This is a classic .NET Framework solution — use MSBuild.exe, not `dotnet build`, if the projects are non-SDK-style.
+3. Build Configuration.UI (Debug|Any CPU or the solution's default) and capture all compiler errors/warnings.
+4. Build Configuration.UI.Tests.
+5. Run the Managed Identity unit tests in ValidateAddOnDatabaseHelperManagedIdentityTests (class name ValidateAddOnDatabaseHelperManagedIdentityTests) via vstest.console.exe or dotnet vstest against the built test assembly. These tests use [DoNotParallelize]. Capture pass/fail per test.
+
+Report back, concisely:
+- BUILD: PASS or FAIL. If FAIL, list each error with file:line and the exact compiler message (especially anything in the 4 files above — e.g. CS errors from the client-id ToString("D") change, the removed guards, or the new tests referencing ArsConfiguration.Strings.ValidateAddon_ManagedIdentitySignInFailed / ValidateTenant_NoTenantSelected).
+- TESTS: total / passed / failed. List any failed test names + assertion messages.
+- Note if the resx changes (Strings.de-DE.resx) caused any resource-generation or build error.
+
+Do NOT attempt to fix anything. Do NOT commit. This is a diagnostic probe — output the build/test report and stop.

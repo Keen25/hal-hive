@@ -1,26 +1,48 @@
 #!/usr/bin/env python3
 """hive_watch.py -- delivery->resume watcher.
 
-Bridges the hive queue (queue.db) to a Copilot CLI session inbox so that when a
+Bridges the hive queue (queue.db) to a Copilot CLI session so that when a
 background worker finishes an offloaded task, the delivery surfaces back into the
 interactive session ("pick up the thread").
 
-Flow:
+*** IMPORTANT (verified 2026-08-25): the `inbox_entries` row this script writes
+*** to session.db is a DURABLE LOG ONLY. The Copilot CLI runtime has no code
+*** path that reads it, marks it read, or surfaces it mid-turn (confirmed by
+*** grep'ing the actual `copilot` binary for "inbox_entries"/
+*** "recipient_session_id" -- zero matches). It will NOT wake a live session on
+*** its own. The ONLY thing that actually notifies a live session is a tracked
+*** async shell (bash tool mode=async, never setsid/detached) EXITING -- that's
+*** what the `wait` subcommand is for. Use `wait` as the primary mechanism;
+*** treat `run`/`notify` + inbox_entries purely as an audit trail / crash-
+*** recovery log to check manually, never as a push channel.
+
+Flow (primary — use this):
   1. You offload a task:  python3 halctl.py add "<defect...>" ...   -> prints task-XXXX
      then register it:     python3 hive_watch.py register task-XXXX
-  2. The daemon polls queue.db; when a *registered* task reaches a terminal
-     status (done_at set), it writes a delivery to the session inbox:
-        - session.db  inbox_entries  (native CLI channel -> surfaces to the agent)
-        - <inbox_dir>/<session>.jsonl (durable log, always written)
-  3. Deduped via <inbox_dir>/state-<session>.json so each task delivers once.
+  2. Launch `wait task-XXXX` as a TRACKED ASYNC shell. Its exit is the real
+     notification. Re-arm (relaunch `wait`) for anything newly added or still
+     pending -- a running `wait` does not pick up later registrations.
+
+Flow (audit log / fallback -- `run`/`notify` daemon):
+  The daemon polls queue.db; when a *registered* task reaches a terminal
+  status (done_at set), it writes a delivery record to:
+     - session.db  inbox_entries  (durable row; NOT auto-surfaced -- read manually)
+     - <inbox_dir>/<session>.jsonl (durable log, always written)
+  Deduped via <inbox_dir>/state-<session>.json so each task delivers once.
+  Useful for recovering deliveries that happened while no `wait` was running
+  (e.g. across a session restart), but it cannot push a notification to you.
 
 Subcommands:
   run        Poll loop (default).            --interval N  --once  --all-since ISO
   register   Add task id(s) to the watchlist.
   unregister Remove task id(s) from the watchlist.
   list       Show current watchlist + delivered state.
+  wait       Block until watched task(s) complete, then exit -- launch this as
+             a TRACKED async shell; its exit IS the notification.
+  notify     Standalone daemon variant of `run` -- audit log only, see above.
 
-Stdlib only. Safe to run detached.
+Stdlib only. Safe to run detached (run/notify only -- never run `wait` detached,
+its whole value is that the tracking runtime sees it exit).
 """
 import argparse
 import json
@@ -69,6 +91,31 @@ def _state_path(inbox_dir, sid):
 
 def _watch_path(inbox_dir, sid):
     return os.path.join(inbox_dir, f"watch-{sid}.json")
+
+
+def _sessions_path(inbox_dir):
+    """sid -> session.db map, populated by `register` so a global daemon
+    (`notify`) can reach each session's inbox without being told its dir."""
+    return os.path.join(inbox_dir, "sessions.json")
+
+
+def _session_db_for(inbox_dir, sid):
+    """Resolve a session's session.db: prefer the registered map, else the
+    standard ~/.copilot/session-state/<sid>/session.db convention."""
+    mapped = _load_json(_sessions_path(inbox_dir), {}).get(sid)
+    if mapped:
+        return mapped
+    return os.path.expanduser(f"~/.copilot/session-state/{sid}/session.db")
+
+
+def _watch_sids(inbox_dir):
+    """Every session id that currently has a watchlist file."""
+    import glob as _glob
+    sids = []
+    prefix = os.path.join(inbox_dir, "watch-")
+    for path in _glob.glob(prefix + "*.json"):
+        sids.append(os.path.basename(path)[len("watch-"):-len(".json")])
+    return sids
 
 
 def _jsonl_path(inbox_dir, sid):
@@ -243,7 +290,7 @@ def deliver(row, sid, session_db, inbox_dir, verbose=True):
 
 
 def cmd_register(args):
-    sid, _, inbox_dir = _paths(args)
+    sid, session_db, inbox_dir = _paths(args)
     if not sid:
         sys.exit("cannot determine session id; pass --session-id")
     wp = _watch_path(inbox_dir, sid)
@@ -252,6 +299,15 @@ def cmd_register(args):
     for tid in args.task_ids:
         watch[tid] = watch.get(tid, now)
     _save_json(wp, watch)
+    # Record where this session's inbox lives so the `notify` daemon can deliver
+    # without being told the session-dir. Standard-path sessions work without
+    # this, but recording it keeps non-standard dirs deliverable too.
+    if session_db:
+        sp = _sessions_path(inbox_dir)
+        sessions = _load_json(sp, {})
+        if sessions.get(sid) != session_db:
+            sessions[sid] = session_db
+            _save_json(sp, sessions)
     print(f"watching {len(watch)} task(s) for session {sid}: {', '.join(sorted(watch))}")
 
 
@@ -376,6 +432,72 @@ def cmd_run(args):
         time.sleep(args.interval)
 
 
+def cmd_notify(args):
+    """Persistent, session-agnostic delivery LOGGER (not a push channel).
+
+    Runs as a standalone service: each pass it scans EVERY `watch-<sid>.json` in
+    the inbox dir and writes a durable delivery record (inbox_entries row +
+    jsonl line) for newly-terminal, registered tasks. A single queue.db read per
+    pass fans out to all watching sessions.
+
+    *** This does NOT wake a live session. *** Verified 2026-08-25: nothing in
+    the Copilot CLI runtime reads `inbox_entries`. Use it to recover deliveries
+    that happened while no tracked `wait` shell was running (e.g. across a
+    session/turn boundary) -- check it manually, don't rely on it to notify.
+    For an actual live push, launch `wait` as a TRACKED ASYNC shell instead;
+    its exit is what the runtime actually surfaces.
+    """
+    inbox_dir = args.inbox_dir
+    os.makedirs(inbox_dir, exist_ok=True)
+
+    def one_pass():
+        sids = _watch_sids(inbox_dir)
+        if not sids:
+            return 0
+        try:
+            conn = _connect_ro(args.queue_db)
+        except sqlite3.Error as exc:
+            print(f"[warn] cannot open queue.db: {exc}", flush=True)
+            return 0
+        try:
+            rows = {r["id"]: r for r in fetch_completed(conn, args.include_cancelled)}
+        finally:
+            conn.close()
+        total = 0
+        for sid in sids:
+            watch = _load_json(_watch_path(inbox_dir, sid), {})
+            if not watch:
+                continue
+            state_path = _state_path(inbox_dir, sid)
+            state = _load_json(state_path, {"delivered": []})
+            delivered = set(state.get("delivered", []))
+            session_db = _session_db_for(inbox_dir, sid)
+            newly = [t for t in watch if t in rows and t not in delivered]
+            for tid in newly:
+                deliver(rows[tid], sid, session_db, inbox_dir, verbose=not args.quiet)
+                delivered.add(tid)
+                total += 1
+            if newly:
+                state["delivered"] = sorted(delivered)
+                _save_json(state_path, state)
+        return total
+
+    if args.once:
+        count = one_pass()
+        print(f"[once] delivered {count} new task(s) across {len(_watch_sids(inbox_dir))} session(s)", flush=True)
+        return
+    print(
+        f"[hive_notify] inbox={inbox_dir} queue={args.queue_db} interval={args.interval}s",
+        flush=True,
+    )
+    while True:
+        try:
+            one_pass()
+        except Exception as exc:  # keep the daemon alive across any single-pass fault
+            print(f"[error] pass failed: {exc}", flush=True)
+        time.sleep(args.interval)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--session-id", help="Copilot CLI session id (autodetected from env if omitted)")
@@ -412,6 +534,13 @@ def build_parser():
 
     lst = sub.add_parser("list", help="show watchlist + delivered state")
     lst.set_defaults(func=cmd_list)
+
+    nt = sub.add_parser("notify", help="standalone daemon: deliver to ALL watching sessions (survives shells/turns)")
+    nt.add_argument("--interval", type=int, default=15, help="seconds between polls (default: %(default)s)")
+    nt.add_argument("--once", action="store_true", help="single pass across all sessions then exit")
+    nt.add_argument("--include-cancelled", action="store_true", help="also deliver cancelled tasks")
+    nt.add_argument("--quiet", action="store_true")
+    nt.set_defaults(func=cmd_notify)
     return p
 
 

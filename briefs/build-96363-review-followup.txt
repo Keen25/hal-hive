@@ -1,0 +1,29 @@
+BUILD + UNIT-TEST VALIDATION ONLY — read-only. Do NOT modify, create, or commit any files. Report results only.
+
+Context: Compile + unit-test validation of commit ce736fac8c on the Active Roles review-follow-up branch feature/732291_review-followup (branched from PR !96363 HEAD d47631d854, "Wire Managed Identity into ConfigCenter add-on DB import validation"). These changes were authored on a Linux box with NO MSBuild, so they have NOT been compiled or test-run. You are the first real build gate.
+
+FIRST, guard against a stale mirror: run `git log -1 --oneline` at the repo root and CONFIRM HEAD is ce736fac8c ("732291 - Review follow-up: harden MI import tests (684881) + tenant-page reconnect-on-Next (684883)"). If HEAD is any other commit, STOP and report the wrong SHA — do not build a stale checkout.
+
+Files touched by the commit under validation:
+- ConfigCenter/Configuration.UI/Tabs/AdministrationService/ImportDatabase/ValidateAddOnDatabaseHelper.cs  (EscapeLikePattern widened private -> internal static)
+- ConfigCenter/Configuration.UI/Tabs/AdministrationService/ImportDatabase/Pages/ValidateTenantPage.cs      (ValidateData now rebuilds the view model via Progress.DoWork on every Next)
+- ConfigCenter/Tests/Configuration.UI.Tests/ImportDatabase/ValidateAddOnDatabaseHelperManagedIdentityTests.cs  (new + tightened MI tests)
+
+Steps:
+1. Locate the ConfigCenter solution (.sln) plus the Configuration.UI project and the Configuration.UI.Tests project (search under ConfigCenter/). Prefer building via the enclosing .sln if one cleanly covers both projects; otherwise build the two .csproj files.
+2. Restore NuGet packages as needed (nuget restore or msbuild /t:Restore). This is a classic .NET Framework (net48/WPF) solution — use the Windows MSBuild.exe toolchain (Developer Command Prompt / vswhere-located MSBuild.exe), NOT `dotnet build`, for the non-SDK-style projects.
+3. Build Configuration.UI (Debug|Any CPU or the solution default) and capture all compiler errors/warnings.
+4. Build Configuration.UI.Tests.
+5. Run the Managed Identity unit tests in class ValidateAddOnDatabaseHelperManagedIdentityTests via vstest.console.exe (or dotnet vstest) against the built test assembly. These tests use [DoNotParallelize] — do not force parallelism. Capture pass/fail per test.
+
+Watch specifically for (these are the new/changed surfaces):
+- ValidateAddOnDatabaseHelper.EscapeLikePattern must now be accessible as `internal static` from the test assembly (InternalsVisibleTo to ActiveRoles.Configuration.UI.Tests). A CS0122 (inaccessible) here means the visibility change did not take.
+- New tests reference SqlAuthenticationMethod, System.Security.SecureString, and consts ChinaServer/ChinaSqlScope — flag any CS errors.
+- New/renamed test methods to confirm PASS: BuildConnection_ManagedIdentity_ChinaCloudServer_RequestsSovereignScope, BuildConnection_ManagedIdentity_NonCanonicalGuidUserName_IsCanonicalized (4 rows), BuildConnection_ManagedIdentity_FinalBuilderShape_ValidatesServerCertAndCarriesNoPassword, BuildConnection_AzurePasswordAuthentication_PropagatesPasswordAndAdShape, EscapeLikePattern_EscapesMetacharacters (8 rows), and the tightened BuildConnection_NonManagedIdentity_NeverAcquiresToken (5 rows).
+
+Report back, concisely:
+- HEAD SHA confirmed (ce736fac8c yes/no).
+- BUILD: PASS or FAIL. If FAIL, list each error with file:line and the exact compiler message.
+- TESTS: total / passed / failed. List any failed test names + assertion messages.
+
+Do NOT attempt to fix anything. Do NOT commit. This is a diagnostic probe — output the build/test report and stop.

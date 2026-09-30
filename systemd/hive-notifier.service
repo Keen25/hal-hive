@@ -1,0 +1,23 @@
+[Unit]
+Description=HAL Live Hive — delivery notifier (queue.db terminal status -> session inbox, all sessions)
+Documentation=https://gist.github.com/Keen25/08d90e38b9a9aad47120ef8e8b38036b
+After=hive-queue-server.service
+Wants=hive-queue-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/hive
+# Standalone, session-agnostic delivery loop: each pass scans every
+# inbox/watch-<sid>.json and delivers newly-terminal registered tasks into that
+# session's inbox. Decoupled from any interactive shell, so a long build that
+# outlives several user turns still notifies (fixes the reaped-async-shell gap).
+# HIVE_NOTIFY_INTERVAL can be overridden via the shared env file.
+EnvironmentFile=-%h/.hive/hive.env
+Environment=HIVE_NOTIFY_INTERVAL=15
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 %h/hive/hive_watch.py notify --interval ${HIVE_NOTIFY_INTERVAL}
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
